@@ -90,8 +90,19 @@ class PoolAttentionWorker(Worker):
             "pid": os.getpid(),
             "client_id": self.pool_client.client_id if self.pool_client else None,
             "peak_torch_allocated_bytes": torch.cuda.max_memory_allocated(self.device),
+            "call_metrics": (
+                self.pool_client.metrics.snapshot()
+                if self.pool_client is not None and self.pool_client.metrics is not None
+                else None
+            ),
             **model.pool_status(),
         }
+
+    def pool_set_metrics(self, enabled: bool = True) -> None:
+        """Reset scalar aggregates after warmup and before submitting requests."""
+        if self.pool_client is None:
+            raise RuntimeError("Pool client was not connected")
+        self.pool_client.set_metrics(enabled)
 
     def close_pool(self) -> None:
         """Call after draining requests, before terminating the native engine."""

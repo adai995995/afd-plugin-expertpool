@@ -9,6 +9,7 @@ from multiprocessing.connection import Connection
 import torch
 
 from afd_plugin.connectors.gpu.pool import PoolTransport
+from afd_plugin.expert_pool.metrics import CallMetrics
 from afd_plugin.expert_pool.protocol import (
     CallKey,
     CallRequest,
@@ -47,6 +48,16 @@ class PoolClient:
         self.lock = threading.Lock()
         self.failed = False
         self.closed = False
+        self.metrics: CallMetrics | None = None
+
+    def set_metrics(self, enabled: bool) -> None:
+        """Reset aggregates between drained trials, never during a model call."""
+        if not self.lock.acquire(blocking=False):
+            raise RuntimeError("Drain the client before changing metrics")
+        try:
+            self.metrics = CallMetrics() if enabled else None
+        finally:
+            self.lock.release()
 
     def _reply(
         self,
@@ -93,6 +104,7 @@ class PoolClient:
             raise RuntimeError("This client already has an outstanding operation")
         issued = False
         try:
+            validation_started = time.perf_counter_ns()
             if self.closed or self.failed:
                 raise RuntimeError("Client is closed or failed")
             if hidden_states.ndim != 2:
@@ -136,20 +148,35 @@ class PoolClient:
             issued = True
             send_message(self.control, Message("submit", request=request))
             grant = self._reply("grant", request)
+            granted = time.perf_counter_ns()
             plan = grant.plan
             assert plan is not None
             self.transport.transfer((hidden_states, topk_weights, topk_ids), send=True)
+            inputs_sent = time.perf_counter_ns()
             self._reply("output_ready", request, plan)
+            output_ready = time.perf_counter_ns()
             output = torch.empty_like(hidden_states)
             self.transport.transfer((output,), send=False)
+            output_received = time.perf_counter_ns()
             completion = self._reply("done", request, plan)
+            finished = time.perf_counter_ns()
+            metrics = {
+                **completion.metrics,
+                "client_validation_ms": (started - validation_started) / 1e6,
+                "client_admission_wait_ms": (granted - started) / 1e6,
+                "client_input_transfer_wall_ms": (inputs_sent - granted) / 1e6,
+                "client_output_ready_wait_ms": (output_ready - inputs_sent) / 1e6,
+                "client_output_transfer_wall_ms": (output_received - output_ready)
+                / 1e6,
+                "client_completion_wait_ms": (finished - output_received) / 1e6,
+                "client_roundtrip_ms": (finished - started) / 1e6,
+            }
+            if self.metrics is not None:
+                self.metrics.record(layer_id, hidden_states.shape[0], metrics)
             return output, Message(
                 "done",
                 plan=plan,
-                metrics={
-                    **completion.metrics,
-                    "client_roundtrip_ms": (time.perf_counter_ns() - started) / 1e6,
-                },
+                metrics=metrics,
                 digests=completion.digests,
             )
         except CallRejectedError:
