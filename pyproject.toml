@@ -44,6 +44,7 @@ Documentation = "https://github.com/vllm-project/afd-plugin#readme"
 
 [project.entry-points."vllm.general_plugins"]
 afd = "afd_plugin:register_afd"
+expert_pool = "afd_plugin.expert_pool:register_expert_pool"
 
 [dependency-groups]
 dev = [
