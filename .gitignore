@@ -221,3 +221,20 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Private deployment settings and local Expert Pool experiment artifacts.
+.env.*
+.local/
+/docs/expert_pool*.md
+/reports/
+/runs/
+/models/
+/offline/
+/output/
+source_manifest.json
+source_changes.patch
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+pytorch_model*.bin
