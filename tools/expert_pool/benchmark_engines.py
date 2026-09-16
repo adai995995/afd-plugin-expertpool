@@ -29,7 +29,11 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 
 import afd_plugin
-from afd_plugin.expert_pool.deployment import ClientEndpoint, PoolDeployment
+from afd_plugin.expert_pool.deployment import (
+    ClientEndpoint,
+    ExecutionOptions,
+    PoolDeployment,
+)
 from tools.expert_pool.validate_engines import (
     expert_process,
     process_environment,
@@ -146,6 +150,7 @@ async def engine_loop(
     client_id: str,
     control: Connection,
     timeout_s: int,
+    profile_dir: str | None,
 ) -> None:
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
@@ -182,6 +187,18 @@ async def engine_loop(
             async_scheduling=False,
             kernel_config={"moe_backend": "triton"},
             disable_log_stats=True,
+            profiler_config=(
+                {
+                    "profiler": "torch",
+                    "torch_profiler_dir": profile_dir,
+                    "torch_profiler_with_stack": False,
+                    "torch_profiler_record_shapes": False,
+                    "ignore_frontend": True,
+                    "max_iterations": 4,
+                }
+                if profile_dir
+                else {}
+            ),
             **options,
         )
     )
@@ -200,6 +217,8 @@ async def engine_loop(
                 await engine.collective_rpc(
                     "pool_set_metrics", args=(command["measure"],)
                 )
+            if command["trace"]:
+                await engine.start_profile(command["trial"])
             delay = (command["start_ns"] - time.perf_counter_ns()) / 1e9
             if delay > 0:
                 await asyncio.sleep(delay)
@@ -260,6 +279,8 @@ async def engine_loop(
             await asyncio.gather(
                 *(slot(cursor, command, records) for _ in range(command["concurrency"]))
             )
+            if command["trace"]:
+                await engine.stop_profile()
             status = await engine.collective_rpc("pool_status") if deployment else None
             send_record(
                 control,
@@ -275,17 +296,26 @@ def engine_process(
     deployment: str | None,
     client_id: str,
     timeout_s: int,
+    profile_dir: str | None,
     control: Connection,
 ) -> None:
     process_environment(gpu)
     send_record(control, {"kind": "spawned", "pid": os.getpid()})
     try:
-        asyncio.run(engine_loop(model, deployment, client_id, control, timeout_s))
+        asyncio.run(
+            engine_loop(model, deployment, client_id, control, timeout_s, profile_dir)
+        )
     except BaseException:
         send_record(control, {"kind": "error", "detail": traceback.format_exc()})
         raise
     finally:
         control.close()
+
+
+def benchmark_expert_process(
+    path: str, gpu: int, profile_dir: Path | None, control: Connection
+) -> None:
+    expert_process(path, gpu, control, profile_dir=profile_dir)
 
 
 def run_mode(
@@ -340,9 +370,17 @@ def run_mode(
                     MAX_BATCH_TOKENS,
                     endpoints,
                     args.timeout,
+                    ExecutionOptions(**args.execution_options),
                 )
                 path.write_text(json.dumps(asdict(deployment)))
-                worker = start(expert_process, str(path), args.gpus[2])
+                worker = start(
+                    benchmark_expert_process,
+                    str(path),
+                    args.gpus[2],
+                    args.profile_dir / "pool" / "expert"
+                    if args.profile_dir is not None
+                    else None,
+                )
             clients = [
                 start(
                     engine_process,
@@ -351,6 +389,9 @@ def run_mode(
                     str(path) if mode == "pool" else None,
                     f"client-{i}",
                     args.timeout,
+                    str(args.profile_dir / mode / f"client-{i}")
+                    if args.profile_dir is not None
+                    else None,
                 )
                 for i in range(2 if mode == "pool" else 3)
             ]
@@ -388,6 +429,12 @@ def run_mode(
                                     + ("-measure" if measure else "-warmup"),
                                     "start_ns": start_ns,
                                     "measure": measure,
+                                    "trace": (
+                                        args.profile_dir is not None
+                                        and measure
+                                        and repeat == 0
+                                        and (length, concurrency) == cases[0]
+                                    ),
                                     "domain": plan["domain"],
                                     "concurrency": plan["concurrency"],
                                     "requests": [
@@ -425,6 +472,7 @@ def run_mode(
                         "output_tokens": OUTPUT_TOKENS,
                         "domain_concurrency": concurrency,
                         "gpu_budget": 3,
+                        "profiling_run": args.profile_dir is not None,
                         "plans": plans,
                         "summary": summarize(records),
                         "domains": {
@@ -474,11 +522,20 @@ def main() -> int:
         "--modes", nargs="+", choices=("native", "pool"), default=["native", "pool"]
     )
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4, 8])
+    parser.add_argument(
+        "--input-lengths", type=int, nargs="+", choices=(128, 512), default=[128, 512]
+    )
+    parser.add_argument("--execution-options", type=json.loads, default={})
+    parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--min-requests", type=int, default=12)
     parser.add_argument("--waves", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args()
+    try:
+        ExecutionOptions(**args.execution_options)
+    except (TypeError, ValueError) as error:
+        parser.error(str(error))
     if (
         len(set(args.gpus)) != 3
         or min(args.gpus) < 0
@@ -506,7 +563,8 @@ def main() -> int:
         "limits": [
             "Both eager/Triton; native default graphs/async scheduling not benchmarked",
             "No SLO threshold supplied; no goodput or max-capacity claim",
-            "Pool payload validation and phase synchronizations remain enabled",
+            "Execution ablations are explicit in config.execution_options",
+            "Profiling runs are diagnostic and must not enter performance comparisons",
             "Worker admitted queue excludes unread messages; "
             "client admission includes control overhead",
             "E compute event includes validation, output copy and launch gaps; "
@@ -531,6 +589,7 @@ def main() -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             max_count = max(args.min_requests, args.waves * max(args.concurrency))
             inputs = fixtures(args.model, max_count)
+            inputs = {length: inputs[length] for length in args.input_lengths}
             report["input_sha256"] = hashlib.sha256(
                 json.dumps(inputs).encode()
             ).hexdigest()

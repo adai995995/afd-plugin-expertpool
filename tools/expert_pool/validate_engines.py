@@ -28,7 +28,11 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 
 import afd_plugin
-from afd_plugin.expert_pool.deployment import ClientEndpoint, PoolDeployment
+from afd_plugin.expert_pool.deployment import (
+    ClientEndpoint,
+    ExecutionOptions,
+    PoolDeployment,
+)
 from tools.expert_pool.validate_service import (
     BusyGPUError,
     check_idle,
@@ -216,13 +220,15 @@ def engine_process(
         supervisor.close()
 
 
-def expert_process(path: str, gpu: int, supervisor: Connection) -> None:
+def expert_process(
+    path: str, gpu: int, supervisor: Connection, profile_dir: Path | None = None
+) -> None:
     process_environment(gpu)
     send_record(supervisor, {"kind": "spawned", "pid": os.getpid()})
     try:
         from afd_plugin.expert_pool.service import serve
 
-        report = serve(PoolDeployment.read(Path(path)))
+        report = serve(PoolDeployment.read(Path(path)), profile_dir=profile_dir)
         send_record(supervisor, {"kind": "finished", **report})
     except BaseException:
         send_record(supervisor, {"kind": "error", "detail": traceback.format_exc()})
@@ -345,6 +351,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 MAX_BATCH_TOKENS,
                 endpoints,
                 args.timeout,
+                ExecutionOptions(**args.execution_options),
             )
             path = root / "deployment.json"
             path.write_text(json.dumps(asdict(deployment)))
@@ -519,7 +526,12 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--logprob-atol", type=float, default=0.05)
+    parser.add_argument("--execution-options", type=json.loads, default={})
     args = parser.parse_args()
+    try:
+        ExecutionOptions(**args.execution_options)
+    except (TypeError, ValueError) as error:
+        parser.error(str(error))
     if len(set(args.gpus)) != 4 or min(args.gpus) < 0:
         parser.error("Select four distinct GPUs")
     if (
@@ -541,6 +553,7 @@ def main() -> int:
         "logprob_atol_declared_before_execution": args.logprob_atol,
         "generation_tokens_required_exact": True,
         "repeats": args.repeats,
+        "execution_options": args.execution_options,
     }
     try:
         root = Path(__file__).resolve().parents[2]

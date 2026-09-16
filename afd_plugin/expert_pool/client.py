@@ -34,6 +34,8 @@ class PoolClient:
         control: Connection,
         transport: PoolTransport,
         timeout_s: float = 60,
+        *,
+        validate_values: bool = True,
     ) -> None:
         CallKey(client_id, session_epoch, 0)
         if transport.peer != 0:
@@ -44,6 +46,7 @@ class PoolClient:
         self.control = control
         self.transport = transport
         self.timeout_s = timeout_s
+        self.validate_values = validate_values
         self.sequence = 0
         self.lock = threading.Lock()
         self.failed = False
@@ -134,15 +137,16 @@ class PoolClient:
                 self.directory.top_k,
             )
             self.directory.validate(request)
-            placement = next(
-                p for p in self.directory.placements if p.layer_id == layer_id
-            )
-            if bool(((topk_ids < 0) | (topk_ids >= placement.num_experts)).any()):
-                raise ValueError("Invalid logical expert ID")
-            if not bool(torch.isfinite(topk_weights).all()) or bool(
-                (topk_weights < 0).any()
-            ):
-                raise ValueError("Invalid routing weight")
+            if self.validate_values:
+                placement = next(
+                    p for p in self.directory.placements if p.layer_id == layer_id
+                )
+                if bool(((topk_ids < 0) | (topk_ids >= placement.num_experts)).any()):
+                    raise ValueError("Invalid logical expert ID")
+                if not bool(torch.isfinite(topk_weights).all()) or bool(
+                    (topk_weights < 0).any()
+                ):
+                    raise ValueError("Invalid routing weight")
             started = time.perf_counter_ns()
             self.sequence += 1
             issued = True

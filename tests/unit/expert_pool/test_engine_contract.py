@@ -12,6 +12,7 @@ from pathlib import Path
 from afd_plugin.expert_pool.deployment import (
     MAX_DEPLOYMENT_BYTES,
     ClientEndpoint,
+    ExecutionOptions,
     PoolDeployment,
 )
 from tools.expert_pool.validate_engines import GENERATED_TOKENS, compare_request
@@ -65,6 +66,21 @@ class EngineContractTests(unittest.TestCase):
             path.write_bytes(b" " * (MAX_DEPLOYMENT_BYTES + 1))
             with self.assertRaises(ValueError):
                 PoolDeployment.read(path)
+
+    def test_execution_options_are_explicit_and_survive_serialization(self) -> None:
+        options = ExecutionOptions(False, False, True, True)
+        deployment = replace(self.deployment(), execution=options)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "deployment.json"
+            path.write_text(json.dumps(asdict(deployment)))
+            self.assertEqual(PoolDeployment.read(path).execution, options)
+            legacy = asdict(deployment)
+            del legacy["execution"]
+            path.write_text(json.dumps(legacy))
+            self.assertEqual(PoolDeployment.read(path).execution, ExecutionOptions())
+        for invalid in ("false", 0, None):
+            with self.subTest(value=invalid), self.assertRaises(ValueError):
+                ExecutionOptions(validate_client_values=invalid)
 
     def request(self) -> dict:
         return {

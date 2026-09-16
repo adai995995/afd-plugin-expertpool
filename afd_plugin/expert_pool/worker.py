@@ -15,7 +15,9 @@ from multiprocessing.connection import Connection, wait
 import torch
 
 from afd_plugin.connectors.gpu.pool import PoolTransport
+from afd_plugin.expert_pool.deployment import ExecutionOptions
 from afd_plugin.expert_pool.executor import ExpertExecutor
+from afd_plugin.expert_pool.profiling import WorkerProfiler
 from afd_plugin.expert_pool.protocol import (
     ExecutionPlan,
     Message,
@@ -48,6 +50,8 @@ class ExpertWorker:
         peers: tuple[WorkerPeer, ...],
         *,
         audit_inputs: bool = False,
+        execution: ExecutionOptions | None = None,
+        profiler: WorkerProfiler | None = None,
     ) -> None:
         if not peers or len({peer.client_id for peer in peers}) != len(peers):
             raise ValueError("Worker requires unique client endpoints")
@@ -79,6 +83,13 @@ class ExpertWorker:
         for peer in peers:
             self.scheduler.register(peer.client_id, peer.session_epoch, peer.domain)
         self.audit_inputs = audit_inputs
+        self.execution = execution or ExecutionOptions()
+        self.profiler = profiler
+        self.compute_events = (
+            tuple(torch.cuda.Event(enable_timing=True) for _ in range(2))
+            if self.execution.reuse_cuda_events
+            else None
+        )
         self.hidden = torch.empty(
             (directory.max_tokens, directory.hidden_size),
             dtype=torch.bfloat16,
@@ -115,7 +126,9 @@ class ExpertWorker:
             else {}
         )
         audit_ms = (time.perf_counter_ns() - audit_started) / 1e6
-        begin, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+        begin, end = self.compute_events or (
+            torch.cuda.Event(enable_timing=True) for _ in range(2)
+        )
         begin.record()
         try:
             result = self.executors[plan.request.layer_id](hidden, weights, ids)
@@ -129,7 +142,11 @@ class ExpertWorker:
             return
         self.output[:rows].copy_(result)
         end.record()
-        end.synchronize()
+        if not self.execution.defer_output_sync:
+            end.synchronize()
+        # output_ready authorizes posting a receive; it is not a completion
+        # credit. The transfer stream waits for the producer event, and its
+        # finished event still completes before the slot can be released.
         send_message(peer.control, Message("output_ready", plan=plan))
         send_ms = peer.transport.transfer((self.output[:rows],), send=True)
         metrics = {
@@ -179,8 +196,16 @@ class ExpertWorker:
                         )
                 plan = self.scheduler.grant()
                 if plan is not None:
+                    if self.profiler is not None:
+                        self.profiler.before_call(self.completed_calls, plan)
                     self._execute(plan)
+                    if self.profiler is not None:
+                        self.profiler.after_call()
         finally:
-            for peer in self.peers.values():
-                peer.transport.close()
-                peer.control.close()
+            try:
+                if self.profiler is not None:
+                    self.profiler.close()
+            finally:
+                for peer in self.peers.values():
+                    peer.transport.close()
+                    peer.control.close()

@@ -21,8 +21,8 @@ class ExpertExecutor(nn.Module):
     arrange exactly one owner for every selected (token, top-k slot), combine
     the contributions, and add the A-side shared branch once.
 
-    This correctness-first implementation validates GPU payload values, which
-    synchronizes with the host. It is not yet an optimized serving hot path.
+    Value checks synchronize with the host and default to enabled. Disabling
+    them is only valid for trusted routes produced by the bound native router.
     """
 
     def __init__(
@@ -30,6 +30,8 @@ class ExpertExecutor(nn.Module):
         checkpoint: DeepseekCheckpoint,
         placement: ExpertPlacement,
         device: torch.device,
+        *,
+        validate_values: bool = True,
     ) -> None:
         super().__init__()
         if version("vllm") != "0.26.0":
@@ -38,6 +40,7 @@ class ExpertExecutor(nn.Module):
             raise ValueError("The initial Expert Pool executor requires CUDA")
         names = checkpoint.expert_tensor_names(placement)
         self.placement = placement
+        self.validate_values = validate_values
         self.checkpoint_path = checkpoint.model_path
         self.hidden_size = checkpoint.config.hidden_size
         self.intermediate_size = checkpoint.config.moe_intermediate_size
@@ -128,12 +131,13 @@ class ExpertExecutor(nn.Module):
             raise ValueError(
                 "Inputs and resident weights must be on the same CUDA device"
             )
-        if bool(((topk_ids < 0) | (topk_ids >= self.placement.num_experts)).any()):
-            raise ValueError("Router supplied an invalid logical expert ID")
-        if not bool(torch.isfinite(topk_weights).all()) or bool(
-            (topk_weights < 0).any()
-        ):
-            raise ValueError("Routing weights must be finite and nonnegative")
+        if self.validate_values:
+            if bool(((topk_ids < 0) | (topk_ids >= self.placement.num_experts)).any()):
+                raise ValueError("Router supplied an invalid logical expert ID")
+            if not bool(torch.isfinite(topk_weights).all()) or bool(
+                (topk_weights < 0).any()
+            ):
+                raise ValueError("Routing weights must be finite and nonnegative")
         if assignment_mask is not None:
             if (
                 assignment_mask.shape != expected_shape

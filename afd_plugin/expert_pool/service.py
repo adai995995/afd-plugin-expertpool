@@ -19,7 +19,13 @@ from pathlib import Path
 from afd_plugin.expert_pool.deployment import PoolDeployment
 
 
-def serve(deployment: PoolDeployment) -> dict:
+def serve(
+    deployment: PoolDeployment,
+    *,
+    profile_dir: Path | None = None,
+    profile_skip_calls: int = 512,
+    profile_calls: int = 208,
+) -> dict:
     # Keep module imports CPU-only so launchers can select the visible device
     # before importing Torch/vLLM in each spawned process.
     import torch
@@ -36,6 +42,7 @@ def serve(deployment: PoolDeployment) -> dict:
     from afd_plugin.connectors.gpu.pool import PoolTransport
     from afd_plugin.expert_pool.checkpoint import DeepseekCheckpoint
     from afd_plugin.expert_pool.executor import ExpertExecutor
+    from afd_plugin.expert_pool.profiling import WorkerProfiler
     from afd_plugin.expert_pool.worker import ExpertWorker, WorkerPeer
 
     device = torch.device("cuda", 0)
@@ -82,7 +89,12 @@ def serve(deployment: PoolDeployment) -> dict:
                     control = listener.accept()
                     stack.callback(control.close)
                     transport = PoolTransport(
-                        "127.0.0.1", endpoint.nccl_port, 0, device, deployment.timeout_s
+                        "127.0.0.1",
+                        endpoint.nccl_port,
+                        0,
+                        device,
+                        deployment.timeout_s,
+                        reuse_events=deployment.execution.reuse_cuda_events,
                     )
                     stack.callback(transport.close)
                     peers.append(
@@ -95,10 +107,26 @@ def serve(deployment: PoolDeployment) -> dict:
                         )
                     )
                 executors = {
-                    placement.layer_id: ExpertExecutor(checkpoint, placement, device)
+                    placement.layer_id: ExpertExecutor(
+                        checkpoint,
+                        placement,
+                        device,
+                        validate_values=deployment.execution.validate_worker_values,
+                    )
                     for placement in directory.placements
                 }
-                worker = ExpertWorker(directory, executors, tuple(peers))
+                profiler = (
+                    WorkerProfiler(profile_dir, profile_skip_calls, profile_calls)
+                    if profile_dir is not None
+                    else None
+                )
+                worker = ExpertWorker(
+                    directory,
+                    executors,
+                    tuple(peers),
+                    execution=deployment.execution,
+                    profiler=profiler,
+                )
                 worker.run()
                 return {
                     "pid": os.getpid(),

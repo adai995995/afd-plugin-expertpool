@@ -22,6 +22,8 @@ class PoolTransport:
         rank: int,
         device: torch.device,
         timeout_s: int = 60,
+        *,
+        reuse_events: bool = False,
     ) -> None:
         if version("vllm") != "0.26.0" or rank not in (0, 1):
             raise ValueError("Requires pinned vLLM and a two-rank channel")
@@ -41,17 +43,27 @@ class PoolTransport:
             raise RuntimeError("NCCL P2P is unavailable; refusing a no-op transport")
         self.stream = torch.cuda.Stream(device=device)
         self.finished = torch.cuda.Event()
+        # Every transfer completes on the host before returning, so these
+        # events cannot still be in flight when the same channel reuses them.
+        self.events = self._events() if reuse_events else None
         self.closed = False
+
+    @staticmethod
+    def _events() -> tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]:
+        return (
+            torch.cuda.Event(),
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
 
     def transfer(self, tensors: tuple[torch.Tensor, ...], *, send: bool) -> float:
         if self.closed:
             raise RuntimeError("Transport is closed")
         if any(t.device != self.device or not t.is_contiguous() for t in tensors):
             raise ValueError("NCCL payload must be contiguous on the channel device")
-        producer = torch.cuda.Event()
+        producer, start, end = self.events or self._events()
         producer.record(torch.cuda.current_stream(self.device))
         self.stream.wait_event(producer)
-        start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
         with torch.cuda.stream(self.stream):
             start.record()
             self.communicator.group_start()

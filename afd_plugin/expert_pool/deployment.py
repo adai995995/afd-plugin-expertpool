@@ -21,6 +21,25 @@ MAX_UNIX_PATH_BYTES = 100
 
 
 @dataclass(frozen=True)
+class ExecutionOptions:
+    """Opt-in hot-path ablations; defaults preserve the validated prototype.
+
+    Disabling value checks requires routes from the bound, trusted native
+    router. Shapes, devices, control identities and buffer credits are always
+    checked. These options never change routing, weights or the GEMM backend.
+    """
+
+    validate_client_values: bool = True
+    validate_worker_values: bool = True
+    reuse_cuda_events: bool = False
+    defer_output_sync: bool = False
+
+    def __post_init__(self) -> None:
+        if any(type(value) is not bool for value in asdict(self).values()):
+            raise ValueError("Execution options must be explicit booleans")
+
+
+@dataclass(frozen=True)
 class ClientEndpoint:
     client_id: str
     session_epoch: int
@@ -48,8 +67,11 @@ class PoolDeployment:
     max_tokens: int
     clients: tuple[ClientEndpoint, ...]
     timeout_s: int = 120
+    execution: ExecutionOptions = ExecutionOptions()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.execution, ExecutionOptions):
+            raise ValueError("Deployment requires typed execution options")
         if not Path(self.model).is_absolute():
             raise ValueError("Deployment requires an absolute checkpoint path")
         if not isinstance(self.model_id, str) or not 0 < len(self.model_id) <= 256:
@@ -74,6 +96,7 @@ class PoolDeployment:
             raise ValueError("Deployment file exceeds its size limit")
         raw = json.loads(payload)
         raw["clients"] = tuple(ClientEndpoint(**client) for client in raw["clients"])
+        raw["execution"] = ExecutionOptions(**raw.get("execution", {}))
         return cls(**raw)
 
     def endpoint(self, client_id: str) -> ClientEndpoint:

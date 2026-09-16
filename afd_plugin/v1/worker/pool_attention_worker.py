@@ -66,7 +66,12 @@ class PoolAttentionWorker(Worker):
                 time.sleep(SOCKET_RETRY_INTERVAL_S)
         try:
             transport = PoolTransport(
-                "127.0.0.1", endpoint.nccl_port, 1, self.device, deployment.timeout_s
+                "127.0.0.1",
+                endpoint.nccl_port,
+                1,
+                self.device,
+                deployment.timeout_s,
+                reuse_events=deployment.execution.reuse_cuda_events,
             )
         except BaseException:
             control.close()
@@ -78,6 +83,7 @@ class PoolAttentionWorker(Worker):
             control,
             transport,
             deployment.timeout_s,
+            validate_values=deployment.execution.validate_client_values,
         )
         model.bind_pool_client(self.pool_client)
         # ### PATCH END
