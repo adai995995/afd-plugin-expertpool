@@ -40,6 +40,7 @@ from vllm.model_executor.models.deepseek_v2 import (
 from afd_plugin.expert_pool.checkpoint import DeepseekCheckpoint
 from afd_plugin.expert_pool.client import PoolClient
 from afd_plugin.expert_pool.deployment import PoolDeployment
+from afd_plugin.expert_pool.replica_client import ReplicaPoolClient
 
 
 def validate_pool_config(config: VllmConfig) -> None:
@@ -77,7 +78,8 @@ def validate_pool_config(config: VllmConfig) -> None:
         raise ValueError("Pool requires real checkpoint routing")
     settings = config.additional_config["expert_pool"]
     deployment = PoolDeployment.read(Path(settings["deployment"]))
-    deployment.endpoint(settings["client_id"])
+    deployment.client_endpoints(settings["client_id"])
+    deployment.pool_directory()
     if Path(config.model_config.model).resolve() != Path(deployment.model).resolve():
         raise ValueError("A and E must bind the same immutable local checkpoint")
     DeepseekCheckpoint(Path(deployment.model))
@@ -96,7 +98,7 @@ class PoolRemoteMoE(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_id = int(prefix.split(".")[-2])
-        self.client: PoolClient | None = None
+        self.client: PoolClient | ReplicaPoolClient | None = None
         self.completed_calls = 0
         self.token_rows = 0
         self.gate = GateLinear(
@@ -351,7 +353,7 @@ class PoolDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
         )
         # ### PATCH END
 
-    def bind_pool_client(self, client: PoolClient) -> None:
+    def bind_pool_client(self, client: PoolClient | ReplicaPoolClient) -> None:
         expected = {p.layer_id for p in client.directory.placements}
         layers = {
             layer.layer_idx: layer.mlp

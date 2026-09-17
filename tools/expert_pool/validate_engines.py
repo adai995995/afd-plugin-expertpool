@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Full-model validation: two native AsyncLLM A/KV engines, one shared E GPU.
+"""Full-model validation: two native AsyncLLM A/KV engines, resident E workers.
 
-A fourth GPU runs the unmodified model as a correctness reference. Requests
+The last GPU first runs the unmodified model as a correctness reference and
+exits before E workers start. It can then be reused by an E worker. Requests
 use public synthetic fixtures, real tokenization, prefill, decode and routing.
 No replay, forced routing, weight dumps or activation dumps are used. This is
 an engine integration test, not an HTTP benchmark or equal-budget speed test.
@@ -32,7 +33,9 @@ from afd_plugin.expert_pool.deployment import (
     ClientEndpoint,
     ExecutionOptions,
     PoolDeployment,
+    WorkerPlacement,
 )
+from afd_plugin.expert_pool.directory import PoolDirectory
 from tools.expert_pool.validate_service import (
     BusyGPUError,
     check_idle,
@@ -221,14 +224,22 @@ def engine_process(
 
 
 def expert_process(
-    path: str, gpu: int, supervisor: Connection, profile_dir: Path | None = None
+    path: str,
+    gpu: int,
+    supervisor: Connection,
+    profile_dir: Path | None = None,
+    worker_id: str | None = None,
 ) -> None:
     process_environment(gpu)
     send_record(supervisor, {"kind": "spawned", "pid": os.getpid()})
     try:
         from afd_plugin.expert_pool.service import serve
 
-        report = serve(PoolDeployment.read(Path(path)), profile_dir=profile_dir)
+        report = serve(
+            PoolDeployment.read(Path(path)),
+            profile_dir=profile_dir,
+            worker_id=worker_id,
+        )
         send_record(supervisor, {"kind": "finished", **report})
     except BaseException:
         send_record(supervisor, {"kind": "error", "detail": traceback.format_exc()})
@@ -328,23 +339,33 @@ def run(args: argparse.Namespace, report: dict) -> None:
     try:
         with tempfile.TemporaryDirectory(prefix="pool-online-") as temporary:
             root = Path(temporary)
-            sockets = [socket.socket() for _ in range(2)]
+            sockets = [socket.socket() for _ in range(2 * args.expert_workers)]
             try:
                 for reserved in sockets:
                     reserved.bind(("127.0.0.1", 0))
                 endpoints = tuple(
                     ClientEndpoint(
-                        f"client-{index}",
+                        f"client-{index % 2}",
                         1,
-                        f"domain-{index}",
-                        str(root / f"a{index}.sock"),
+                        f"domain-{index % 2}",
+                        str(root / f"e{index // 2}-a{index % 2}.sock"),
                         reserved.getsockname()[1],
+                        f"worker-{index // 2}",
                     )
                     for index, reserved in enumerate(sockets)
                 )
             finally:
                 for reserved in sockets:
                     reserved.close()
+            model_config = json.loads((args.model / "config.json").read_text())
+            moe_layers = tuple(
+                layer
+                for layer in range(
+                    model_config["first_k_dense_replace"],
+                    model_config["num_hidden_layers"],
+                )
+                if layer % model_config["moe_layer_freq"] == 0
+            )
             deployment = PoolDeployment(
                 str(args.model.resolve()),
                 uuid.uuid4().hex,
@@ -352,7 +373,20 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 endpoints,
                 args.timeout,
                 ExecutionOptions(**args.execution_options),
+                tuple(
+                    WorkerPlacement(
+                        f"worker-{index}",
+                        (
+                            moe_layers[index :: args.expert_workers]
+                            if args.placement == "partitioned"
+                            else None
+                        ),
+                    )
+                    for index in range(args.expert_workers)
+                ),
             )
+            directory = deployment.pool_directory()
+            report["placement"] = asdict(directory)
             path = root / "deployment.json"
             path.write_text(json.dumps(asdict(deployment)))
             # Reference uses exactly the same local checkpoint and eager kernel
@@ -360,7 +394,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
             reference = start(
                 engine_entry,
                 str(args.model),
-                args.gpus[3],
+                args.gpus[-1],
                 None,
                 "reference",
                 args.timeout,
@@ -405,17 +439,21 @@ def run(args: argparse.Namespace, report: dict) -> None:
             children[0].join(args.timeout)
             if children[0].exitcode != 0:
                 raise RuntimeError("Reference engine did not exit cleanly")
-            worker = start(expert_process, str(path), args.gpus[2])
+            report["post_reference_gpu_state"] = check_idle(args.gpus)
+            workers = [
+                start(expert_entry, str(path), args.gpus[index + 2], worker_id)
+                for index, worker_id in enumerate(deployment.worker_ids)
+            ]
             clients = [
                 start(
                     engine_entry,
                     str(args.model),
                     args.gpus[index],
                     str(path),
-                    endpoint.client_id,
+                    client_id,
                     args.timeout,
                 )
-                for index, endpoint in enumerate(endpoints)
+                for index, client_id in enumerate(deployment.client_ids)
             ]
             ready = [receive_record(client, args.timeout) for client in clients]
             report["engines_ready"] = ready
@@ -473,12 +511,16 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 send_record(client, {"kind": "close"})
             closed = [receive_record(client, args.timeout) for client in clients]
             report["engines_closed"] = closed
-            report["worker"] = receive_record(worker, args.timeout)
+            report["workers"] = [
+                receive_record(worker, args.timeout) for worker in workers
+            ]
+            if len(report["workers"]) == 1:
+                report["worker"] = report["workers"][0]
             for before, after in zip(
                 statuses, (item["status"][0] for item in closed), strict=True
             ):
                 if set(after["layers"]) != {
-                    str(p.layer_id) for p in deployment.directory().placements
+                    str(p.layer_id) for p in directory.placements
                 }:
                     raise AssertionError("Full-model MoE layer coverage is incomplete")
                 if any(
@@ -486,6 +528,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                     for layer in before["layers"]
                 ):
                     raise AssertionError("An MoE layer did not execute real requests")
+            verify_dispatch(directory, statuses, closed, report["workers"])
             for child in children[1:]:
                 child.join(args.timeout)
                 if child.exitcode != 0:
@@ -511,15 +554,68 @@ def engine_entry(
     engine_process(model, gpu, deployment, client_id, supervisor, timeout_s)
 
 
+def expert_entry(path: str, gpu: int, worker_id: str, supervisor: Connection) -> None:
+    expert_process(path, gpu, supervisor, worker_id=worker_id)
+
+
+def verify_dispatch(
+    directory: PoolDirectory, ready: list[dict], closed: list[dict], workers: list[dict]
+) -> None:
+    """Reconcile both endpoints, layer coverage and real use of every replica."""
+    after = [item["status"][0] for item in closed]
+    by_worker = {item["worker_id"]: item for item in workers}
+    if set(by_worker) != {worker.worker_id for worker in directory.workers}:
+        raise AssertionError("Worker report coverage changed")
+    for worker in directory.workers:
+        actual = by_worker[worker.worker_id]
+        if actual["placement_version"] != worker.version or set(
+            actual["resident_layers"]
+        ) != {placement.layer_id for placement in worker.placements}:
+            raise AssertionError("Worker loaded the wrong placement")
+        calls = 0
+        for before, status in zip(ready, after, strict=True):
+            start = before["dispatch"]["workers"][worker.worker_id]
+            end = status["dispatch"]["workers"][worker.worker_id]
+            if end["calls"] != actual["client_calls"][status["client_id"]]:
+                raise AssertionError("Client/worker completion counts disagree")
+            if any(
+                end["layer_calls"][str(placement.layer_id)]
+                <= start["layer_calls"][str(placement.layer_id)]
+                for placement in worker.placements
+            ):
+                raise AssertionError("A client did not exercise each resident replica")
+            calls += end["calls"]
+        if calls != actual["completed_calls"]:
+            raise AssertionError("Worker completion accounting is incomplete")
+        for placement in worker.placements:
+            layer = str(placement.layer_id)
+            if actual["layer_calls"][layer] != sum(
+                status["dispatch"]["workers"][worker.worker_id]["layer_calls"][layer]
+                for status in after
+            ):
+                raise AssertionError("Layer completion accounting disagrees")
+    for status in after:
+        for layer, counters in status["layers"].items():
+            if counters["calls"] != sum(
+                worker["layer_calls"].get(layer, 0)
+                for worker in status["dispatch"]["workers"].values()
+            ):
+                raise AssertionError("A layer call was lost or duplicated")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument(
         "--gpus",
-        nargs=4,
+        nargs="+",
         type=int,
         required=True,
-        help="A0, A1, E worker, native reference physical GPUs",
+        help="A0, A1, E GPUs; minimum four, last reused after native reference",
+    )
+    parser.add_argument("--expert-workers", type=int, default=1)
+    parser.add_argument(
+        "--placement", choices=("replicated", "partitioned"), default="replicated"
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--lock-path", type=Path, required=True)
@@ -532,8 +628,14 @@ def main() -> int:
         ExecutionOptions(**args.execution_options)
     except (TypeError, ValueError) as error:
         parser.error(str(error))
-    if len(set(args.gpus)) != 4 or min(args.gpus) < 0:
-        parser.error("Select four distinct GPUs")
+    required_gpus = max(4, 2 + args.expert_workers)
+    if (
+        args.expert_workers < 1
+        or len(args.gpus) != required_gpus
+        or len(set(args.gpus)) != required_gpus
+        or min(args.gpus) < 0
+    ):
+        parser.error("Select distinct GPUs: max(4, 2 + expert-workers)")
     if (
         args.timeout <= 0
         or args.repeats <= 0
@@ -554,6 +656,8 @@ def main() -> int:
         "generation_tokens_required_exact": True,
         "repeats": args.repeats,
         "execution_options": args.execution_options,
+        "expert_workers": args.expert_workers,
+        "placement_mode": args.placement,
     }
     try:
         root = Path(__file__).resolve().parents[2]

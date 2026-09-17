@@ -22,6 +22,7 @@ from afd_plugin.expert_pool.deployment import PoolDeployment
 def serve(
     deployment: PoolDeployment,
     *,
+    worker_id: str | None = None,
     profile_dir: Path | None = None,
     profile_skip_calls: int = 512,
     profile_calls: int = 208,
@@ -48,7 +49,8 @@ def serve(
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     checkpoint = DeepseekCheckpoint(Path(deployment.model))
-    directory = deployment.directory()
+    directory = deployment.directory(worker_id)
+    endpoints = deployment.worker_endpoints(directory.worker_id)
     config = EngineArgs(
         model=deployment.model,
         dtype="bfloat16",
@@ -59,7 +61,7 @@ def serve(
     ).create_engine_config()
     with ExitStack() as stack:
         listeners = []
-        for endpoint in deployment.clients:
+        for endpoint in endpoints:
             parent = Path(endpoint.control_path).parent.stat()
             if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
                 raise ValueError(
@@ -83,9 +85,7 @@ def serve(
                 ensure_model_parallel_initialized(1, 1)
                 init_workspace_manager(device)
                 peers = []
-                for listener, endpoint in zip(
-                    listeners, deployment.clients, strict=True
-                ):
+                for listener, endpoint in zip(listeners, endpoints, strict=True):
                     control = listener.accept()
                     stack.callback(control.close)
                     transport = PoolTransport(
@@ -129,8 +129,12 @@ def serve(
                 )
                 worker.run()
                 return {
+                    "worker_id": directory.worker_id,
+                    "placement_version": directory.version,
                     "pid": os.getpid(),
                     "completed_calls": worker.completed_calls,
+                    "client_calls": dict(worker.client_calls),
+                    "layer_calls": dict(worker.layer_calls),
                     "resident_layers": sorted(executors),
                     "resident_weight_bytes": sum(
                         e.weight_storage_bytes for e in executors.values()
@@ -150,8 +154,16 @@ def serve(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deployment", type=Path, required=True)
+    parser.add_argument(
+        "--worker-id", help="Required when the deployment has multiple E workers"
+    )
     args = parser.parse_args()
-    print(json.dumps(serve(PoolDeployment.read(args.deployment))), flush=True)
+    print(
+        json.dumps(
+            serve(PoolDeployment.read(args.deployment), worker_id=args.worker_id)
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

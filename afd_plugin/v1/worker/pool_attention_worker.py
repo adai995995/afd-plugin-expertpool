@@ -4,6 +4,7 @@
 
 import os
 import time
+from contextlib import ExitStack
 from multiprocessing.connection import Client
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from afd_plugin.connectors.gpu.pool import PoolTransport
 from afd_plugin.expert_pool import register_expert_pool
 from afd_plugin.expert_pool.client import PoolClient
 from afd_plugin.expert_pool.deployment import PoolDeployment
+from afd_plugin.expert_pool.replica_client import ReplicaPoolClient
 from afd_plugin.model_executor.models.pool_deepseek_v2 import (
     PoolDeepseekV2ForCausalLM,
     validate_pool_config,
@@ -23,7 +25,7 @@ SOCKET_RETRY_INTERVAL_S = 0.05
 
 
 class PoolAttentionWorker(Worker):
-    pool_client: PoolClient | None = None
+    pool_client: ReplicaPoolClient | None = None
 
     # Register in the spawned worker before the native loader resolves the
     # custom architecture. The large native device/runner setup is unchanged;
@@ -52,40 +54,53 @@ class PoolAttentionWorker(Worker):
             raise ValueError("PoolAttentionWorker requires the Pool model architecture")
         settings = self.vllm_config.additional_config["expert_pool"]
         deployment = PoolDeployment.read(Path(settings["deployment"]))
-        endpoint = deployment.endpoint(settings["client_id"])
-        deadline = time.monotonic() + deployment.timeout_s
-        while True:
-            try:
-                control = Client(endpoint.control_path, family="AF_UNIX")
-                break
-            except (FileNotFoundError, ConnectionRefusedError):
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        "E service control socket did not become ready"
-                    ) from None
-                time.sleep(SOCKET_RETRY_INTERVAL_S)
-        try:
-            transport = PoolTransport(
-                "127.0.0.1",
-                endpoint.nccl_port,
-                1,
-                self.device,
-                deployment.timeout_s,
-                reuse_events=deployment.execution.reuse_cuda_events,
+        directories = {
+            worker.worker_id: worker for worker in deployment.pool_directory().workers
+        }
+        # Both sides connect in sorted identity order. Arbitrary input JSON
+        # order must not create a cycle during pairwise NCCL initialization.
+        with ExitStack() as startup:
+            channels = []
+            deadline = time.monotonic() + deployment.timeout_s
+            for endpoint in deployment.client_endpoints(settings["client_id"]):
+                while True:
+                    try:
+                        control = Client(endpoint.control_path, family="AF_UNIX")
+                        break
+                    except (FileNotFoundError, ConnectionRefusedError):
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                "E service control socket did not become ready"
+                            ) from None
+                        time.sleep(SOCKET_RETRY_INTERVAL_S)
+                startup.callback(control.close)
+                transport = PoolTransport(
+                    "127.0.0.1",
+                    endpoint.nccl_port,
+                    1,
+                    self.device,
+                    deployment.timeout_s,
+                    reuse_events=deployment.execution.reuse_cuda_events,
+                )
+                startup.callback(transport.close)
+                channels.append(
+                    PoolClient(
+                        endpoint.client_id,
+                        endpoint.session_epoch,
+                        directories[endpoint.worker_id],
+                        control,
+                        transport,
+                        deployment.timeout_s,
+                        validate_values=deployment.execution.validate_client_values,
+                    )
+                )
+            client = ReplicaPoolClient(
+                tuple(channels),
+                client_offset=deployment.client_ids.index(settings["client_id"]),
             )
-        except BaseException:
-            control.close()
-            raise
-        self.pool_client = PoolClient(
-            endpoint.client_id,
-            endpoint.session_epoch,
-            deployment.directory(),
-            control,
-            transport,
-            deployment.timeout_s,
-            validate_values=deployment.execution.validate_client_values,
-        )
-        model.bind_pool_client(self.pool_client)
+            model.bind_pool_client(client)
+            self.pool_client = client
+            startup.pop_all()  # Ownership passes to close_pool after binding.
         # ### PATCH END
 
     def pool_status(self) -> dict:
@@ -95,6 +110,9 @@ class PoolAttentionWorker(Worker):
         return {
             "pid": os.getpid(),
             "client_id": self.pool_client.client_id if self.pool_client else None,
+            "dispatch": (
+                self.pool_client.dispatch_status() if self.pool_client else None
+            ),
             "peak_torch_allocated_bytes": torch.cuda.max_memory_allocated(self.device),
             "call_metrics": (
                 self.pool_client.metrics.snapshot()

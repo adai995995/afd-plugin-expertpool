@@ -9,6 +9,7 @@ validation and must be disabled when measuring service performance.
 
 import hashlib
 import time
+from collections import Counter
 from dataclasses import dataclass
 from multiprocessing.connection import Connection, wait
 
@@ -79,7 +80,12 @@ class ExpertWorker:
         self.directory = directory
         self.executors = executors
         self.peers = {peer.client_id: peer for peer in peers}
-        self.scheduler = StaticScheduler(directory)
+        # One outstanding call per declared client bounds the queues even when
+        # a service domain has more than the original four-client default.
+        domain_clients = Counter(peer.domain for peer in peers)
+        self.scheduler = StaticScheduler(
+            directory, max_pending_per_domain=max(domain_clients.values())
+        )
         for peer in peers:
             self.scheduler.register(peer.client_id, peer.session_epoch, peer.domain)
         self.audit_inputs = audit_inputs
@@ -103,6 +109,8 @@ class ExpertWorker:
         self.ids = torch.empty_like(self.weights, dtype=torch.int32)
         self.output = torch.empty_like(self.hidden)
         self.completed_calls = 0
+        self.client_calls = dict.fromkeys(self.peers, 0)
+        self.layer_calls = dict.fromkeys(self.executors, 0)
 
     @torch.inference_mode()
     def _execute(self, plan: ExecutionPlan) -> None:
@@ -161,6 +169,8 @@ class ExpertWorker:
         # not release on host enqueue or on receipt of a CPU completion alone.
         self.scheduler.complete(plan)
         self.completed_calls += 1
+        self.client_calls[plan.request.key.client_id] += 1
+        self.layer_calls[plan.request.layer_id] += 1
         send_message(
             peer.control, Message("done", plan=plan, metrics=metrics, digests=digests)
         )

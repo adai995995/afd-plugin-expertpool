@@ -95,6 +95,8 @@ class PoolClient:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        call_seq: int | None = None,
     ) -> tuple[torch.Tensor, Message]:
         """Return an owned output tensor and a matching completion record.
 
@@ -110,6 +112,9 @@ class PoolClient:
             validation_started = time.perf_counter_ns()
             if self.closed or self.failed:
                 raise RuntimeError("Client is closed or failed")
+            sequence = self.sequence if call_seq is None else call_seq
+            if type(sequence) is not int or sequence < self.sequence:
+                raise ValueError("Call sequence must increase on each worker channel")
             if hidden_states.ndim != 2:
                 raise ValueError("Expected a two-dimensional activation tensor")
             shape = (hidden_states.shape[0], self.directory.top_k)
@@ -128,7 +133,7 @@ class PoolClient:
             ):
                 raise ValueError("Invalid activation or external routing payload")
             request = CallRequest(
-                CallKey(self.client_id, self.session_epoch, self.sequence),
+                CallKey(self.client_id, self.session_epoch, sequence),
                 self.directory.model_id,
                 self.directory.version,
                 layer_id,
@@ -148,7 +153,7 @@ class PoolClient:
                 ):
                     raise ValueError("Invalid routing weight")
             started = time.perf_counter_ns()
-            self.sequence += 1
+            self.sequence = sequence + 1
             issued = True
             send_message(self.control, Message("submit", request=request))
             grant = self._reply("grant", request)
@@ -185,7 +190,7 @@ class PoolClient:
             )
         except CallRejectedError:
             raise
-        except Exception:
+        except BaseException:
             if issued:
                 self.failed = True
             raise
