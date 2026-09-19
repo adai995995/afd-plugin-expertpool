@@ -101,7 +101,11 @@ class PoolAttentionWorker(Worker):
                     deployment, "client", settings["client_id"]
                 )
                 startup.callback(controller.close)
-                client = ControlledPoolClient(tuple(channels), controller)
+                client = ControlledPoolClient(
+                    tuple(channels),
+                    controller,
+                    scheduling_policy=deployment.controller.scheduling_policy,
+                )
             else:
                 client = ReplicaPoolClient(
                     tuple(channels),

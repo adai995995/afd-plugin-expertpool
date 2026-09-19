@@ -15,6 +15,8 @@ from afd_plugin.expert_pool.directory import PoolDirectory, ReplicaSelector
 from afd_plugin.expert_pool.protocol import CallKey, CallRequest, ExecutionPlan
 from afd_plugin.expert_pool.scheduler import StaticDirectory
 
+CONTROLLER_POLICIES = ("round_robin", "ready_first")
+
 
 def directory_digest(directory: StaticDirectory) -> str:
     payload = json.dumps(asdict(directory), sort_keys=True, separators=(",", ":"))
@@ -36,7 +38,7 @@ class ControllerClientIdentity:
 @dataclass(frozen=True)
 class QueuedCall:
     request: CallRequest
-    worker_id: str
+    worker_id: str | None
     enqueued_ns: int
 
 
@@ -52,11 +54,17 @@ class WorkerReservation:
 
 class ControllerLedger:
     def __init__(
-        self, directory: PoolDirectory, clients: tuple[ControllerClientIdentity, ...]
+        self,
+        directory: PoolDirectory,
+        clients: tuple[ControllerClientIdentity, ...],
+        scheduling_policy: str = "round_robin",
     ) -> None:
+        if scheduling_policy not in CONTROLLER_POLICIES:
+            raise ValueError("Unknown controller scheduling policy")
         if not clients or len({c.client_id for c in clients}) != len(clients):
             raise ValueError("Controller requires unique clients")
         self.directory = directory
+        self.scheduling_policy = scheduling_policy
         self.directories = {d.worker_id: d for d in directory.workers}
         self.clients = {c.client_id: c for c in clients}
         self.selectors = {
@@ -82,6 +90,7 @@ class ControllerLedger:
         self.plan_sequence = 0
         self.peak_pending = 0
         self.peak_reserved = 0
+        self.busy_replica_bypasses = 0
 
     def ready(self, worker_id: str, fingerprint: str) -> None:
         worker = self.workers[worker_id]
@@ -105,9 +114,13 @@ class ControllerLedger:
         if not candidates:
             raise ValueError("Requested layer is absent from the pool")
         self.directories[candidates[0]].validate(request)
-        # Selection is intentionally static; busy targets wait in a bounded
-        # controller queue. Queue-aware replica selection is a later policy.
-        target = self.selectors[client_id].select(request.layer_id)
+        # Only the comparison policy binds on admission. Ready-first requests
+        # remain logical until a resident slot can be reserved at grant time.
+        target = (
+            self.selectors[client_id].select(request.layer_id)
+            if self.scheduling_policy == "round_robin"
+            else None
+        )
         self.pending[identity.domain].append(QueuedCall(request, target, now_ns))
         self.outstanding[client_id] = request.key
         self.last_sequence[client_id] = request.key.call_seq
@@ -118,20 +131,40 @@ class ControllerLedger:
         return sum(len(queue) for queue in self.pending.values())
 
     def grant(self, now_ns: int) -> tuple[ExecutionPlan, float] | None:
+        available = {
+            key
+            for key, worker in self.workers.items()
+            if worker.ready and worker.active is None
+        }
         for _ in range(len(self.domains)):
             domain = self.domains[0]
             self.domains.rotate(-1)
             queue = self.pending[domain]
             for call in queue:
-                worker = self.workers[call.worker_id]
-                if not worker.ready or worker.active is not None:
-                    continue
+                if self.scheduling_policy == "round_robin":
+                    target = call.worker_id
+                    if target not in available:
+                        continue
+                else:
+                    selector = self.selectors[call.request.key.client_id]
+                    layer = call.request.layer_id
+                    candidates = selector.candidates[layer]
+                    preferred = candidates[
+                        selector.next_replica[layer] % len(candidates)
+                    ]
+                    target = selector.select_available(layer, available)
+                    if target is None:
+                        continue
+                    if self.workers[preferred].active is not None:
+                        self.busy_replica_bypasses += 1
+                assert target is not None
+                worker = self.workers[target]
                 queue.remove(call)
                 worker.generation += 1
                 self.plan_sequence += 1
                 plan = ExecutionPlan(
                     call.request,
-                    call.worker_id,
+                    target,
                     self.plan_sequence,
                     0,
                     worker.generation,
@@ -182,7 +215,11 @@ class ControllerLedger:
 
     def snapshot(self) -> dict:
         return {
-            "policy": "controller-resident-layer-round-robin",
+            "policy": (
+                "controller-resident-layer-" + self.scheduling_policy.replace("_", "-")
+            ),
+            "scheduling_policy": self.scheduling_policy,
+            "busy_replica_bypasses": self.busy_replica_bypasses,
             "pending": self.pending_count,
             "outstanding": len(self.outstanding),
             "closed_clients": len(self.closed),

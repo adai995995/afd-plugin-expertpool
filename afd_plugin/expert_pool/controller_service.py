@@ -83,6 +83,9 @@ class ControllerRuntime:
                                         w.completed
                                         for w in self.ledger.workers.values()
                                     ),
+                                    "busy_replica_bypasses": (
+                                        self.ledger.busy_replica_bypasses
+                                    ),
                                 },
                             ),
                         )
@@ -153,7 +156,11 @@ def serve_controller(deployment: PoolDeployment) -> dict:
         for client_id in deployment.client_ids
         for c in (deployment.client_endpoints(client_id),)
     )
-    ledger = ControllerLedger(deployment.pool_directory(), identities)
+    ledger = ControllerLedger(
+        deployment.pool_directory(),
+        identities,
+        scheduling_policy=deployment.controller.scheduling_policy,
+    )
     with ExitStack() as stack:
         listeners = {
             (role, identity): stack.enter_context(

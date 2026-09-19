@@ -29,6 +29,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 
 import afd_plugin
+from afd_plugin.expert_pool.controller import CONTROLLER_POLICIES
 from afd_plugin.expert_pool.deployment import (
     ClientEndpoint,
     ControllerConfig,
@@ -385,7 +386,11 @@ def run(args: argparse.Namespace, report: dict) -> None:
                     )
                     for index in range(args.expert_workers)
                 ),
-                controller=ControllerConfig(str(root)) if args.controller else None,
+                controller=(
+                    ControllerConfig(str(root), args.controller_policy)
+                    if args.controller
+                    else None
+                ),
             )
             directory = deployment.pool_directory()
             report["placement"] = asdict(directory)
@@ -531,10 +536,23 @@ def run(args: argparse.Namespace, report: dict) -> None:
                     for layer in before["layers"]
                 ):
                     raise AssertionError("An MoE layer did not execute real requests")
-            verify_dispatch(directory, statuses, closed, report["workers"])
+            verify_dispatch(
+                directory,
+                statuses,
+                closed,
+                report["workers"],
+                require_each_replica=(
+                    not args.controller or args.controller_policy == "round_robin"
+                ),
+            )
             if controller is not None:
                 controlled = receive_record(controller, args.timeout)
                 report["controller"] = controlled
+                if controlled["scheduling_policy"] != args.controller_policy or any(
+                    item["status"][0]["dispatch"]["policy"] != controlled["policy"]
+                    for item in ready + closed
+                ):
+                    raise AssertionError("Controller and clients disagree on policy")
                 if (
                     controlled["pending"]
                     or controlled["outstanding"]
@@ -597,9 +615,14 @@ def controller_entry(path: str, supervisor: Connection) -> None:
 
 
 def verify_dispatch(
-    directory: PoolDirectory, ready: list[dict], closed: list[dict], workers: list[dict]
+    directory: PoolDirectory,
+    ready: list[dict],
+    closed: list[dict],
+    workers: list[dict],
+    *,
+    require_each_replica: bool = True,
 ) -> None:
-    """Reconcile both endpoints, layer coverage and real use of every replica."""
+    """Reconcile counters and coverage without requiring balanced dynamic use."""
     after = [item["status"][0] for item in closed]
     by_worker = {item["worker_id"]: item for item in workers}
     if set(by_worker) != {worker.worker_id for worker in directory.workers}:
@@ -616,7 +639,7 @@ def verify_dispatch(
             end = status["dispatch"]["workers"][worker.worker_id]
             if end["calls"] != actual["client_calls"][status["client_id"]]:
                 raise AssertionError("Client/worker completion counts disagree")
-            if any(
+            if require_each_replica and any(
                 end["layer_calls"][str(placement.layer_id)]
                 <= start["layer_calls"][str(placement.layer_id)]
                 for placement in worker.placements
@@ -658,6 +681,12 @@ def main() -> int:
         help="Route control messages through the authoritative CPU controller",
     )
     parser.add_argument(
+        "--controller-policy",
+        choices=CONTROLLER_POLICIES,
+        default="round_robin",
+        help="Bind on admission, or select an available resident copy at grant time",
+    )
+    parser.add_argument(
         "--placement", choices=("replicated", "partitioned"), default="replicated"
     )
     parser.add_argument("--output", type=Path, required=True)
@@ -667,6 +696,8 @@ def main() -> int:
     parser.add_argument("--logprob-atol", type=float, default=0.05)
     parser.add_argument("--execution-options", type=json.loads, default={})
     args = parser.parse_args()
+    if not args.controller and args.controller_policy != "round_robin":
+        parser.error("--controller-policy requires --controller")
     try:
         ExecutionOptions(**args.execution_options)
     except (TypeError, ValueError) as error:
@@ -702,6 +733,7 @@ def main() -> int:
         "expert_workers": args.expert_workers,
         "placement_mode": args.placement,
         "controller_enabled": args.controller,
+        "controller_policy": args.controller_policy if args.controller else None,
     }
     try:
         root = Path(__file__).resolve().parents[2]

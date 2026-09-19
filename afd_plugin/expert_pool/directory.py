@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Immutable multi-worker coverage and CPU-only static replica selection.
+"""Immutable multi-worker coverage and CPU-only replica tie breaking.
 
 Each resident layer currently contains all its routed experts. Layers can be
 partitioned or replicated across workers; a call executes on exactly one copy.
-There is no per-expert fan-out, migration, busy feedback or failure retry yet.
+The Controller can filter candidates by its authoritative slot ledger. There
+is no per-expert fan-out, migration or failure retry yet.
 """
 
+from collections.abc import Collection
 from dataclasses import dataclass
 
 from afd_plugin.expert_pool.placement import ExpertPlacement
@@ -109,3 +111,22 @@ class ReplicaSelector:
         index = self.next_replica[layer_id] % len(candidates)
         self.next_replica[layer_id] = (index + 1) % len(candidates)
         return candidates[index]
+
+    def select_available(
+        self, layer_id: int, available_workers: Collection[str]
+    ) -> str | None:
+        """Advance only after selecting an available resident whole-layer copy.
+
+        The caller must atomically reserve the returned worker before exposing
+        the plan. Availability is a slot ledger view, not measured GPU load.
+        """
+        if type(layer_id) is not int or layer_id not in self.candidates:
+            raise ValueError("Requested layer is not resident")
+        candidates = self.candidates[layer_id]
+        start = self.next_replica[layer_id]
+        for offset in range(len(candidates)):
+            index = (start + offset) % len(candidates)
+            if candidates[index] in available_workers:
+                self.next_replica[layer_id] = (index + 1) % len(candidates)
+                return candidates[index]
+        return None

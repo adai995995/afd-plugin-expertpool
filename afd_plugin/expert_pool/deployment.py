@@ -12,6 +12,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from afd_plugin.expert_pool.controller import CONTROLLER_POLICIES
 from afd_plugin.expert_pool.directory import PoolDirectory
 from afd_plugin.expert_pool.placement import ExpertPlacement
 from afd_plugin.expert_pool.protocol import CallKey
@@ -86,8 +87,11 @@ class WorkerPlacement:
 @dataclass(frozen=True)
 class ControllerConfig:
     socket_dir: str
+    scheduling_policy: str = "round_robin"
 
     def __post_init__(self) -> None:
+        if self.scheduling_policy not in CONTROLLER_POLICIES:
+            raise ValueError("Unknown controller scheduling policy")
         if (
             not isinstance(self.socket_dir, str)
             or not Path(self.socket_dir).is_absolute()

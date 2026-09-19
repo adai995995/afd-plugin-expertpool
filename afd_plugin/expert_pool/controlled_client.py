@@ -9,6 +9,7 @@ from multiprocessing.connection import Connection
 import torch
 
 from afd_plugin.expert_pool.client import CallRejectedError, PoolClient
+from afd_plugin.expert_pool.controller import CONTROLLER_POLICIES
 from afd_plugin.expert_pool.protocol import (
     CallRequest,
     ExecutionPlan,
@@ -20,10 +21,18 @@ from afd_plugin.expert_pool.replica_client import ReplicaPoolClient
 
 
 class ControlledPoolClient(ReplicaPoolClient):
-    def __init__(self, channels: tuple[PoolClient, ...], control: Connection) -> None:
+    def __init__(
+        self,
+        channels: tuple[PoolClient, ...],
+        control: Connection,
+        scheduling_policy: str = "round_robin",
+    ) -> None:
+        if scheduling_policy not in CONTROLLER_POLICIES:
+            raise ValueError("Unknown controller scheduling policy")
         super().__init__(channels)
         self.control = control
         self.timeout_s = channels[0].timeout_s
+        self.scheduling_policy = scheduling_policy
 
     def _reply(
         self, kind: str, request: CallRequest, plan: ExecutionPlan | None = None
@@ -123,7 +132,9 @@ class ControlledPoolClient(ReplicaPoolClient):
             raise RuntimeError("Drain this A before requesting controller status")
         try:
             result = super().dispatch_status()
-            result["policy"] = "controller-resident-layer-round-robin"
+            result["policy"] = (
+                "controller-resident-layer-" + self.scheduling_policy.replace("_", "-")
+            )
             if not self.closed and not self.failed:
                 send_message(self.control, Message("status"))
                 reply = receive_message(self.control, self.timeout_s)
