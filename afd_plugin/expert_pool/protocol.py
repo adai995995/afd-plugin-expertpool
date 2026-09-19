@@ -13,7 +13,20 @@ from multiprocessing.connection import Connection
 
 MAX_CONTROL_BYTES = 65536
 MESSAGE_KINDS = frozenset(
-    {"submit", "grant", "output_ready", "done", "error", "close", "closed"}
+    {
+        "submit",
+        "grant",
+        "output_ready",
+        "done",
+        "error",
+        "close",
+        "closed",
+        "ready",
+        "input_ready",
+        "executing",
+        "status",
+        "snapshot",
+    }
 )
 
 
@@ -98,11 +111,15 @@ class Message:
             raise ValueError("Invalid error detail")
         if self.kind == "submit" and (self.request is None or self.plan is not None):
             raise ValueError("Submit requires a request only")
-        if self.kind in {"grant", "output_ready", "done"} and (
-            self.plan is None or self.request is not None
-        ):
+        if self.kind in {
+            "grant",
+            "input_ready",
+            "executing",
+            "output_ready",
+            "done",
+        } and (self.plan is None or self.request is not None):
             raise ValueError("Execution reply requires a plan only")
-        if self.kind in {"close", "closed"} and (
+        if self.kind in {"close", "closed", "ready", "status", "snapshot"} and (
             self.request is not None or self.plan is not None
         ):
             raise ValueError("Close messages cannot carry a call")

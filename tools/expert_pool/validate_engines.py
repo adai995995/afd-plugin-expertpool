@@ -31,6 +31,7 @@ from pathlib import Path
 import afd_plugin
 from afd_plugin.expert_pool.deployment import (
     ClientEndpoint,
+    ControllerConfig,
     ExecutionOptions,
     PoolDeployment,
     WorkerPlacement,
@@ -384,6 +385,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                     )
                     for index in range(args.expert_workers)
                 ),
+                controller=ControllerConfig(str(root)) if args.controller else None,
             )
             directory = deployment.pool_directory()
             report["placement"] = asdict(directory)
@@ -440,6 +442,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
             if children[0].exitcode != 0:
                 raise RuntimeError("Reference engine did not exit cleanly")
             report["post_reference_gpu_state"] = check_idle(args.gpus)
+            controller = start(controller_entry, str(path)) if args.controller else None
             workers = [
                 start(expert_entry, str(path), args.gpus[index + 2], worker_id)
                 for index, worker_id in enumerate(deployment.worker_ids)
@@ -529,6 +532,26 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 ):
                     raise AssertionError("An MoE layer did not execute real requests")
             verify_dispatch(directory, statuses, closed, report["workers"])
+            if controller is not None:
+                controlled = receive_record(controller, args.timeout)
+                report["controller"] = controlled
+                if (
+                    controlled["pending"]
+                    or controlled["outstanding"]
+                    or controlled["closed_clients"] != len(clients)
+                ):
+                    raise AssertionError(
+                        "Controller did not drain all clients and reservations"
+                    )
+                for worker in report["workers"]:
+                    counters = controlled["workers"][worker["worker_id"]]
+                    if counters["active"] is not None or any(
+                        counters[key] != worker[key]
+                        for key in ("completed_calls", "client_calls", "layer_calls")
+                    ):
+                        raise AssertionError(
+                            "Controller and GPU worker counters disagree"
+                        )
             for child in children[1:]:
                 child.join(args.timeout)
                 if child.exitcode != 0:
@@ -556,6 +579,21 @@ def engine_entry(
 
 def expert_entry(path: str, gpu: int, worker_id: str, supervisor: Connection) -> None:
     expert_process(path, gpu, supervisor, worker_id=worker_id)
+
+
+def controller_entry(path: str, supervisor: Connection) -> None:
+    os.setsid()
+    send_record(supervisor, {"kind": "spawned", "pid": os.getpid()})
+    try:
+        from afd_plugin.expert_pool.controller_service import serve_controller
+
+        report = serve_controller(PoolDeployment.read(Path(path)))
+        send_record(supervisor, {"kind": "finished", **report})
+    except BaseException:
+        send_record(supervisor, {"kind": "error", "detail": traceback.format_exc()})
+        raise
+    finally:
+        supervisor.close()
 
 
 def verify_dispatch(
@@ -615,6 +653,11 @@ def main() -> int:
     )
     parser.add_argument("--expert-workers", type=int, default=1)
     parser.add_argument(
+        "--controller",
+        action="store_true",
+        help="Route control messages through the authoritative CPU controller",
+    )
+    parser.add_argument(
         "--placement", choices=("replicated", "partitioned"), default="replicated"
     )
     parser.add_argument("--output", type=Path, required=True)
@@ -658,6 +701,7 @@ def main() -> int:
         "execution_options": args.execution_options,
         "expert_workers": args.expert_workers,
         "placement_mode": args.placement,
+        "controller_enabled": args.controller,
     }
     try:
         root = Path(__file__).resolve().parents[2]

@@ -14,6 +14,8 @@ from vllm.v1.worker.gpu_worker import Worker
 from afd_plugin.connectors.gpu.pool import PoolTransport
 from afd_plugin.expert_pool import register_expert_pool
 from afd_plugin.expert_pool.client import PoolClient
+from afd_plugin.expert_pool.controlled_client import ControlledPoolClient
+from afd_plugin.expert_pool.controller_service import connect_controller
 from afd_plugin.expert_pool.deployment import PoolDeployment
 from afd_plugin.expert_pool.replica_client import ReplicaPoolClient
 from afd_plugin.model_executor.models.pool_deepseek_v2 import (
@@ -94,10 +96,17 @@ class PoolAttentionWorker(Worker):
                         validate_values=deployment.execution.validate_client_values,
                     )
                 )
-            client = ReplicaPoolClient(
-                tuple(channels),
-                client_offset=deployment.client_ids.index(settings["client_id"]),
-            )
+            if deployment.controller is not None:
+                controller = connect_controller(
+                    deployment, "client", settings["client_id"]
+                )
+                startup.callback(controller.close)
+                client = ControlledPoolClient(tuple(channels), controller)
+            else:
+                client = ReplicaPoolClient(
+                    tuple(channels),
+                    client_offset=deployment.client_ids.index(settings["client_id"]),
+                )
             model.bind_pool_client(client)
             self.pool_client = client
             startup.pop_all()  # Ownership passes to close_pool after binding.

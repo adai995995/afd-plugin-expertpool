@@ -88,6 +88,54 @@ class PoolClient:
             raise RuntimeError("Unexpected worker or buffer slot")
         return message
 
+    def prepare_request(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        sequence: int,
+    ) -> CallRequest:
+        """Validate without issuing work or consuming a sequence number."""
+        if hidden_states.ndim != 2:
+            raise ValueError("Expected a two-dimensional activation tensor")
+        shape = (hidden_states.shape[0], self.directory.top_k)
+        if (
+            hidden_states.ndim != 2
+            or hidden_states.shape[1] != self.directory.hidden_size
+            or hidden_states.dtype != torch.bfloat16
+            or topk_ids.shape != shape
+            or topk_ids.dtype != torch.int32
+            or topk_weights.shape != shape
+            or topk_weights.dtype != torch.float32
+            or any(
+                t.device != self.transport.device or not t.is_contiguous()
+                for t in (hidden_states, topk_weights, topk_ids)
+            )
+        ):
+            raise ValueError("Invalid activation or external routing payload")
+        request = CallRequest(
+            CallKey(self.client_id, self.session_epoch, sequence),
+            self.directory.model_id,
+            self.directory.version,
+            layer_id,
+            hidden_states.shape[0],
+            self.directory.hidden_size,
+            self.directory.top_k,
+        )
+        self.directory.validate(request)
+        if self.validate_values:
+            placement = next(
+                p for p in self.directory.placements if p.layer_id == layer_id
+            )
+            if bool(((topk_ids < 0) | (topk_ids >= placement.num_experts)).any()):
+                raise ValueError("Invalid logical expert ID")
+            if not bool(torch.isfinite(topk_weights).all()) or bool(
+                (topk_weights < 0).any()
+            ):
+                raise ValueError("Invalid routing weight")
+        return request
+
     @torch.inference_mode()
     def execute(
         self,
@@ -115,43 +163,9 @@ class PoolClient:
             sequence = self.sequence if call_seq is None else call_seq
             if type(sequence) is not int or sequence < self.sequence:
                 raise ValueError("Call sequence must increase on each worker channel")
-            if hidden_states.ndim != 2:
-                raise ValueError("Expected a two-dimensional activation tensor")
-            shape = (hidden_states.shape[0], self.directory.top_k)
-            if (
-                hidden_states.ndim != 2
-                or hidden_states.shape[1] != self.directory.hidden_size
-                or hidden_states.dtype != torch.bfloat16
-                or topk_ids.shape != shape
-                or topk_ids.dtype != torch.int32
-                or topk_weights.shape != shape
-                or topk_weights.dtype != torch.float32
-                or any(
-                    t.device != self.transport.device or not t.is_contiguous()
-                    for t in (hidden_states, topk_weights, topk_ids)
-                )
-            ):
-                raise ValueError("Invalid activation or external routing payload")
-            request = CallRequest(
-                CallKey(self.client_id, self.session_epoch, sequence),
-                self.directory.model_id,
-                self.directory.version,
-                layer_id,
-                hidden_states.shape[0],
-                self.directory.hidden_size,
-                self.directory.top_k,
+            request = self.prepare_request(
+                layer_id, hidden_states, topk_weights, topk_ids, sequence
             )
-            self.directory.validate(request)
-            if self.validate_values:
-                placement = next(
-                    p for p in self.directory.placements if p.layer_id == layer_id
-                )
-                if bool(((topk_ids < 0) | (topk_ids >= placement.num_experts)).any()):
-                    raise ValueError("Invalid logical expert ID")
-                if not bool(torch.isfinite(topk_weights).all()) or bool(
-                    (topk_weights < 0).any()
-                ):
-                    raise ValueError("Invalid routing weight")
             started = time.perf_counter_ns()
             self.sequence = sequence + 1
             issued = True

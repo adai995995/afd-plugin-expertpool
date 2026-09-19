@@ -16,6 +16,7 @@ from multiprocessing.connection import Connection, wait
 import torch
 
 from afd_plugin.connectors.gpu.pool import PoolTransport
+from afd_plugin.expert_pool.controller import directory_digest
 from afd_plugin.expert_pool.deployment import ExecutionOptions
 from afd_plugin.expert_pool.executor import ExpertExecutor
 from afd_plugin.expert_pool.profiling import WorkerProfiler
@@ -53,6 +54,7 @@ class ExpertWorker:
         audit_inputs: bool = False,
         execution: ExecutionOptions | None = None,
         profiler: WorkerProfiler | None = None,
+        controller: Connection | None = None,
     ) -> None:
         if not peers or len({peer.client_id for peer in peers}) != len(peers):
             raise ValueError("Worker requires unique client endpoints")
@@ -91,6 +93,8 @@ class ExpertWorker:
         self.audit_inputs = audit_inputs
         self.execution = execution or ExecutionOptions()
         self.profiler = profiler
+        self.controller = controller
+        self.controller_generation = 0
         self.compute_events = (
             tuple(torch.cuda.Event(enable_timing=True) for _ in range(2))
             if self.execution.reuse_cuda_events
@@ -113,16 +117,34 @@ class ExpertWorker:
         self.layer_calls = dict.fromkeys(self.executors, 0)
 
     @torch.inference_mode()
-    def _execute(self, plan: ExecutionPlan) -> None:
+    def _execute(
+        self, plan: ExecutionPlan, controller_queue_ms: float | None = None
+    ) -> None:
         peer = self.peers[plan.request.key.client_id]
+        control = self.controller if self.controller is not None else peer.control
         admitted_queue_ms = (
-            time.perf_counter_ns() - self.scheduler.active_enqueued_ns
-        ) / 1e6
+            controller_queue_ms
+            if controller_queue_ms is not None
+            else (time.perf_counter_ns() - self.scheduler.active_enqueued_ns) / 1e6
+        )
         started = time.perf_counter_ns()
-        send_message(peer.control, Message("grant", plan=plan))
+        send_message(
+            control,
+            Message(
+                "grant",
+                plan=plan,
+                metrics=(
+                    {"controller_queue_ms": controller_queue_ms}
+                    if controller_queue_ms is not None
+                    else {}
+                ),
+            ),
+        )
         rows = plan.request.num_tokens
         hidden, weights, ids = self.hidden[:rows], self.weights[:rows], self.ids[:rows]
         receive_ms = peer.transport.transfer((hidden, weights, ids), send=False)
+        if self.controller is not None:
+            send_message(control, Message("input_ready", plan=plan))
         audit_started = time.perf_counter_ns()
         digests = (
             {
@@ -138,6 +160,8 @@ class ExpertWorker:
             torch.cuda.Event(enable_timing=True) for _ in range(2)
         )
         begin.record()
+        if self.controller is not None:
+            send_message(control, Message("executing", plan=plan))
         try:
             result = self.executors[plan.request.layer_id](hidden, weights, ids)
         except ValueError as error:
@@ -145,8 +169,9 @@ class ExpertWorker:
             # so a matched error can safely release the slot. CUDA failures must
             # escape and terminate the launch instead of reusing suspect memory.
             torch.cuda.current_stream(self.device).synchronize()
-            send_message(peer.control, Message("error", plan=plan, detail=str(error)))
-            self.scheduler.complete(plan)
+            send_message(control, Message("error", plan=plan, detail=str(error)))
+            if self.controller is None:
+                self.scheduler.complete(plan)
             return
         self.output[:rows].copy_(result)
         end.record()
@@ -155,7 +180,7 @@ class ExpertWorker:
         # output_ready authorizes posting a receive; it is not a completion
         # credit. The transfer stream waits for the producer event, and its
         # finished event still completes before the slot can be released.
-        send_message(peer.control, Message("output_ready", plan=plan))
+        send_message(control, Message("output_ready", plan=plan))
         send_ms = peer.transport.transfer((self.output[:rows],), send=True)
         metrics = {
             "admitted_queue_ms": admitted_queue_ms,
@@ -167,17 +192,51 @@ class ExpertWorker:
         }
         # The send event is complete: a later call may now reuse the slot. Do
         # not release on host enqueue or on receipt of a CPU completion alone.
-        self.scheduler.complete(plan)
+        if self.controller is None:
+            self.scheduler.complete(plan)
         self.completed_calls += 1
         self.client_calls[plan.request.key.client_id] += 1
         self.layer_calls[plan.request.layer_id] += 1
         send_message(
-            peer.control, Message("done", plan=plan, metrics=metrics, digests=digests)
+            control, Message("done", plan=plan, metrics=metrics, digests=digests)
         )
+
+    def _run_controlled(self) -> None:
+        control = self.controller
+        assert control is not None
+        send_message(control, Message("ready", detail=directory_digest(self.directory)))
+        while True:
+            wait([control])
+            message = receive_message(control, 0)
+            if message.kind == "close":
+                send_message(control, Message("closed"))
+                return
+            if message.kind != "grant" or message.plan is None:
+                raise RuntimeError("Worker expected a reserved controller plan")
+            plan = message.plan
+            self.directory.validate(plan.request)
+            peer = self.peers.get(plan.request.key.client_id)
+            if (
+                peer is None
+                or peer.session_epoch != plan.request.key.session_epoch
+                or plan.worker_id != self.directory.worker_id
+                or plan.slot_id != 0
+                or plan.generation != self.controller_generation + 1
+            ):
+                raise RuntimeError("Stale or mismatched controller reservation")
+            self.controller_generation = plan.generation
+            if self.profiler is not None:
+                self.profiler.before_call(self.completed_calls, plan)
+            self._execute(plan, message.metrics["controller_queue_ms"])
+            if self.profiler is not None:
+                self.profiler.after_call()
 
     def run(self) -> None:
         connections = {peer.control: peer for peer in self.peers.values()}
         try:
+            if self.controller is not None:
+                self._run_controlled()
+                return
             while connections:
                 timeout = 0 if self.scheduler.outstanding else None
                 for connection in wait(list(connections), timeout=timeout):
@@ -216,6 +275,8 @@ class ExpertWorker:
                 if self.profiler is not None:
                     self.profiler.close()
             finally:
+                if self.controller is not None:
+                    self.controller.close()
                 for peer in self.peers.values():
                     peer.transport.close()
                     peer.control.close()

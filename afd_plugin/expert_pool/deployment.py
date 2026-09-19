@@ -84,6 +84,18 @@ class WorkerPlacement:
 
 
 @dataclass(frozen=True)
+class ControllerConfig:
+    socket_dir: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.socket_dir, str)
+            or not Path(self.socket_dir).is_absolute()
+        ):
+            raise ValueError("Controller requires an absolute private socket directory")
+
+
+@dataclass(frozen=True)
 class PoolDeployment:
     model: str
     model_id: str
@@ -93,6 +105,7 @@ class PoolDeployment:
     execution: ExecutionOptions = ExecutionOptions()
     workers: tuple[WorkerPlacement, ...] = (WorkerPlacement("worker-0"),)
     placement_version: int = 1
+    controller: ControllerConfig | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution, ExecutionOptions):
@@ -140,6 +153,19 @@ class PoolDeployment:
             values = [asdict(client)[field] for client in self.clients]
             if len(set(values)) != len(values):
                 raise ValueError(f"Duplicate client {field}")
+        if self.controller is not None:
+            if not isinstance(self.controller, ControllerConfig):
+                raise ValueError("Deployment requires typed controller configuration")
+            paths = [
+                self.controller_path(role, identity)
+                for role, identities in (
+                    ("client", self.client_ids),
+                    ("worker", self.worker_ids),
+                )
+                for identity in identities
+            ]
+            if set(paths) & {c.control_path for c in self.clients}:
+                raise ValueError("Controller and data bootstrap sockets must differ")
 
     @classmethod
     def read(cls, path: Path) -> "PoolDeployment":
@@ -150,6 +176,8 @@ class PoolDeployment:
         raw = json.loads(payload)
         raw["clients"] = tuple(ClientEndpoint(**client) for client in raw["clients"])
         raw["execution"] = ExecutionOptions(**raw.get("execution", {}))
+        if raw.get("controller") is not None:
+            raw["controller"] = ControllerConfig(**raw["controller"])
         if "workers" in raw:
             raw["workers"] = tuple(
                 WorkerPlacement(
@@ -165,6 +193,18 @@ class PoolDeployment:
                 for worker in raw["workers"]
             )
         return cls(**raw)
+
+    def controller_path(self, role: str, identity: str) -> str:
+        if self.controller is None or role not in {"client", "worker"}:
+            raise ValueError("Controller role is not configured")
+        identities = self.client_ids if role == "client" else self.worker_ids
+        path = str(
+            Path(self.controller.socket_dir)
+            / f"{role}-{identities.index(identity)}.sock"
+        )
+        if len(path.encode()) > MAX_UNIX_PATH_BYTES:
+            raise ValueError("Controller socket path is too long")
+        return path
 
     @property
     def worker_ids(self) -> tuple[str, ...]:

@@ -16,6 +16,7 @@ from contextlib import ExitStack
 from multiprocessing.connection import Listener
 from pathlib import Path
 
+from afd_plugin.expert_pool.controller_service import connect_controller
 from afd_plugin.expert_pool.deployment import PoolDeployment
 
 
@@ -120,12 +121,20 @@ def serve(
                     if profile_dir is not None
                     else None
                 )
+                controller = (
+                    connect_controller(deployment, "worker", directory.worker_id)
+                    if deployment.controller is not None
+                    else None
+                )
+                if controller is not None:
+                    stack.callback(controller.close)
                 worker = ExpertWorker(
                     directory,
                     executors,
                     tuple(peers),
                     execution=deployment.execution,
                     profiler=profiler,
+                    controller=controller,
                 )
                 worker.run()
                 return {
