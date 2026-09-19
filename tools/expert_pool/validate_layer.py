@@ -8,6 +8,9 @@ The native reference uses unmodified vLLM 0.26.0 DeepseekV2MoE and its weight
 loaders. Inputs are seeded synthetic hidden states; routing is computed afresh.
 BF16 reduction changes are reported against predeclared tolerances, separately
 from exact gate/route/weight checks. No timing from this script is a speedup.
+Slot checks restore disjoint Expert contributions in their original top-k order
+and apply the native reduction once. Additional boundary routes are explicitly
+synthetic and do not replace the fresh native Router comparisons.
 """
 
 import argparse
@@ -25,6 +28,7 @@ from importlib.metadata import version
 from pathlib import Path
 
 import torch
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import (
     destroy_distributed_environment,
@@ -46,6 +50,7 @@ from afd_plugin.expert_pool.router import DeepseekPoolRouter
 DEFAULT_ATOL = 0.01
 DEFAULT_RTOL = 0.02
 IDLE_MEMORY_LIMIT_MIB = 128
+BOUNDARY_BATCH_SIZE = 3
 
 
 def compare(
@@ -109,6 +114,88 @@ def expect_rejection(call: Callable[[], torch.Tensor], description: str) -> None
     except ValueError:
         return
     raise AssertionError(f"Invalid request accepted: {description}")
+
+
+def validate_slots(
+    full: ExpertExecutor,
+    even: ExpertExecutor,
+    odd: ExpertExecutor,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    full_output: torch.Tensor,
+    native_routed: torch.Tensor,
+    atol: float,
+    rtol: float,
+) -> dict:
+    """Check real GPU slot kernels; scalar reads here are validation only."""
+    saved_hidden = hidden_states.clone()
+    saved_weights = topk_weights.clone()
+    saved_ids = topk_ids.clone()
+    expected_shape = (*topk_ids.shape, full.hidden_size)
+    full_slots, even_slots, odd_slots = [
+        executor.forward_slots(hidden_states, topk_weights, topk_ids)
+        for executor in (full, even, odd)
+    ]
+    for slots in (full_slots, even_slots, odd_slots):
+        if (
+            slots.shape != expected_shape
+            or slots.dtype != hidden_states.dtype
+            or slots.device != hidden_states.device
+            or not slots.is_contiguous()
+        ):
+            raise AssertionError("Expert slot output violates its tensor contract")
+
+    # The maps include the reversed physical slot layouts from this test. The
+    # ownership decision stays on the GPU and preserves the original route slot.
+    even_owner = even.expert_map[topk_ids.long()] >= 0
+    odd_owner = odd.expert_map[topk_ids.long()] >= 0
+    if not bool((even_owner.int() + odd_owner.int() == 1).all()):
+        raise AssertionError("A top-k slot has duplicate or missing shard ownership")
+    zero_results = {}
+    for name, slots, owner in (
+        ("even", even_slots, even_owner),
+        ("odd", odd_slots, odd_owner),
+    ):
+        absent_slots = slots[~owner]
+        zero_results[name] = compare(absent_slots, torch.zeros_like(absent_slots), 0, 0)
+    merged_slots = torch.where(even_owner.unsqueeze(-1), even_slots, odd_slots)
+    full_reduced = torch.empty_like(hidden_states)
+    merged_reduced = torch.empty_like(hidden_states)
+    if hidden_states.shape[0]:
+        ops.moe_sum(full_slots, full_reduced)
+        ops.moe_sum(merged_slots, merged_reduced)
+    # Empty outputs already have the required [0, hidden] shape. Avoid launching
+    # a zero-grid reduction: the output contract itself is the empty-case check.
+    result = {
+        "slot_shape": list(expected_shape),
+        "slot_dtype": str(full_slots.dtype),
+        "owned_slots": {
+            "even": int(even_owner.sum()),
+            "odd": int(odd_owner.sum()),
+        },
+        "unique_route_ownership": True,
+        "nonresident_slots_exact_zero": zero_results,
+        "merge_kind": "GPU ownership mask; original top-k order; one native moe_sum",
+        "full_slots_reduced_vs_full_routed": compare(
+            full_reduced, full_output, atol, rtol
+        ),
+        "full_slots_reduced_vs_native_routed": compare(
+            full_reduced, native_routed, atol, rtol
+        ),
+        "merged_slots_vs_full_slots": compare(merged_slots, full_slots, atol, rtol),
+        "merged_slots_reduced_vs_full_routed": compare(
+            merged_reduced, full_output, atol, rtol
+        ),
+        "merged_slots_reduced_vs_native_routed": compare(
+            merged_reduced, native_routed, atol, rtol
+        ),
+    }
+    compare(hidden_states, saved_hidden, 0, 0)
+    compare(topk_weights, saved_weights, 0, 0)
+    compare(topk_ids, saved_ids, 0, 0)
+    result["inputs_unchanged"] = True
+    return result
 
 
 @torch.inference_mode()
@@ -215,6 +302,18 @@ def validate_layer(
                 "overlap_moe": compare(
                     shared + overlap_output, native_output, atol, rtol
                 ),
+                "slot_contributions": validate_slots(
+                    full,
+                    even,
+                    odd,
+                    x,
+                    topk_weights,
+                    topk_ids,
+                    full_output,
+                    native_routed,
+                    atol,
+                    rtol,
+                ),
             }
             compare(x, original_input, 0, 0)
             compare(topk_ids, saved_ids, 0, 0)
@@ -225,6 +324,82 @@ def validate_layer(
     empty = torch.empty(0, full.hidden_size, dtype=torch.bfloat16, device="cuda")
     empty_weights, empty_ids = router(empty)
     compare(full(empty, empty_weights, empty_ids), empty, 0, 0)
+    boundary_cases = [
+        {
+            "kind": "empty_input",
+            "tokens": 0,
+            "native_reference": "empty shape contract; no native kernel launched",
+            "slot_contributions": validate_slots(
+                full,
+                even,
+                odd,
+                empty,
+                empty_weights,
+                empty_ids,
+                empty,
+                empty,
+                atol,
+                rtol,
+            ),
+        }
+    ]
+    boundary_tokens = min(x.shape[0], BOUNDARY_BATCH_SIZE)
+    boundary_hidden = x[:boundary_tokens].contiguous()
+    boundary_weights = topk_weights[:boundary_tokens].contiguous()
+    # Exercise zero-hit shards and both ends of the logical Expert ID space.
+    # Each row has unique IDs; rotate their top-k order between rows so ownership
+    # restoration cannot accidentally rely on a fixed position for each shard.
+    boundary_routes = {
+        "all_even_zero_hit_odd": even.placement.expert_ids[: full.top_k],
+        "all_odd_zero_hit_even": odd.placement.expert_ids[: full.top_k],
+        "mixed_min_max_expert_ids": tuple(
+            index if index % 2 == 0 else total_experts - index
+            for index in range(full.top_k)
+        ),
+    }
+    slot_positions = (
+        torch.arange(full.top_k, device="cuda")[None, :]
+        + torch.arange(boundary_tokens, device="cuda")[:, None]
+    ) % full.top_k
+    for kind, route_ids in boundary_routes.items():
+        if len(route_ids) != full.top_k or len(set(route_ids)) != full.top_k:
+            raise AssertionError(
+                "Boundary routes require enough distinct resident experts"
+            )
+        forced_ids = torch.tensor(route_ids, dtype=torch.int32, device="cuda")[
+            slot_positions
+        ].contiguous()
+        with set_forward_context(None, config, num_tokens=boundary_tokens):
+            forced_native = reference_weights.forward_modular(
+                boundary_hidden, boundary_weights, forced_ids
+            )
+        forced_full = full(boundary_hidden, boundary_weights, forced_ids)
+        boundary_result = {
+            "kind": kind,
+            "seed": seeds[-1],
+            "tokens": boundary_tokens,
+            "routing_kind": "synthetic boundary IDs; native Router weights",
+            "first_row_logical_expert_ids": list(route_ids),
+            "native_reference": "native routed experts with the same boundary routes",
+            "slot_contributions": validate_slots(
+                full,
+                even,
+                odd,
+                boundary_hidden,
+                boundary_weights,
+                forced_ids,
+                forced_full,
+                forced_native,
+                atol,
+                rtol,
+            ),
+        }
+        boundary_cases.append(boundary_result)
+    for boundary_result in boundary_cases:
+        print(
+            json.dumps({"layer": layer_id, "slot_boundary": boundary_result}),
+            flush=True,
+        )
     invalid_ids = topk_ids.clone()
     invalid_ids[0, 0] = total_experts
     expect_rejection(lambda: full(x, topk_weights, invalid_ids), "out-of-range ID")
@@ -258,6 +433,7 @@ def validate_layer(
         "empty_input_and_unassigned_output_exact": True,
         "nonresident_only_output_exact_zero": True,
         "invalid_payload_checks_passed": True,
+        "slot_boundary_cases": boundary_cases,
         "cases": cases,
     }
 

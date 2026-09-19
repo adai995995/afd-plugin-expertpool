@@ -2,10 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Immutable multi-worker coverage and CPU-only replica tie breaking.
 
-Each resident layer currently contains all its routed experts. Layers can be
-partitioned or replicated across workers; a call executes on exactly one copy.
-The Controller can filter candidates by its authoritative slot ledger. There
-is no per-expert fan-out, migration or failure retry yet.
+Whole-layer mode permits replicated layers; partitioned mode assigns each
+logical expert to exactly one worker. The Controller reserves the required
+workers before dispatch. Placement is static, with no migration or retry.
 """
 
 from collections.abc import Collection
@@ -18,8 +17,11 @@ from afd_plugin.expert_pool.scheduler import StaticDirectory
 @dataclass(frozen=True)
 class PoolDirectory:
     workers: tuple[StaticDirectory, ...]
+    expert_partitioned: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.expert_partitioned) is not bool:
+            raise ValueError("Expert partitioning must be an explicit boolean")
         if not isinstance(self.workers, tuple) or not self.workers:
             raise ValueError("Pool requires immutable worker directories")
         if any(not isinstance(worker, StaticDirectory) for worker in self.workers):
@@ -28,7 +30,10 @@ class PoolDirectory:
             raise ValueError("Duplicate worker identity")
         reference = self.workers[0]
         layers: dict[int, int] = {}
+        covered: dict[int, set[int]] = {}
         for worker in self.workers:
+            if worker.allow_partial_experts != self.expert_partitioned:
+                raise ValueError("Pool and worker expert partition modes disagree")
             if (
                 worker.model_id,
                 worker.version,
@@ -47,6 +52,15 @@ class PoolDirectory:
                 count = layers.setdefault(placement.layer_id, placement.num_experts)
                 if count != placement.num_experts:
                     raise ValueError("Replica expert counts disagree")
+                if self.expert_partitioned:
+                    resident = covered.setdefault(placement.layer_id, set())
+                    if resident.intersection(placement.expert_ids):
+                        raise ValueError("Partitioned experts require a unique owner")
+                    resident.update(placement.expert_ids)
+        if self.expert_partitioned and any(
+            covered[layer] != set(range(count)) for layer, count in layers.items()
+        ):
+            raise ValueError("Expert partitions must cover every logical expert")
 
     @property
     def placements(self) -> tuple[ExpertPlacement, ...]:
@@ -73,12 +87,31 @@ class PoolDirectory:
                         0 <= expert_id < placement.num_experts
                     ):
                         raise ValueError("Invalid logical expert ID")
-                    locations.append(
-                        (worker.worker_id, placement.expert_ids.index(expert_id))
-                    )
+                    if expert_id in placement.expert_ids:
+                        locations.append(
+                            (worker.worker_id, placement.expert_ids.index(expert_id))
+                        )
         if not locations:
             raise ValueError("Layer is absent from the pool")
         return tuple(locations)
+
+    def owners(self, layer_id: int) -> tuple[str, ...]:
+        """Return all resident owners in deterministic reservation order."""
+        if type(layer_id) is not int or layer_id < 0:
+            raise ValueError("Invalid logical layer ID")
+        owners = tuple(
+            sorted(
+                worker.worker_id
+                for worker in self.workers
+                if any(
+                    placement.layer_id == layer_id and placement.expert_ids
+                    for placement in worker.placements
+                )
+            )
+        )
+        if not owners:
+            raise ValueError("Layer is absent from the pool")
+        return owners
 
 
 class ReplicaSelector:
@@ -90,6 +123,8 @@ class ReplicaSelector:
     """
 
     def __init__(self, directory: PoolDirectory, client_offset: int = 0) -> None:
+        if directory.expert_partitioned:
+            raise ValueError("Replica selector requires whole-layer coverage")
         if type(client_offset) is not int or client_offset < 0:
             raise ValueError("Client offset must be a nonnegative integer")
         self.candidates: dict[int, tuple[str, ...]] = {

@@ -58,6 +58,8 @@ class ExpertWorker:
     ) -> None:
         if not peers or len({peer.client_id for peer in peers}) != len(peers):
             raise ValueError("Worker requires unique client endpoints")
+        if directory.allow_partial_experts and controller is None:
+            raise ValueError("Expert partitions require authoritative gang control")
         if set(executors) != {p.layer_id for p in directory.placements}:
             raise ValueError("Loaded layers do not match the directory")
         self.device = peers[0].transport.device
@@ -82,14 +84,16 @@ class ExpertWorker:
         self.directory = directory
         self.executors = executors
         self.peers = {peer.client_id: peer for peer in peers}
-        # One outstanding call per declared client bounds the queues even when
-        # a service domain has more than the original four-client default.
-        domain_clients = Counter(peer.domain for peer in peers)
-        self.scheduler = StaticScheduler(
-            directory, max_pending_per_domain=max(domain_clients.values())
-        )
-        for peer in peers:
-            self.scheduler.register(peer.client_id, peer.session_epoch, peer.domain)
+        self.scheduler: StaticScheduler | None = None
+        if not directory.allow_partial_experts:
+            # One outstanding call per declared client bounds the queues even
+            # when a service domain has more than four clients.
+            domain_clients = Counter(peer.domain for peer in peers)
+            self.scheduler = StaticScheduler(
+                directory, max_pending_per_domain=max(domain_clients.values())
+            )
+            for peer in peers:
+                self.scheduler.register(peer.client_id, peer.session_epoch, peer.domain)
         self.audit_inputs = audit_inputs
         self.execution = execution or ExecutionOptions()
         self.profiler = profiler
@@ -111,7 +115,15 @@ class ExpertWorker:
             device=self.device,
         )
         self.ids = torch.empty_like(self.weights, dtype=torch.int32)
-        self.output = torch.empty_like(self.hidden)
+        self.output = (
+            torch.empty(
+                (directory.max_tokens, directory.top_k, directory.hidden_size),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            if directory.allow_partial_experts
+            else torch.empty_like(self.hidden)
+        )
         self.completed_calls = 0
         self.client_calls = dict.fromkeys(self.peers, 0)
         self.layer_calls = dict.fromkeys(self.executors, 0)
@@ -122,11 +134,13 @@ class ExpertWorker:
     ) -> None:
         peer = self.peers[plan.request.key.client_id]
         control = self.controller if self.controller is not None else peer.control
-        admitted_queue_ms = (
-            controller_queue_ms
-            if controller_queue_ms is not None
-            else (time.perf_counter_ns() - self.scheduler.active_enqueued_ns) / 1e6
-        )
+        if controller_queue_ms is not None:
+            admitted_queue_ms = controller_queue_ms
+        else:
+            assert self.scheduler is not None
+            admitted_queue_ms = (
+                time.perf_counter_ns() - self.scheduler.active_enqueued_ns
+            ) / 1e6
         started = time.perf_counter_ns()
         send_message(
             control,
@@ -163,14 +177,25 @@ class ExpertWorker:
         if self.controller is not None:
             send_message(control, Message("executing", plan=plan))
         try:
-            result = self.executors[plan.request.layer_id](hidden, weights, ids)
+            executor = self.executors[plan.request.layer_id]
+            result = (
+                executor.forward_slots(hidden, weights, ids)
+                if self.directory.allow_partial_experts
+                else executor(hidden, weights, ids)
+            )
         except ValueError as error:
             # All incoming transfers have completed. No output send was posted,
-            # so a matched error can safely release the slot. CUDA failures must
-            # escape and terminate the launch instead of reusing suspect memory.
+            # so a whole-layer error can safely release its individual slot.
+            # Partitioned siblings may still be in NCCL and require fail-stop.
+            # CUDA failures always terminate without reusing suspect memory.
             torch.cuda.current_stream(self.device).synchronize()
             send_message(control, Message("error", plan=plan, detail=str(error)))
+            if self.directory.allow_partial_experts:
+                raise RuntimeError(
+                    "Expert fan-out failed; terminate the deployment"
+                ) from error
             if self.controller is None:
+                assert self.scheduler is not None
                 self.scheduler.complete(plan)
             return
         self.output[:rows].copy_(result)
@@ -193,6 +218,7 @@ class ExpertWorker:
         # The send event is complete: a later call may now reuse the slot. Do
         # not release on host enqueue or on receipt of a CPU completion alone.
         if self.controller is None:
+            assert self.scheduler is not None
             self.scheduler.complete(plan)
         self.completed_calls += 1
         self.client_calls[plan.request.key.client_id] += 1
@@ -237,6 +263,7 @@ class ExpertWorker:
             if self.controller is not None:
                 self._run_controlled()
                 return
+            assert self.scheduler is not None
             while connections:
                 timeout = 0 if self.scheduler.outstanding else None
                 for connection in wait(list(connections), timeout=timeout):

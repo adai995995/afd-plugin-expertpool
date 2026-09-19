@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 
 from afd_plugin.expert_pool.checkpoint import DeepseekCheckpoint
 from afd_plugin.expert_pool.placement import ExpertPlacement
+from afd_plugin.expert_pool.slot_backend import fused_expert_slots
 
 
 class ExpertExecutor(nn.Module):
@@ -88,21 +89,13 @@ class ExpertExecutor(nn.Module):
         """Allocated tensor storage, excluding mapping/buffers/CUDA allocator cache."""
         return self.w13.untyped_storage().nbytes() + self.w2.untyped_storage().nbytes()
 
-    @torch.inference_mode()
-    def forward(
+    def _validate_inputs(
         self,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        assignment_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Execute resident routes; an optional mask selects this physical copy.
-
-        ``assignment_mask`` addresses token/top-k slots, never changes their
-        logical IDs or weights, and must not assign an absent expert here.
-        The caller must check global coverage/uniqueness across all workers.
-        Unassigned slots use Triton's internal -1 skip sentinel.
-        """
+    ) -> None:
+        """Validate metadata, with optional explicit CUDA value auditing."""
         if (
             hidden_states.ndim != 2
             or hidden_states.shape[1] != self.hidden_size
@@ -138,9 +131,26 @@ class ExpertExecutor(nn.Module):
                 (topk_weights < 0).any()
             ):
                 raise ValueError("Routing weights must be finite and nonnegative")
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        assignment_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Execute resident routes; an optional mask selects this physical copy.
+
+        ``assignment_mask`` addresses token/top-k slots, never changes their
+        logical IDs or weights, and must not assign an absent expert here.
+        The caller must check global coverage/uniqueness across all workers.
+        Unassigned slots use Triton's internal -1 skip sentinel.
+        """
+        self._validate_inputs(hidden_states, topk_weights, topk_ids)
         if assignment_mask is not None:
             if (
-                assignment_mask.shape != expected_shape
+                assignment_mask.shape != topk_ids.shape
                 or assignment_mask.dtype != torch.bool
                 or assignment_mask.device != self.w13.device
             ):
@@ -159,6 +169,30 @@ class ExpertExecutor(nn.Module):
             topk_weights,
             topk_ids,
             activation=MoEActivation.SILU,
+            global_num_experts=self.placement.num_experts,
+            expert_map=self.expert_map,
+        )
+
+    @torch.inference_mode()
+    def forward_slots(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return weighted BF16 [tokens, top_k, hidden] resident contributions.
+
+        Static disjoint ownership replaces a per-token assignment mask. Missing
+        local experts produce zero slots; the A performs the final reduction
+        once after collecting the unique owner for every logical route slot.
+        """
+        self._validate_inputs(hidden_states, topk_weights, topk_ids)
+        return fused_expert_slots(
+            hidden_states,
+            self.w13,
+            self.w2,
+            topk_weights,
+            topk_ids,
             global_num_experts=self.placement.num_experts,
             expert_map=self.expert_map,
         )

@@ -49,6 +49,8 @@ MAX_BATCH_TOKENS = 256
 MAX_MODEL_LEN = 1024
 KV_CACHE_BYTES = 256 * 1024 * 1024
 GENERATED_TOKENS = 16
+BF16_WEIGHT_ELEMENT_BYTES = 2
+EXPERT_PROJECTION_COUNT = 3
 PROMPTS = (
     "The capital of France is",
     "A triangle has three sides. A square has",
@@ -383,6 +385,17 @@ def run(args: argparse.Namespace, report: dict) -> None:
                             if args.placement == "partitioned"
                             else None
                         ),
+                        expert_ids=(
+                            tuple(
+                                range(
+                                    index,
+                                    model_config["n_routed_experts"],
+                                    args.expert_workers,
+                                )
+                            )
+                            if args.placement == "expert_partitioned"
+                            else None
+                        ),
                     )
                     for index in range(args.expert_workers)
                 ),
@@ -390,6 +403,11 @@ def run(args: argparse.Namespace, report: dict) -> None:
                     ControllerConfig(str(root), args.controller_policy)
                     if args.controller
                     else None
+                ),
+                dispatch_mode=(
+                    "expert_partitioned"
+                    if args.placement == "expert_partitioned"
+                    else "whole_layer"
                 ),
             )
             directory = deployment.pool_directory()
@@ -536,13 +554,19 @@ def run(args: argparse.Namespace, report: dict) -> None:
                     for layer in before["layers"]
                 ):
                     raise AssertionError("An MoE layer did not execute real requests")
-            verify_dispatch(
+            report["dispatch_accounting"] = verify_dispatch(
                 directory,
                 statuses,
                 closed,
                 report["workers"],
                 require_each_replica=(
                     not args.controller or args.controller_policy == "round_robin"
+                ),
+                expert_weight_bytes=(
+                    model_config["hidden_size"]
+                    * model_config["moe_intermediate_size"]
+                    * EXPERT_PROJECTION_COUNT
+                    * BF16_WEIGHT_ELEMENT_BYTES
                 ),
             )
             if controller is not None:
@@ -560,6 +584,13 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 ):
                     raise AssertionError(
                         "Controller did not drain all clients and reservations"
+                    )
+                if (
+                    controlled["completed_by_client"]
+                    != report["dispatch_accounting"]["parent_layer_calls_by_client"]
+                ):
+                    raise AssertionError(
+                        "Controller parent completions disagree with A layer calls"
                     )
                 for worker in report["workers"]:
                     counters = controlled["workers"][worker["worker_id"]]
@@ -621,8 +652,13 @@ def verify_dispatch(
     workers: list[dict],
     *,
     require_each_replica: bool = True,
-) -> None:
-    """Reconcile counters and coverage without requiring balanced dynamic use."""
+    expert_weight_bytes: int | None = None,
+) -> dict:
+    """Reconcile parent calls with worker children and actual resident weights.
+
+    A partitioned parent executes once on every owner; a whole-layer parent
+    executes on one replica. These counts are different from user requests.
+    """
     after = [item["status"][0] for item in closed]
     by_worker = {item["worker_id"]: item for item in workers}
     if set(by_worker) != {worker.worker_id for worker in directory.workers}:
@@ -633,6 +669,16 @@ def verify_dispatch(
             actual["resident_layers"]
         ) != {placement.layer_id for placement in worker.placements}:
             raise AssertionError("Worker loaded the wrong placement")
+        if actual["resident_experts"] != {
+            str(placement.layer_id): list(placement.expert_ids)
+            for placement in worker.placements
+        }:
+            raise AssertionError("Worker loaded the wrong expert IDs or slot order")
+        if expert_weight_bytes is not None and actual["resident_weight_bytes"] != (
+            expert_weight_bytes
+            * sum(len(placement.expert_ids) for placement in worker.placements)
+        ):
+            raise AssertionError("Worker allocated more or fewer expert weights")
         calls = 0
         for before, status in zip(ready, after, strict=True):
             start = before["dispatch"]["workers"][worker.worker_id]
@@ -657,11 +703,53 @@ def verify_dispatch(
                 raise AssertionError("Layer completion accounting disagrees")
     for status in after:
         for layer, counters in status["layers"].items():
-            if counters["calls"] != sum(
-                worker["layer_calls"].get(layer, 0)
-                for worker in status["dispatch"]["workers"].values()
-            ):
-                raise AssertionError("A layer call was lost or duplicated")
+            owners = directory.owners(int(layer))
+            child_counts = {
+                worker_id: worker["layer_calls"].get(layer, 0)
+                for worker_id, worker in status["dispatch"]["workers"].items()
+            }
+            if any(count for key, count in child_counts.items() if key not in owners):
+                raise AssertionError("A layer executed on a nonresident worker")
+            if directory.expert_partitioned:
+                if any(child_counts[owner] != counters["calls"] for owner in owners):
+                    raise AssertionError("A partition child was lost or duplicated")
+            elif counters["calls"] != sum(child_counts.values()):
+                raise AssertionError("A whole-layer call was lost or duplicated")
+    parents = {
+        status["client_id"]: sum(layer["calls"] for layer in status["layers"].values())
+        for status in after
+    }
+    children = {worker["worker_id"]: worker["completed_calls"] for worker in workers}
+    return {
+        "dispatch_mode": (
+            "expert_partitioned" if directory.expert_partitioned else "whole_layer"
+        ),
+        "count_scope": "Layer calls including engine initialization, not user requests",
+        "parent_layer_calls": sum(parents.values()),
+        "parent_layer_calls_by_client": parents,
+        "worker_child_calls": sum(children.values()),
+        "worker_child_calls_by_worker": children,
+        "request_parent_layer_calls": sum(
+            status["layers"][layer]["calls"] - before["layers"][layer]["calls"]
+            for before, status in zip(ready, after, strict=True)
+            for layer in status["layers"]
+        ),
+        "request_worker_child_calls": sum(
+            status["dispatch"]["workers"][worker]["calls"]
+            - before["dispatch"]["workers"][worker]["calls"]
+            for before, status in zip(ready, after, strict=True)
+            for worker in status["dispatch"]["workers"]
+        ),
+        "resident_routed_weight_bytes": sum(
+            worker["resident_weight_bytes"] for worker in workers
+        ),
+        "single_model_routed_weight_bytes": (
+            expert_weight_bytes
+            * sum(placement.num_experts for placement in directory.placements)
+            if expert_weight_bytes is not None
+            else None
+        ),
+    }
 
 
 def main() -> int:
@@ -687,7 +775,9 @@ def main() -> int:
         help="Bind on admission, or select an available resident copy at grant time",
     )
     parser.add_argument(
-        "--placement", choices=("replicated", "partitioned"), default="replicated"
+        "--placement",
+        choices=("replicated", "partitioned", "expert_partitioned"),
+        default="replicated",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--lock-path", type=Path, required=True)
@@ -698,6 +788,12 @@ def main() -> int:
     args = parser.parse_args()
     if not args.controller and args.controller_policy != "round_robin":
         parser.error("--controller-policy requires --controller")
+    if args.placement == "expert_partitioned" and (
+        not args.controller or args.controller_policy != "ready_first"
+    ):
+        parser.error(
+            "Expert partitions require --controller --controller-policy ready_first"
+        )
     try:
         ExecutionOptions(**args.execution_options)
     except (TypeError, ValueError) as error:
@@ -732,6 +828,11 @@ def main() -> int:
         "execution_options": args.execution_options,
         "expert_workers": args.expert_workers,
         "placement_mode": args.placement,
+        "dispatch_mode": (
+            "expert_partitioned"
+            if args.placement == "expert_partitioned"
+            else "whole_layer"
+        ),
         "controller_enabled": args.controller,
         "controller_policy": args.controller_policy if args.controller else None,
     }

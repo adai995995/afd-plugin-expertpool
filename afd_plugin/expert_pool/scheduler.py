@@ -15,10 +15,11 @@ from afd_plugin.expert_pool.protocol import CallKey, CallRequest, ExecutionPlan
 
 @dataclass(frozen=True)
 class StaticDirectory:
-    """Complete resident coverage on one worker for explicitly enabled layers.
+    """Resident coverage on one worker for explicitly enabled layers.
 
     model_id binds an immutable checkpoint selected by the launcher. It is not
     inferred from model architecture and does not prove cross-checkpoint equality.
+    Partial expert coverage requires a partition-aware controller and client.
     """
 
     model_id: str
@@ -28,8 +29,11 @@ class StaticDirectory:
     hidden_size: int
     top_k: int
     max_tokens: int
+    allow_partial_experts: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.allow_partial_experts) is not bool:
+            raise ValueError("Partial expert coverage must be an explicit boolean")
         if (
             not isinstance(self.model_id, str)
             or not 0 < len(self.model_id) <= 256
@@ -50,7 +54,9 @@ class StaticDirectory:
         if len(set(layers)) != len(layers):
             raise ValueError("Duplicate layer placement")
         for placement in self.placements:
-            if set(placement.expert_ids) != set(range(placement.num_experts)):
+            if not self.allow_partial_experts and set(placement.expert_ids) != set(
+                range(placement.num_experts)
+            ):
                 raise ValueError("Single-worker runtime requires complete coverage")
             if self.top_k > placement.num_experts:
                 raise ValueError("Top-k exceeds expert count")
@@ -79,6 +85,8 @@ class StaticScheduler:
     def __init__(
         self, directory: StaticDirectory, max_pending_per_domain: int = 4
     ) -> None:
+        if directory.allow_partial_experts:
+            raise ValueError("Static scheduler requires complete worker coverage")
         if type(max_pending_per_domain) is not int or max_pending_per_domain <= 0:
             raise ValueError("Domain queue capacity must be positive")
         self.directory = directory

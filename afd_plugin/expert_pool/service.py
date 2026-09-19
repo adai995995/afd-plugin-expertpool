@@ -145,6 +145,11 @@ def serve(
                     "client_calls": dict(worker.client_calls),
                     "layer_calls": dict(worker.layer_calls),
                     "resident_layers": sorted(executors),
+                    "dispatch_mode": deployment.dispatch_mode,
+                    "resident_experts": {
+                        str(layer): list(executor.placement.expert_ids)
+                        for layer, executor in executors.items()
+                    },
                     "resident_weight_bytes": sum(
                         e.weight_storage_bytes for e in executors.values()
                     ),

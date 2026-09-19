@@ -17,6 +17,7 @@ from afd_plugin.expert_pool.client import PoolClient
 from afd_plugin.expert_pool.controlled_client import ControlledPoolClient
 from afd_plugin.expert_pool.controller_service import connect_controller
 from afd_plugin.expert_pool.deployment import PoolDeployment
+from afd_plugin.expert_pool.fanout_client import FanoutPoolClient
 from afd_plugin.expert_pool.replica_client import ReplicaPoolClient
 from afd_plugin.model_executor.models.pool_deepseek_v2 import (
     PoolDeepseekV2ForCausalLM,
@@ -101,7 +102,12 @@ class PoolAttentionWorker(Worker):
                     deployment, "client", settings["client_id"]
                 )
                 startup.callback(controller.close)
-                client = ControlledPoolClient(
+                client_type = (
+                    FanoutPoolClient
+                    if deployment.dispatch_mode == "expert_partitioned"
+                    else ControlledPoolClient
+                )
+                client = client_type(
                     tuple(channels),
                     controller,
                     scheduling_policy=deployment.controller.scheduling_policy,

@@ -26,6 +26,13 @@ class ReplicaPoolClient:
     def __init__(
         self, channels: tuple[PoolClient, ...], *, client_offset: int = 0
     ) -> None:
+        self._initialize_channels(channels)
+        self.selector = ReplicaSelector(self.directory, client_offset)
+
+    def _initialize_channels(
+        self, channels: tuple[PoolClient, ...], *, expert_partitioned: bool = False
+    ) -> None:
+        """Bind fresh channels; subclasses supply a compatible dispatch policy."""
         if not channels:
             raise ValueError("Pool client requires worker channels")
         first = channels[0]
@@ -38,9 +45,11 @@ class ReplicaPoolClient:
             for channel in channels
         ):
             raise ValueError("Channels must bind one fresh A session on one GPU")
-        self.directory = PoolDirectory(tuple(channel.directory for channel in channels))
+        self.directory = PoolDirectory(
+            tuple(channel.directory for channel in channels),
+            expert_partitioned=expert_partitioned,
+        )
         self.channels = {channel.directory.worker_id: channel for channel in channels}
-        self.selector = ReplicaSelector(self.directory, client_offset)
         self.client_id = first.client_id
         self.session_epoch = first.session_epoch
         self.sequence = 0

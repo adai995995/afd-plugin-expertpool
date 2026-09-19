@@ -59,6 +59,19 @@ class ControllerLedger:
         clients: tuple[ControllerClientIdentity, ...],
         scheduling_policy: str = "round_robin",
     ) -> None:
+        self._initialize(directory, clients, scheduling_policy)
+        self.selectors = {
+            client_id: ReplicaSelector(directory, offset)
+            for offset, client_id in enumerate(sorted(self.clients))
+        }
+
+    def _initialize(
+        self,
+        directory: PoolDirectory,
+        clients: tuple[ControllerClientIdentity, ...],
+        scheduling_policy: str,
+    ) -> None:
+        """Initialize shared bounded state; subclasses supply dispatch policy."""
         if scheduling_policy not in CONTROLLER_POLICIES:
             raise ValueError("Unknown controller scheduling policy")
         if not clients or len({c.client_id for c in clients}) != len(clients):
@@ -67,10 +80,6 @@ class ControllerLedger:
         self.scheduling_policy = scheduling_policy
         self.directories = {d.worker_id: d for d in directory.workers}
         self.clients = {c.client_id: c for c in clients}
-        self.selectors = {
-            client_id: ReplicaSelector(directory, offset)
-            for offset, client_id in enumerate(sorted(self.clients))
-        }
         self.last_sequence = dict.fromkeys(self.clients, -1)
         self.outstanding: dict[str, CallKey] = {}
         self.closed: set[str] = set()

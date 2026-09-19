@@ -13,6 +13,7 @@ from pathlib import Path
 
 from afd_plugin.expert_pool.controller import ControllerClientIdentity, ControllerLedger
 from afd_plugin.expert_pool.deployment import PoolDeployment
+from afd_plugin.expert_pool.fanout_controller import FanoutControllerLedger
 from afd_plugin.expert_pool.protocol import Message, receive_message, send_message
 
 CONNECT_RETRY_S = 0.05
@@ -156,7 +157,12 @@ def serve_controller(deployment: PoolDeployment) -> dict:
         for client_id in deployment.client_ids
         for c in (deployment.client_endpoints(client_id),)
     )
-    ledger = ControllerLedger(
+    ledger_type = (
+        FanoutControllerLedger
+        if deployment.dispatch_mode == "expert_partitioned"
+        else ControllerLedger
+    )
+    ledger = ledger_type(
         deployment.pool_directory(),
         identities,
         scheduling_policy=deployment.controller.scheduling_policy,

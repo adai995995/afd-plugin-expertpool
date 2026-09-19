@@ -67,10 +67,11 @@ class ClientEndpoint:
 
 @dataclass(frozen=True)
 class WorkerPlacement:
-    """Resident whole-layer expert replicas; None explicitly means all layers."""
+    """Resident layers and a shared expert subset; None means full coverage."""
 
     worker_id: str
     layer_ids: tuple[int, ...] | None = None
+    expert_ids: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.worker_id, str) or not 0 < len(self.worker_id) <= 128:
@@ -82,6 +83,13 @@ class WorkerPlacement:
             or len(set(self.layer_ids)) != len(self.layer_ids)
         ):
             raise ValueError("Worker layers must be unique nonnegative integers")
+        if self.expert_ids is not None and (
+            not isinstance(self.expert_ids, tuple)
+            or not self.expert_ids
+            or any(type(expert) is not int or expert < 0 for expert in self.expert_ids)
+            or len(set(self.expert_ids)) != len(self.expert_ids)
+        ):
+            raise ValueError("Worker experts must be unique nonnegative integers")
 
 
 @dataclass(frozen=True)
@@ -110,6 +118,7 @@ class PoolDeployment:
     workers: tuple[WorkerPlacement, ...] = (WorkerPlacement("worker-0"),)
     placement_version: int = 1
     controller: ControllerConfig | None = None
+    dispatch_mode: str = "whole_layer"
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution, ExecutionOptions):
@@ -136,6 +145,24 @@ class PoolDeployment:
             raise ValueError("Deployment requires unique immutable worker placements")
         if type(self.placement_version) is not int or self.placement_version < 0:
             raise ValueError("Invalid placement version")
+        if not isinstance(self.dispatch_mode, str) or self.dispatch_mode not in {
+            "whole_layer",
+            "expert_partitioned",
+        }:
+            raise ValueError("Unknown expert dispatch mode")
+        if self.dispatch_mode == "whole_layer":
+            if any(worker.expert_ids is not None for worker in self.workers):
+                raise ValueError("Whole-layer dispatch requires full worker experts")
+        else:
+            if (
+                not isinstance(self.controller, ControllerConfig)
+                or self.controller.scheduling_policy != "ready_first"
+            ):
+                raise ValueError(
+                    "Expert partitioning requires a ready-first controller"
+                )
+            if any(worker.expert_ids is None for worker in self.workers):
+                raise ValueError("Expert partitioning requires explicit worker experts")
         pairs = {(client.client_id, client.worker_id) for client in self.clients}
         expected = {
             (client_id, worker_id)
@@ -190,6 +217,11 @@ class PoolDeployment:
                         "layer_ids": (
                             tuple(worker["layer_ids"])
                             if worker.get("layer_ids") is not None
+                            else None
+                        ),
+                        "expert_ids": (
+                            tuple(worker["expert_ids"])
+                            if worker.get("expert_ids") is not None
                             else None
                         ),
                     }
@@ -275,18 +307,26 @@ class PoolDeployment:
                         ExpertPlacement(
                             layer,
                             config["n_routed_experts"],
-                            tuple(range(config["n_routed_experts"])),
+                            (
+                                worker.expert_ids
+                                if worker.expert_ids is not None
+                                else tuple(range(config["n_routed_experts"]))
+                            ),
                         )
                         for layer in sorted(layers)
                     ),
                     config["hidden_size"],
                     config["num_experts_per_tok"],
                     self.max_tokens,
+                    allow_partial_experts=self.dispatch_mode == "expert_partitioned",
                 )
             )
         if covered != required:
             raise ValueError("Pool placement must cover every model MoE layer")
-        return PoolDirectory(tuple(directories))
+        return PoolDirectory(
+            tuple(directories),
+            expert_partitioned=self.dispatch_mode == "expert_partitioned",
+        )
 
     def directory(self, worker_id: str | None = None) -> StaticDirectory:
         if worker_id is None:
