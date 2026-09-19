@@ -84,6 +84,9 @@ class ControllerRuntime:
                                         w.completed
                                         for w in self.ledger.workers.values()
                                     ),
+                                    "completed_parents": sum(
+                                        self.ledger.completed_by_client.values()
+                                    ),
                                     "busy_replica_bypasses": (
                                         self.ledger.busy_replica_bypasses
                                     ),
@@ -100,6 +103,15 @@ class ControllerRuntime:
                                     "error", request=message.request, detail=str(error)
                                 ),
                             )
+                        else:
+                            if (
+                                message.request.demand is not None
+                                and message.request.num_tokens == 0
+                            ):
+                                send_message(
+                                    connection,
+                                    Message("empty_done", request=message.request),
+                                )
                     else:
                         raise ValueError("Unexpected client control message")
                 elif message.kind == "ready":
@@ -157,16 +169,19 @@ def serve_controller(deployment: PoolDeployment) -> dict:
         for client_id in deployment.client_ids
         for c in (deployment.client_endpoints(client_id),)
     )
-    ledger_type = (
-        FanoutControllerLedger
-        if deployment.dispatch_mode == "expert_partitioned"
-        else ControllerLedger
-    )
-    ledger = ledger_type(
-        deployment.pool_directory(),
-        identities,
-        scheduling_policy=deployment.controller.scheduling_policy,
-    )
+    if deployment.dispatch_mode == "expert_partitioned":
+        ledger = FanoutControllerLedger(
+            deployment.pool_directory(),
+            identities,
+            scheduling_policy=deployment.controller.scheduling_policy,
+            demand_aware=deployment.demand_aware,
+        )
+    else:
+        ledger = ControllerLedger(
+            deployment.pool_directory(),
+            identities,
+            scheduling_policy=deployment.controller.scheduling_policy,
+        )
     with ExitStack() as stack:
         listeners = {
             (role, identity): stack.enter_context(

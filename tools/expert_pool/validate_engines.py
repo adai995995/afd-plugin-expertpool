@@ -409,6 +409,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                     if args.placement == "expert_partitioned"
                     else "whole_layer"
                 ),
+                demand_aware=args.expert_demand,
             )
             directory = deployment.pool_directory()
             report["placement"] = asdict(directory)
@@ -568,6 +569,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                     * EXPERT_PROJECTION_COUNT
                     * BF16_WEIGHT_ELEMENT_BYTES
                 ),
+                demand_aware=args.expert_demand,
             )
             if controller is not None:
                 controlled = receive_record(controller, args.timeout)
@@ -601,6 +603,8 @@ def run(args: argparse.Namespace, report: dict) -> None:
                         raise AssertionError(
                             "Controller and GPU worker counters disagree"
                         )
+                if args.expert_demand:
+                    verify_demand_controller(controlled, report["dispatch_accounting"])
             for child in children[1:]:
                 child.join(args.timeout)
                 if child.exitcode != 0:
@@ -653,12 +657,16 @@ def verify_dispatch(
     *,
     require_each_replica: bool = True,
     expert_weight_bytes: int | None = None,
+    demand_aware: bool = False,
 ) -> dict:
     """Reconcile parent calls with worker children and actual resident weights.
 
-    A partitioned parent executes once on every owner; a whole-layer parent
-    executes on one replica. These counts are different from user requests.
+    A broadcast parent executes on every owner; a demand parent executes only
+    on selected owners, and an empty parent has no children. A whole-layer
+    parent executes on one replica. None of these counts are user requests.
     """
+    if demand_aware and not directory.expert_partitioned:
+        raise AssertionError("Expert demand requires partitioned dispatch")
     after = [item["status"][0] for item in closed]
     by_worker = {item["worker_id"]: item for item in workers}
     if set(by_worker) != {worker.worker_id for worker in directory.workers}:
@@ -685,10 +693,14 @@ def verify_dispatch(
             end = status["dispatch"]["workers"][worker.worker_id]
             if end["calls"] != actual["client_calls"][status["client_id"]]:
                 raise AssertionError("Client/worker completion counts disagree")
-            if require_each_replica and any(
-                end["layer_calls"][str(placement.layer_id)]
-                <= start["layer_calls"][str(placement.layer_id)]
-                for placement in worker.placements
+            if (
+                require_each_replica
+                and not demand_aware
+                and any(
+                    end["layer_calls"][str(placement.layer_id)]
+                    <= start["layer_calls"][str(placement.layer_id)]
+                    for placement in worker.placements
+                )
             ):
                 raise AssertionError("A client did not exercise each resident replica")
             calls += end["calls"]
@@ -710,6 +722,9 @@ def verify_dispatch(
             }
             if any(count for key, count in child_counts.items() if key not in owners):
                 raise AssertionError("A layer executed on a nonresident worker")
+            if demand_aware:
+                # Per-expert metadata below determines which owners participated.
+                continue
             if directory.expert_partitioned:
                 if any(child_counts[owner] != counters["calls"] for owner in owners):
                     raise AssertionError("A partition child was lost or duplicated")
@@ -720,10 +735,14 @@ def verify_dispatch(
         for status in after
     }
     children = {worker["worker_id"]: worker["completed_calls"] for worker in workers}
+    demand_summary = (
+        verify_expert_demand(directory, ready, after, workers) if demand_aware else {}
+    )
     return {
         "dispatch_mode": (
             "expert_partitioned" if directory.expert_partitioned else "whole_layer"
         ),
+        "demand_aware": demand_aware,
         "count_scope": "Layer calls including engine initialization, not user requests",
         "parent_layer_calls": sum(parents.values()),
         "parent_layer_calls_by_client": parents,
@@ -749,7 +768,149 @@ def verify_dispatch(
             if expert_weight_bytes is not None
             else None
         ),
+        **demand_summary,
     }
+
+
+def verify_expert_demand(
+    directory: PoolDirectory,
+    ready: list[dict],
+    after: list[dict],
+    workers: list[dict],
+) -> dict:
+    """Validate selected children and assignment totals from independent reports."""
+    logical_counts = {
+        str(placement.layer_id): placement.num_experts
+        for placement in directory.placements
+    }
+    worker_layers = {
+        worker.worker_id: {str(p.layer_id): p.expert_ids for p in worker.placements}
+        for worker in directory.workers
+    }
+    top_k = directory.workers[0].top_k
+    for status in ready + after:
+        if status["dispatch"].get("demand_aware") is not True:
+            raise AssertionError("A report does not enable expert demand")
+        demand = status["dispatch"]["demand"]
+        if demand["parent_layer_calls"] != {
+            layer: counters["calls"] for layer, counters in status["layers"].items()
+        }:
+            raise AssertionError("Demand parent counters disagree with model layers")
+        if any(
+            set(demand[field]) != set(logical_counts)
+            for field in (
+                "parent_layer_calls",
+                "empty_layer_calls",
+                "expert_assignments",
+            )
+        ) or set(demand["selected_worker_layer_calls"]) != set(worker_layers):
+            raise AssertionError("Demand report coverage is incomplete")
+        for worker_id, layers in worker_layers.items():
+            selected = demand["selected_worker_layer_calls"][worker_id]
+            completed = status["dispatch"]["workers"][worker_id]
+            if set(selected) != set(layers) or selected != completed["layer_calls"]:
+                raise AssertionError("Selected and completed worker layers disagree")
+            if sum(selected.values()) != completed["calls"]:
+                raise AssertionError("Selected worker total is inconsistent")
+        for layer, expert_count in logical_counts.items():
+            parent = demand["parent_layer_calls"][layer]
+            empty = demand["empty_layer_calls"][layer]
+            assignments = demand["expert_assignments"][layer]
+            if (
+                type(parent) is not int
+                or type(empty) is not int
+                or not 0 <= empty <= parent
+                or not isinstance(assignments, list)
+                or len(assignments) != expert_count
+                or any(type(count) is not int or count < 0 for count in assignments)
+            ):
+                raise AssertionError("Invalid demand parent or assignment counts")
+            if sum(assignments) != status["layers"][layer]["token_rows"] * top_k:
+                raise AssertionError(
+                    "Demand assignments do not cover routed token rows"
+                )
+            selected_total = 0
+            for owner in directory.owners(int(layer)):
+                count = demand["selected_worker_layer_calls"][owner][layer]
+                owned_assignments = sum(
+                    assignments[expert] for expert in worker_layers[owner][layer]
+                )
+                if (
+                    type(count) is not int
+                    or not 0 <= count <= parent - empty
+                    or owned_assignments < count
+                    or (count == 0) != (owned_assignments == 0)
+                ):
+                    raise AssertionError(
+                        "Selected child count contradicts expert demand"
+                    )
+                selected_total += count
+            if selected_total < parent - empty:
+                raise AssertionError("A nonempty parent is missing all child calls")
+    expected_assignments = {
+        worker_id: {
+            layer: {
+                str(expert): sum(
+                    status["dispatch"]["demand"]["expert_assignments"][layer][expert]
+                    for status in after
+                )
+                for expert in experts
+            }
+            for layer, experts in layers.items()
+        }
+        for worker_id, layers in worker_layers.items()
+    }
+    for worker in workers:
+        if (
+            worker.get("demand_aware") is not True
+            or worker["expert_assignments"]
+            != (expected_assignments[worker["worker_id"]])
+        ):
+            raise AssertionError("A and E expert assignment reports disagree")
+    empty_calls = sum(
+        sum(status["dispatch"]["demand"]["empty_layer_calls"].values())
+        for status in after
+    )
+    return {
+        "empty_parent_calls": empty_calls,
+        "expert_assignments_by_worker_layer_expert": expected_assignments,
+        "expert_assignments": sum(
+            sum(counts.values())
+            for layers in expected_assignments.values()
+            for counts in layers.values()
+        ),
+        "skipped_worker_calls": {
+            worker_id: sum(
+                status["layers"][layer]["calls"]
+                - status["dispatch"]["workers"][worker_id]["layer_calls"][layer]
+                for status in after
+                for layer in layers
+            )
+            for worker_id, layers in worker_layers.items()
+        },
+        "request_empty_parent_calls": sum(
+            status["dispatch"]["demand"]["empty_layer_calls"][layer]
+            - before["dispatch"]["demand"]["empty_layer_calls"][layer]
+            for before, status in zip(ready, after, strict=True)
+            for layer in logical_counts
+        ),
+    }
+
+
+def verify_demand_controller(controlled: dict, accounting: dict) -> None:
+    if controlled.get("demand_aware") is not True or any(
+        controlled[reported] != accounting[expected]
+        for reported, expected in (
+            ("empty_parent_calls", "empty_parent_calls"),
+            ("selected_worker_calls", "worker_child_calls_by_worker"),
+            ("skipped_worker_calls", "skipped_worker_calls"),
+            (
+                "admitted_assignments_by_worker_layer_expert",
+                "expert_assignments_by_worker_layer_expert",
+            ),
+        )
+    ):
+        raise AssertionError("Controller and completed demand accounting disagree")
 
 
 def main() -> int:
@@ -779,6 +940,11 @@ def main() -> int:
         choices=("replicated", "partitioned", "expert_partitioned"),
         default="replicated",
     )
+    parser.add_argument(
+        "--expert-demand",
+        action="store_true",
+        help="Dispatch expert partitions only to owners with positive routed demand",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--lock-path", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=300)
@@ -794,6 +960,8 @@ def main() -> int:
         parser.error(
             "Expert partitions require --controller --controller-policy ready_first"
         )
+    if args.expert_demand and args.placement != "expert_partitioned":
+        parser.error("--expert-demand requires --placement expert_partitioned")
     try:
         ExecutionOptions(**args.execution_options)
     except (TypeError, ValueError) as error:
@@ -833,6 +1001,7 @@ def main() -> int:
             if args.placement == "expert_partitioned"
             else "whole_layer"
         ),
+        "demand_aware": args.expert_demand,
         "controller_enabled": args.controller,
         "controller_policy": args.controller_policy if args.controller else None,
     }

@@ -119,6 +119,7 @@ class PoolDeployment:
     placement_version: int = 1
     controller: ControllerConfig | None = None
     dispatch_mode: str = "whole_layer"
+    demand_aware: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution, ExecutionOptions):
@@ -145,6 +146,10 @@ class PoolDeployment:
             raise ValueError("Deployment requires unique immutable worker placements")
         if type(self.placement_version) is not int or self.placement_version < 0:
             raise ValueError("Invalid placement version")
+        if type(self.demand_aware) is not bool or (
+            self.demand_aware and self.dispatch_mode != "expert_partitioned"
+        ):
+            raise ValueError("Expert demand requires explicit expert partitioning")
         if not isinstance(self.dispatch_mode, str) or self.dispatch_mode not in {
             "whole_layer",
             "expert_partitioned",

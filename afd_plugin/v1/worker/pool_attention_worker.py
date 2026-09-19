@@ -102,16 +102,19 @@ class PoolAttentionWorker(Worker):
                     deployment, "client", settings["client_id"]
                 )
                 startup.callback(controller.close)
-                client_type = (
-                    FanoutPoolClient
-                    if deployment.dispatch_mode == "expert_partitioned"
-                    else ControlledPoolClient
-                )
-                client = client_type(
-                    tuple(channels),
-                    controller,
-                    scheduling_policy=deployment.controller.scheduling_policy,
-                )
+                if deployment.dispatch_mode == "expert_partitioned":
+                    client = FanoutPoolClient(
+                        tuple(channels),
+                        controller,
+                        scheduling_policy=deployment.controller.scheduling_policy,
+                        demand_aware=deployment.demand_aware,
+                    )
+                else:
+                    client = ControlledPoolClient(
+                        tuple(channels),
+                        controller,
+                        scheduling_policy=deployment.controller.scheduling_policy,
+                    )
             else:
                 client = ReplicaPoolClient(
                     tuple(channels),

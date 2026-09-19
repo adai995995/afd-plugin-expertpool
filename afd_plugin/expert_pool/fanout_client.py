@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Static expert partition dispatch with one native Top-k reduction on A.
 
-The first version broadcasts the complete batch to every resident owner and
-returns unreduced slots. It preserves routing and avoids CPU route reads, but
-does not yet pack selected rows or optimize communication volume.
+Inputs remain complete batches and outputs retain original Top-k slots. The
+optional demand path copies only a bounded Expert count vector to the host,
+then submits to the owners with positive demand. Payloads stay on the GPU.
 """
 
 import time
+from dataclasses import replace
 from multiprocessing.connection import Connection
 
 import torch
@@ -15,6 +16,8 @@ from vllm import _custom_ops as ops
 
 from afd_plugin.expert_pool.client import PoolClient
 from afd_plugin.expert_pool.controlled_client import ControlledPoolClient
+from afd_plugin.expert_pool.demand import plan_expert_demand
+from afd_plugin.expert_pool.demand_gpu import ExpertDemandCollector
 from afd_plugin.expert_pool.fanout_protocol import FanoutReplies
 from afd_plugin.expert_pool.protocol import Message, receive_message, send_message
 
@@ -25,6 +28,8 @@ class FanoutPoolClient(ControlledPoolClient):
         channels: tuple[PoolClient, ...],
         control: Connection,
         scheduling_policy: str = "ready_first",
+        *,
+        demand_aware: bool = False,
     ) -> None:
         if scheduling_policy != "ready_first":
             raise ValueError("Expert partitions require ready-first gang admission")
@@ -32,8 +37,36 @@ class FanoutPoolClient(ControlledPoolClient):
         self.control = control
         self.timeout_s = channels[0].timeout_s
         self.scheduling_policy = scheduling_policy
-        # Immutable placement metadata is uploaded once. No router values are
-        # fetched from CUDA during dispatch; indexing below stays on the GPU.
+        if type(demand_aware) is not bool:
+            raise ValueError("Expert demand must be an explicit boolean")
+        self.demand_aware = demand_aware
+        self.layer_expert_counts = {
+            placement.layer_id: placement.num_experts
+            for placement in self.directory.placements
+        }
+        self.collectors = (
+            {
+                count: ExpertDemandCollector(
+                    count,
+                    channels[0].transport.device,
+                    channels[0].directory.max_tokens * channels[0].directory.top_k,
+                )
+                for count in set(self.layer_expert_counts.values())
+            }
+            if demand_aware
+            else {}
+        )
+        self.parent_layer_calls = dict.fromkeys(self.layer_expert_counts, 0)
+        self.empty_layer_calls = dict.fromkeys(self.layer_expert_counts, 0)
+        self.expert_assignments = {
+            layer: [0] * count for layer, count in self.layer_expert_counts.items()
+        }
+        self.selected_worker_layer_calls = {
+            worker: dict.fromkeys(layers, 0)
+            for worker, layers in self.worker_layer_calls.items()
+        }
+        # Immutable placement metadata is uploaded once. Lookup indices stay
+        # on the GPU; the optional demand path copies only its count summary.
         self.ownership = {
             (worker.worker_id, placement.layer_id): torch.tensor(
                 [slot >= 0 for slot in placement.global_to_local()],
@@ -76,11 +109,53 @@ class FanoutPoolClient(ControlledPoolClient):
             request = self.channels[owners[0]].prepare_request(
                 layer_id, hidden_states, topk_weights, topk_ids, self.sequence
             )
-            replies = FanoutReplies(request, owners)
             started = time.perf_counter_ns()
+            demand_metrics = {}
+            dispatch_plan = None
+            if self.demand_aware:
+                try:
+                    demand, demand_metrics = self.collectors[
+                        self.layer_expert_counts[layer_id]
+                    ].collect(topk_ids)
+                except ValueError:
+                    # Metadata rejection or invalid-ID rejection after the
+                    # completed summary copy posts no controller/NCCL work.
+                    raise
+                except BaseException:
+                    # GPU failure or interruption may leave collector events
+                    # in flight even though no request has been submitted yet.
+                    self.failed = True
+                    raise
+                request = replace(request, demand=demand)
+                planning_started = time.perf_counter_ns()
+                dispatch_plan = plan_expert_demand(self.directory, request)
+                owners = dispatch_plan.owners
+                demand_metrics["client_demand_plan_ms"] = (
+                    time.perf_counter_ns() - planning_started
+                ) / 1e6
+            submitted = time.perf_counter_ns()
             self.sequence += 1
             issued = True
             send_message(self.control, Message("submit", request=request))
+            if not owners:
+                completion = receive_message(self.control, self.timeout_s)
+                if completion.kind != "empty_done" or completion.request != request:
+                    raise RuntimeError("Empty demand completion does not match request")
+                finished = time.perf_counter_ns()
+                self.parent_layer_calls[layer_id] += 1
+                self.empty_layer_calls[layer_id] += 1
+                metrics = {
+                    **demand_metrics,
+                    "client_validation_ms": (started - validation_started) / 1e6,
+                    "client_admission_wait_ms": (finished - submitted) / 1e6,
+                    "client_host_roundtrip_ms": (finished - started) / 1e6,
+                }
+                if self.metrics is not None:
+                    self.metrics.record(layer_id, 0, metrics)
+                return torch.empty_like(hidden_states), Message(
+                    "empty_done", request=request, metrics=metrics
+                )
+            replies = FanoutReplies(request, owners, dispatch_plan=dispatch_plan)
             grants = {
                 owner: self._fanout_reply(replies, "grant", owner) for owner in owners
             }
@@ -113,8 +188,9 @@ class FanoutPoolClient(ControlledPoolClient):
             }
             finished = time.perf_counter_ns()
             metrics = {
+                **demand_metrics,
                 "client_validation_ms": (started - validation_started) / 1e6,
-                "client_admission_wait_ms": (granted - started) / 1e6,
+                "client_admission_wait_ms": (granted - submitted) / 1e6,
                 "client_input_transfer_wall_ms": (inputs_sent - granted) / 1e6,
                 "client_output_ready_wait_ms": (output_ready - inputs_sent) / 1e6,
                 "client_output_transfer_wall_ms": (output_received - output_ready)
@@ -128,6 +204,7 @@ class FanoutPoolClient(ControlledPoolClient):
             for owner in owners:
                 self.worker_calls[owner] += 1
                 self.worker_layer_calls[owner][layer_id] += 1
+                self.selected_worker_layer_calls[owner][layer_id] += 1
                 channel = self.channels[owner]
                 if channel.metrics is not None:
                     channel.metrics.record(
@@ -137,6 +214,11 @@ class FanoutPoolClient(ControlledPoolClient):
                     )
             if self.metrics is not None:
                 self.metrics.record(layer_id, request.num_tokens, metrics)
+            self.parent_layer_calls[layer_id] += 1
+            if request.demand is not None:
+                counts = self.expert_assignments[layer_id]
+                for expert, assignments in enumerate(request.demand.counts):
+                    counts[expert] += assignments
             # The public return represents the parent; its representative
             # child plan is metadata only, never a buffer-release authority.
             return output, Message(
@@ -153,6 +235,31 @@ class FanoutPoolClient(ControlledPoolClient):
 
     def dispatch_status(self) -> dict:
         result = super().dispatch_status()
-        result["policy"] = "controller-expert-partitioned-gang"
+        result["policy"] = (
+            "controller-expert-demand-gang"
+            if self.demand_aware
+            else "controller-expert-partitioned-gang"
+        )
         result["output_contract"] = "weighted-top-k-slots"
+        result["demand_aware"] = self.demand_aware
+        if self.demand_aware:
+            result["demand"] = {
+                "parent_layer_calls": {
+                    str(k): v for k, v in self.parent_layer_calls.items()
+                },
+                "empty_layer_calls": {
+                    str(k): v for k, v in self.empty_layer_calls.items()
+                },
+                "expert_assignments": {
+                    str(k): list(v) for k, v in self.expert_assignments.items()
+                },
+                "selected_worker_layer_calls": {
+                    w: {str(k): v for k, v in layers.items()}
+                    for w, layers in self.selected_worker_layer_calls.items()
+                },
+                "summary_bytes_by_expert_count": {
+                    str(count): collector.summary_bytes
+                    for count, collector in self.collectors.items()
+                },
+            }
         return result

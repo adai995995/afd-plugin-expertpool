@@ -135,6 +135,7 @@ def serve(
                     execution=deployment.execution,
                     profiler=profiler,
                     controller=controller,
+                    demand_aware=deployment.demand_aware,
                 )
                 worker.run()
                 return {
@@ -146,6 +147,8 @@ def serve(
                     "layer_calls": dict(worker.layer_calls),
                     "resident_layers": sorted(executors),
                     "dispatch_mode": deployment.dispatch_mode,
+                    "demand_aware": deployment.demand_aware,
+                    "expert_assignments": worker.expert_assignments,
                     "resident_experts": {
                         str(layer): list(executor.placement.expert_ids)
                         for layer, executor in executors.items()

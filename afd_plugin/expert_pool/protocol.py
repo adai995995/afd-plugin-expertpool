@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field
 from multiprocessing.connection import Connection
 
 MAX_CONTROL_BYTES = 65536
+MAX_DEMAND_EXPERTS = 4096
 MESSAGE_KINDS = frozenset(
     {
         "submit",
@@ -26,6 +27,7 @@ MESSAGE_KINDS = frozenset(
         "executing",
         "status",
         "snapshot",
+        "empty_done",
     }
 )
 
@@ -47,6 +49,27 @@ class CallKey:
 
 
 @dataclass(frozen=True)
+class ExpertDemand:
+    """CPU metadata counting routed top-k assignments, not unique token rows."""
+
+    counts: tuple[int, ...]
+    ready_ns: int
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.counts, tuple)
+            or not 0 < len(self.counts) <= MAX_DEMAND_EXPERTS
+            or any(type(count) is not int or count < 0 for count in self.counts)
+        ):
+            raise ValueError("Demand requires bounded nonnegative integer counts")
+        if type(self.ready_ns) is not int or self.ready_ns < 0:
+            raise ValueError("Demand readiness must be a nonnegative timestamp")
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("Unsupported expert demand version")
+
+
+@dataclass(frozen=True)
 class CallRequest:
     key: CallKey
     model_id: str
@@ -55,6 +78,7 @@ class CallRequest:
     num_tokens: int
     hidden_size: int
     top_k: int
+    demand: ExpertDemand | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, CallKey):
@@ -67,6 +91,11 @@ class CallRequest:
         for value in (self.hidden_size, self.top_k):
             if type(value) is not int or value <= 0:
                 raise ValueError("Invalid tensor shape")
+        if self.demand is not None:
+            if not isinstance(self.demand, ExpertDemand):
+                raise ValueError("Request requires typed expert demand")
+            if sum(self.demand.counts) != self.num_tokens * self.top_k:
+                raise ValueError("Demand must count every routed top-k assignment")
 
 
 @dataclass(frozen=True)
@@ -76,6 +105,8 @@ class ExecutionPlan:
     plan_id: int
     slot_id: int
     generation: int
+    expert_ids: tuple[int, ...] = ()
+    num_assignments: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -89,6 +120,31 @@ class ExecutionPlan:
             for value in (self.plan_id, self.slot_id, self.generation)
         ):
             raise ValueError("Invalid plan or buffer identity")
+        if not isinstance(self.expert_ids, tuple):
+            raise ValueError("Plan expert IDs must be immutable")
+        if self.num_assignments is None:
+            if self.expert_ids or self.request.demand is not None:
+                raise ValueError("Legacy plans cannot carry expert demand")
+            return
+        if (
+            type(self.num_assignments) is not int
+            or self.num_assignments <= 0
+            or self.request.demand is None
+            or not self.expert_ids
+            or any(
+                type(expert) is not int
+                or not 0 <= expert < len(self.request.demand.counts)
+                for expert in self.expert_ids
+            )
+            or len(set(self.expert_ids)) != len(self.expert_ids)
+        ):
+            raise ValueError("Invalid demand execution plan")
+        if any(self.request.demand.counts[expert] == 0 for expert in self.expert_ids):
+            raise ValueError("Plan cannot dispatch experts without demand")
+        if self.num_assignments != sum(
+            self.request.demand.counts[expert] for expert in self.expert_ids
+        ):
+            raise ValueError("Plan assignment count disagrees with expert demand")
 
 
 @dataclass(frozen=True)
@@ -111,6 +167,13 @@ class Message:
             raise ValueError("Invalid error detail")
         if self.kind == "submit" and (self.request is None or self.plan is not None):
             raise ValueError("Submit requires a request only")
+        if self.kind == "empty_done" and (
+            self.request is None
+            or self.request.demand is None
+            or self.request.num_tokens != 0
+            or self.plan is not None
+        ):
+            raise ValueError("Empty completion requires a zero-token demand request")
         if self.kind in {
             "grant",
             "input_ready",
@@ -152,6 +215,21 @@ def encode_message(message: Message) -> bytes:
     return payload
 
 
+def _decode_request(raw: dict) -> CallRequest:
+    if not isinstance(raw, dict):
+        raise ValueError("Malformed request object")
+    request = dict(raw)
+    request["key"] = CallKey(**request["key"])
+    if request.get("demand") is not None:
+        demand = request["demand"]
+        if not isinstance(demand, dict) or not isinstance(demand.get("counts"), list):
+            raise ValueError("Malformed demand object")
+        request["demand"] = ExpertDemand(
+            **{**demand, "counts": tuple(demand["counts"])}
+        )
+    return CallRequest(**request)
+
+
 def decode_message(payload: bytes) -> Message:
     if len(payload) > MAX_CONTROL_BYTES:
         raise ValueError("Control message exceeds size limit")
@@ -160,14 +238,14 @@ def decode_message(payload: bytes) -> Message:
         if set(data) != {"kind", "request", "plan", "detail", "metrics", "digests"}:
             raise ValueError("Unexpected message fields")
         if data["request"] is not None:
-            request = data["request"]
-            request["key"] = CallKey(**request["key"])
-            data["request"] = CallRequest(**request)
+            data["request"] = _decode_request(data["request"])
         if data["plan"] is not None:
             plan = data["plan"]
-            request = plan["request"]
-            request["key"] = CallKey(**request["key"])
-            plan["request"] = CallRequest(**request)
+            plan["request"] = _decode_request(plan["request"])
+            if "expert_ids" in plan:
+                if not isinstance(plan["expert_ids"], list):
+                    raise ValueError("Malformed plan expert IDs")
+                plan["expert_ids"] = tuple(plan["expert_ids"])
             data["plan"] = ExecutionPlan(**plan)
         return Message(**data)
     except (KeyError, TypeError, UnicodeError) as error:

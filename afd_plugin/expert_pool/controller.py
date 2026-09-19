@@ -109,6 +109,8 @@ class ControllerLedger:
         worker.phase = "idle"
 
     def submit(self, client_id: str, request: CallRequest, now_ns: int) -> None:
+        if request.demand is not None:
+            raise ValueError("Whole-layer dispatch does not accept expert demand")
         identity = self.clients[client_id]
         if client_id in self.closed or (
             request.key.client_id,

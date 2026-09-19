@@ -55,11 +55,17 @@ class ExpertWorker:
         execution: ExecutionOptions | None = None,
         profiler: WorkerProfiler | None = None,
         controller: Connection | None = None,
+        demand_aware: bool = False,
     ) -> None:
         if not peers or len({peer.client_id for peer in peers}) != len(peers):
             raise ValueError("Worker requires unique client endpoints")
         if directory.allow_partial_experts and controller is None:
             raise ValueError("Expert partitions require authoritative gang control")
+        if type(demand_aware) is not bool or (
+            demand_aware and (not directory.allow_partial_experts or controller is None)
+        ):
+            raise ValueError("Expert demand requires controlled expert partitions")
+        self.demand_aware = demand_aware
         if set(executors) != {p.layer_id for p in directory.placements}:
             raise ValueError("Loaded layers do not match the directory")
         self.device = peers[0].transport.device
@@ -127,6 +133,10 @@ class ExpertWorker:
         self.completed_calls = 0
         self.client_calls = dict.fromkeys(self.peers, 0)
         self.layer_calls = dict.fromkeys(self.executors, 0)
+        self.expert_assignments = {
+            str(p.layer_id): dict.fromkeys((str(e) for e in p.expert_ids), 0)
+            for p in directory.placements
+        }
 
     @torch.inference_mode()
     def _execute(
@@ -223,6 +233,12 @@ class ExpertWorker:
         self.completed_calls += 1
         self.client_calls[plan.request.key.client_id] += 1
         self.layer_calls[plan.request.layer_id] += 1
+        if self.demand_aware:
+            assert plan.request.demand is not None
+            for expert in plan.expert_ids:
+                self.expert_assignments[str(plan.request.layer_id)][str(expert)] += (
+                    plan.request.demand.counts[expert]
+                )
         send_message(
             control, Message("done", plan=plan, metrics=metrics, digests=digests)
         )
@@ -241,6 +257,16 @@ class ExpertWorker:
                 raise RuntimeError("Worker expected a reserved controller plan")
             plan = message.plan
             self.directory.validate(plan.request)
+            if self.demand_aware != (plan.request.demand is not None):
+                raise RuntimeError("Worker and plan demand modes disagree")
+            if self.demand_aware:
+                placement = self.executors[plan.request.layer_id].placement
+                demand = plan.request.demand
+                assert demand is not None
+                if len(demand.counts) != placement.num_experts or plan.expert_ids != (
+                    tuple(sorted(e for e in placement.expert_ids if demand.counts[e]))
+                ):
+                    raise RuntimeError("Plan does not match resident expert demand")
             peer = self.peers.get(plan.request.key.client_id)
             if (
                 peer is None

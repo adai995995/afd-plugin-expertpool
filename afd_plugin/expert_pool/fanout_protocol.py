@@ -2,13 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Bounded reply demultiplexing for one parent with static expert owners."""
 
+from afd_plugin.expert_pool.demand import DispatchPlan
 from afd_plugin.expert_pool.protocol import CallRequest, ExecutionPlan, Message
 
 FANOUT_REPLY_KINDS = ("grant", "output_ready", "done")
 
 
 class FanoutReplies:
-    def __init__(self, request: CallRequest, owners: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        request: CallRequest,
+        owners: tuple[str, ...],
+        *,
+        dispatch_plan: DispatchPlan | None = None,
+    ) -> None:
         if not isinstance(request, CallRequest):
             raise ValueError("Fan-out replies require a parent request")
         if (
@@ -22,6 +29,13 @@ class FanoutReplies:
         ):
             raise ValueError("Fan-out replies require unique worker identities")
         self.request = request
+        if (request.demand is not None) != (dispatch_plan is not None):
+            raise ValueError("Demand replies require the expected dispatch plan")
+        if dispatch_plan is not None and (
+            dispatch_plan.request != request or dispatch_plan.owners != owners
+        ):
+            raise ValueError("Dispatch plan and fan-out reply owners disagree")
+        self.dispatch_plan = dispatch_plan
         self.owners = owners
         self.plans: dict[str, ExecutionPlan] = {}
         self.next_phase = dict.fromkeys(owners, 0)
@@ -47,6 +61,13 @@ class FanoutReplies:
         ):
             raise RuntimeError("Duplicate or out-of-order fan-out reply")
         if index == 0:
+            if self.dispatch_plan is not None:
+                task = self.dispatch_plan.task_for(worker_id)
+                if (plan.expert_ids, plan.num_assignments) != (
+                    task.expert_ids,
+                    task.num_assignments,
+                ):
+                    raise RuntimeError("Granted task disagrees with expert demand")
             if any(
                 previous.plan_id == plan.plan_id for previous in self.plans.values()
             ):

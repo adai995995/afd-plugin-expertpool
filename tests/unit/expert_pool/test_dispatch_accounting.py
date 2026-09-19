@@ -8,7 +8,7 @@ from copy import deepcopy
 from afd_plugin.expert_pool.directory import PoolDirectory
 from afd_plugin.expert_pool.placement import ExpertPlacement
 from afd_plugin.expert_pool.scheduler import StaticDirectory
-from tools.expert_pool.validate_engines import verify_dispatch
+from tools.expert_pool.validate_engines import verify_demand_controller, verify_dispatch
 
 EXPERT_WEIGHT_BYTES = 192
 
@@ -82,6 +82,57 @@ def reports(partitioned: bool) -> tuple[PoolDirectory, list, list, list]:
             }
         )
     return directory, ready, closed, workers
+
+
+def demand_reports(
+    *, all_empty: bool = False
+) -> tuple[PoolDirectory, list, list, list]:
+    """Each A selects one opposite owner; initial empty calls select neither."""
+    pool, ready, closed, workers = reports(True)
+    for index, (before, record) in enumerate(zip(ready, closed, strict=True)):
+        after = record["status"][0]
+        for status, initial in ((before, True), (after, False)):
+            parent = status["layers"]["1"]["calls"]
+            empty = parent if initial or all_empty else index + 1
+            selected = parent - empty
+            assignments = [0, 0, 0, 0]
+            assignments[index] = selected * 2
+            assignments[index + 2] = selected * 2
+            status["layers"]["1"]["token_rows"] = selected * 2
+            for worker in range(2):
+                count = selected if index == worker else 0
+                status["dispatch"]["workers"][f"e{worker}"] = {
+                    "calls": count,
+                    "layer_calls": {"1": count},
+                }
+            status["dispatch"].update(
+                demand_aware=True,
+                demand={
+                    "parent_layer_calls": {"1": parent},
+                    "empty_layer_calls": {"1": empty},
+                    "expert_assignments": {"1": assignments},
+                    "selected_worker_layer_calls": {
+                        f"e{worker}": {"1": selected if worker == index else 0}
+                        for worker in range(2)
+                    },
+                    "summary_bytes_by_expert_count": {"4": 40},
+                },
+            )
+    for index, worker in enumerate(workers):
+        selected = 0 if all_empty else index + 2
+        worker.update(
+            demand_aware=True,
+            completed_calls=selected,
+            client_calls={
+                "a0": selected if index == 0 else 0,
+                "a1": selected if index == 1 else 0,
+            },
+            layer_calls={"1": selected},
+            expert_assignments={
+                "1": {str(index): selected * 2, str(index + 2): selected * 2}
+            },
+        )
+    return pool, ready, closed, workers
 
 
 class DispatchAccountingTests(unittest.TestCase):
@@ -184,6 +235,93 @@ class DispatchAccountingTests(unittest.TestCase):
                     workers,
                     expert_weight_bytes=EXPERT_WEIGHT_BYTES,
                 )
+
+    def test_demand_counts_only_selected_children_and_tracks_empty_parents(self):
+        summary = verify_dispatch(
+            *demand_reports(),
+            demand_aware=True,
+            expert_weight_bytes=EXPERT_WEIGHT_BYTES,
+        )
+        self.assertTrue(summary["demand_aware"])
+        self.assertEqual(summary["parent_layer_calls"], 8)
+        self.assertEqual(summary["empty_parent_calls"], 3)
+        self.assertEqual(summary["worker_child_calls"], 5)
+        self.assertEqual(summary["worker_child_calls_by_worker"], {"e0": 2, "e1": 3})
+        self.assertEqual(summary["skipped_worker_calls"], {"e0": 6, "e1": 5})
+        self.assertEqual(summary["request_parent_layer_calls"], 6)
+        self.assertEqual(summary["request_empty_parent_calls"], 1)
+        self.assertEqual(summary["request_worker_child_calls"], 5)
+        self.assertEqual(summary["expert_assignments"], 20)
+        self.assertEqual(
+            summary["expert_assignments_by_worker_layer_expert"],
+            {"e0": {"1": {"0": 4, "2": 4}}, "e1": {"1": {"1": 6, "3": 6}}},
+        )
+
+    def test_all_empty_demand_has_no_worker_execution_or_assignments(self):
+        summary = verify_dispatch(
+            *demand_reports(all_empty=True),
+            demand_aware=True,
+            expert_weight_bytes=EXPERT_WEIGHT_BYTES,
+        )
+        self.assertEqual(summary["parent_layer_calls"], 8)
+        self.assertEqual(summary["empty_parent_calls"], 8)
+        self.assertEqual(summary["worker_child_calls"], 0)
+        self.assertEqual(summary["expert_assignments"], 0)
+        self.assertEqual(summary["request_empty_parent_calls"], 6)
+        self.assertEqual(summary["skipped_worker_calls"], {"e0": 8, "e1": 8})
+
+    def test_demand_parent_empty_assignment_and_selection_reports_are_checked(self):
+        for field, value in (
+            ("parent_layer_calls", {"1": 4}),
+            ("empty_layer_calls", {"1": 4}),
+            ("empty_layer_calls", {"1": -1}),
+            ("expert_assignments", {"1": [4, 0, 3, 0]}),
+            ("expert_assignments", {"1": [4, 0, 4]}),
+            ("expert_assignments", {"1": [0, 4, 0, 4]}),
+            ("selected_worker_layer_calls", {"e0": {"1": 3}, "e1": {"1": 0}}),
+        ):
+            pool, ready, closed, workers = demand_reports()
+            closed[0]["status"][0]["dispatch"]["demand"][field] = value
+            with (
+                self.subTest(field=field, value=value),
+                self.assertRaises(AssertionError),
+            ):
+                verify_dispatch(pool, ready, closed, workers, demand_aware=True)
+
+    def test_worker_assignments_must_match_all_clients_logical_counts(self):
+        for counts in ({"0": 3, "2": 4}, {"0": 4}, {"0": 4, "2": 4, "1": 0}):
+            pool, ready, closed, workers = demand_reports()
+            workers[0]["expert_assignments"] = {"1": counts}
+            with (
+                self.subTest(counts=counts),
+                self.assertRaisesRegex(AssertionError, "A and E"),
+            ):
+                verify_dispatch(pool, ready, closed, workers, demand_aware=True)
+        with self.assertRaises(AssertionError):
+            verify_dispatch(*reports(False), demand_aware=True)
+
+    def test_controller_demand_counts_match_drained_execution(self):
+        accounting = verify_dispatch(*demand_reports(), demand_aware=True)
+        controlled = {
+            "demand_aware": True,
+            "empty_parent_calls": 3,
+            "selected_worker_calls": {"e0": 2, "e1": 3},
+            "skipped_worker_calls": {"e0": 6, "e1": 5},
+            "admitted_assignments_by_worker_layer_expert": {
+                "e0": {"1": {"0": 4, "2": 4}},
+                "e1": {"1": {"1": 6, "3": 6}},
+            },
+        }
+        verify_demand_controller(controlled, accounting)
+        for key, value in (
+            ("demand_aware", False),
+            ("empty_parent_calls", 2),
+            ("selected_worker_calls", {"e0": 3, "e1": 3}),
+            ("skipped_worker_calls", {"e0": 5, "e1": 5}),
+            ("admitted_assignments_by_worker_layer_expert", {}),
+        ):
+            with self.subTest(key=key), self.assertRaises(AssertionError):
+                verify_demand_controller({**controlled, key: value}, accounting)
 
 
 if __name__ == "__main__":
