@@ -136,6 +136,7 @@ def serve(
                     profiler=profiler,
                     controller=controller,
                     demand_aware=deployment.demand_aware,
+                    compact_output=deployment.compact_output,
                 )
                 worker.run()
                 return {
@@ -148,6 +149,8 @@ def serve(
                     "resident_layers": sorted(executors),
                     "dispatch_mode": deployment.dispatch_mode,
                     "demand_aware": deployment.demand_aware,
+                    "compact_output": deployment.compact_output,
+                    "output_transfer": dict(worker.output_transfer),
                     "expert_assignments": worker.expert_assignments,
                     "resident_experts": {
                         str(layer): list(executor.placement.expert_ids)

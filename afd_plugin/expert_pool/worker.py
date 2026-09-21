@@ -16,6 +16,7 @@ from multiprocessing.connection import Connection, wait
 import torch
 
 from afd_plugin.connectors.gpu.pool import PoolTransport
+from afd_plugin.expert_pool.compact_output import CompactOutputWorkspace
 from afd_plugin.expert_pool.controller import directory_digest
 from afd_plugin.expert_pool.deployment import ExecutionOptions
 from afd_plugin.expert_pool.executor import ExpertExecutor
@@ -56,6 +57,7 @@ class ExpertWorker:
         profiler: WorkerProfiler | None = None,
         controller: Connection | None = None,
         demand_aware: bool = False,
+        compact_output: bool = False,
     ) -> None:
         if not peers or len({peer.client_id for peer in peers}) != len(peers):
             raise ValueError("Worker requires unique client endpoints")
@@ -66,6 +68,9 @@ class ExpertWorker:
         ):
             raise ValueError("Expert demand requires controlled expert partitions")
         self.demand_aware = demand_aware
+        if type(compact_output) is not bool or (compact_output and not demand_aware):
+            raise ValueError("Compact output requires expert-demand dispatch")
+        self.compact_output = compact_output
         if set(executors) != {p.layer_id for p in directory.placements}:
             raise ValueError("Loaded layers do not match the directory")
         self.device = peers[0].transport.device
@@ -121,15 +126,46 @@ class ExpertWorker:
             device=self.device,
         )
         self.ids = torch.empty_like(self.weights, dtype=torch.int32)
-        self.output = (
-            torch.empty(
-                (directory.max_tokens, directory.top_k, directory.hidden_size),
-                dtype=torch.bfloat16,
-                device=self.device,
+        self.output_workspace = (
+            CompactOutputWorkspace(
+                directory.max_tokens * directory.top_k,
+                directory.hidden_size,
+                self.device,
             )
-            if directory.allow_partial_experts
-            else torch.empty_like(self.hidden)
+            if compact_output
+            else None
         )
+        self.ownership = (
+            {
+                placement.layer_id: torch.tensor(
+                    [slot >= 0 for slot in placement.global_to_local()],
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                for placement in directory.placements
+            }
+            if compact_output
+            else {}
+        )
+        self.output = (
+            None
+            if compact_output
+            else (
+                torch.empty(
+                    (directory.max_tokens, directory.top_k, directory.hidden_size),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+                if directory.allow_partial_experts
+                else torch.empty_like(self.hidden)
+            )
+        )
+        self.pack_events = (
+            tuple(torch.cuda.Event(enable_timing=True) for _ in range(2))
+            if compact_output and self.execution.reuse_cuda_events
+            else None
+        )
+        self.output_transfer = {"sent_bytes": 0, "dense_equivalent_bytes": 0}
         self.completed_calls = 0
         self.client_calls = dict.fromkeys(self.peers, 0)
         self.layer_calls = dict.fromkeys(self.executors, 0)
@@ -208,16 +244,45 @@ class ExpertWorker:
                 assert self.scheduler is not None
                 self.scheduler.complete(plan)
             return
-        self.output[:rows].copy_(result)
-        end.record()
+        pack_metrics = {}
+        pack_begin = pack_end = None
+        if self.compact_output:
+            end.record()
+            assert self.output_workspace is not None
+            assert plan.num_assignments is not None
+            pack_begin, pack_end = self.pack_events or (
+                torch.cuda.Event(enable_timing=True) for _ in range(2)
+            )
+            pack_begin.record()
+            outgoing = self.output_workspace.pack(
+                result,
+                ids,
+                self.ownership[plan.request.layer_id],
+                num_assignments=plan.num_assignments,
+            )
+            pack_end.record()
+            output_event = pack_end
+        else:
+            assert self.output is not None
+            self.output[:rows].copy_(result)
+            outgoing = self.output[:rows]
+            end.record()
+            output_event = end
         if not self.execution.defer_output_sync:
-            end.synchronize()
+            output_event.synchronize()
         # output_ready authorizes posting a receive; it is not a completion
         # credit. The transfer stream waits for the producer event, and its
         # finished event still completes before the slot can be released.
         send_message(control, Message("output_ready", plan=plan))
-        send_ms = peer.transport.transfer((self.output[:rows],), send=True)
+        send_ms = peer.transport.transfer((outgoing,), send=True)
+        if pack_begin is not None and pack_end is not None:
+            pack_metrics["output_pack_gpu_ms"] = pack_begin.elapsed_time(pack_end)
+        self.output_transfer["sent_bytes"] += outgoing.numel() * outgoing.element_size()
+        self.output_transfer["dense_equivalent_bytes"] += (
+            result.numel() * result.element_size()
+        )
         metrics = {
+            **pack_metrics,
             "admitted_queue_ms": admitted_queue_ms,
             "receive_gpu_ms": receive_ms,
             "compute_phase_gpu_ms": begin.elapsed_time(end),
@@ -259,6 +324,8 @@ class ExpertWorker:
             self.directory.validate(plan.request)
             if self.demand_aware != (plan.request.demand is not None):
                 raise RuntimeError("Worker and plan demand modes disagree")
+            if self.compact_output != plan.request.compact_output:
+                raise RuntimeError("Worker and plan output layouts disagree")
             if self.demand_aware:
                 placement = self.executors[plan.request.layer_id].placement
                 demand = plan.request.demand

@@ -120,6 +120,7 @@ class PoolDeployment:
     controller: ControllerConfig | None = None
     dispatch_mode: str = "whole_layer"
     demand_aware: bool = False
+    compact_output: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution, ExecutionOptions):
@@ -150,6 +151,11 @@ class PoolDeployment:
             self.demand_aware and self.dispatch_mode != "expert_partitioned"
         ):
             raise ValueError("Expert demand requires explicit expert partitioning")
+        if type(self.compact_output) is not bool or (
+            self.compact_output
+            and (not self.demand_aware or self.dispatch_mode != "expert_partitioned")
+        ):
+            raise ValueError("Compact output requires demand-aware expert partitioning")
         if not isinstance(self.dispatch_mode, str) or self.dispatch_mode not in {
             "whole_layer",
             "expert_partitioned",

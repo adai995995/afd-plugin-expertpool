@@ -175,6 +175,7 @@ def serve_controller(deployment: PoolDeployment) -> dict:
             identities,
             scheduling_policy=deployment.controller.scheduling_policy,
             demand_aware=deployment.demand_aware,
+            compact_output=deployment.compact_output,
         )
     else:
         ledger = ControllerLedger(

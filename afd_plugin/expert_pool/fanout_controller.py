@@ -28,13 +28,17 @@ class FanoutControllerLedger(ControllerLedger):
         scheduling_policy: str = "ready_first",
         *,
         demand_aware: bool = False,
+        compact_output: bool = False,
     ) -> None:
         if not directory.expert_partitioned or scheduling_policy != "ready_first":
             raise ValueError("Expert fan-out requires partitioned ready-first control")
         if type(demand_aware) is not bool:
             raise ValueError("Demand-aware dispatch must be a boolean")
+        if type(compact_output) is not bool or (compact_output and not demand_aware):
+            raise ValueError("Compact output requires demand-aware dispatch")
         self._initialize(directory, clients, scheduling_policy)
         self.demand_aware = demand_aware
+        self.compact_output = compact_output
         self.active_parents: dict[CallKey, tuple[ExecutionPlan, ...]] = {}
         self.pending_child_plans: deque[tuple[ExecutionPlan, float]] = deque()
         # Requests and placement are immutable. Keep one derived plan per
@@ -69,6 +73,10 @@ class FanoutControllerLedger(ControllerLedger):
                 self.skipped_worker_calls[worker_id] += 1
 
     def submit(self, client_id: str, request: CallRequest, now_ns: int) -> None:
+        if request.compact_output != self.compact_output:
+            raise ValueError(
+                "Output layout does not match the configured dispatch mode"
+            )
         if (request.demand is not None) != self.demand_aware:
             raise ValueError(
                 "Expert demand does not match the configured dispatch mode"
@@ -222,6 +230,7 @@ class FanoutControllerLedger(ControllerLedger):
                 else "controller-expert-partitioned-gang"
             ),
             "demand_aware": self.demand_aware,
+            "compact_output": self.compact_output,
             "empty_parent_calls": self.empty_parent_calls,
             "planning_cpu_ms_total": self.planning_cpu_ns / 1e6,
             "selected_worker_calls": dict(self.selected_worker_calls),

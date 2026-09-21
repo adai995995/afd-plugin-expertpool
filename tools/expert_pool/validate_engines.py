@@ -50,6 +50,7 @@ MAX_MODEL_LEN = 1024
 KV_CACHE_BYTES = 256 * 1024 * 1024
 GENERATED_TOKENS = 16
 BF16_WEIGHT_ELEMENT_BYTES = 2
+BF16_OUTPUT_ELEMENT_BYTES = 2
 EXPERT_PROJECTION_COUNT = 3
 PROMPTS = (
     "The capital of France is",
@@ -410,6 +411,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                     else "whole_layer"
                 ),
                 demand_aware=args.expert_demand,
+                compact_output=args.compact_output,
             )
             directory = deployment.pool_directory()
             report["placement"] = asdict(directory)
@@ -571,6 +573,14 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 ),
                 demand_aware=args.expert_demand,
             )
+            if args.expert_demand:
+                report["output_transfer_accounting"] = verify_output_transfer(
+                    directory,
+                    statuses,
+                    closed,
+                    report["workers"],
+                    compact_output=args.compact_output,
+                )
             if controller is not None:
                 controlled = receive_record(controller, args.timeout)
                 report["controller"] = controlled
@@ -913,6 +923,148 @@ def verify_demand_controller(controlled: dict, accounting: dict) -> None:
         raise AssertionError("Controller and completed demand accounting disagree")
 
 
+def verify_output_transfer(
+    directory: PoolDirectory,
+    ready: list[dict],
+    closed: list[dict],
+    workers: list[dict],
+    *,
+    compact_output: bool,
+) -> dict:
+    """Reconcile payload bytes with A assignments and independent E reports.
+
+    Dense-equivalent bytes count only the workers selected by real calls. They
+    exclude skipped owners, allocation capacity and network protocol overhead.
+    Startup is checked in the totals and subtracted from request-only counters.
+    """
+    if not directory.expert_partitioned or type(compact_output) is not bool:
+        raise AssertionError("Output accounting requires explicit partition mode")
+    resident = {worker.worker_id: worker for worker in directory.workers}
+    worker_reports = {worker["worker_id"]: worker for worker in workers}
+    if set(worker_reports) != set(resident) or len(worker_reports) != len(workers):
+        raise AssertionError("Output worker report coverage is inconsistent")
+    after = [item["status"][0] for item in closed]
+    before_ids = [status["client_id"] for status in ready]
+    after_ids = [status["client_id"] for status in after]
+    if before_ids != after_ids or len(set(before_ids)) != len(before_ids):
+        raise AssertionError("Output client report identities changed")
+
+    phases = []
+    for statuses in (ready, after):
+        per_client = {}
+        for status in statuses:
+            dispatch = status["dispatch"]
+            if (
+                dispatch.get("compact_output") is not compact_output
+                or dispatch.get("demand_aware") is not True
+                or set(dispatch["workers"]) != set(resident)
+            ):
+                raise AssertionError("A output mode or worker coverage disagrees")
+            per_worker = {}
+            for worker_id, worker in resident.items():
+                output = dispatch["workers"][worker_id]["output_transfer"]
+                actual = output["received_bytes"]
+                dense = output["dense_equivalent_bytes"]
+                row_bytes = (
+                    worker.top_k * worker.hidden_size * BF16_OUTPUT_ELEMENT_BYTES
+                )
+                useful = (
+                    sum(
+                        dispatch["demand"]["expert_assignments"][str(p.layer_id)][
+                            expert
+                        ]
+                        for p in worker.placements
+                        for expert in p.expert_ids
+                    )
+                    * worker.hidden_size
+                    * BF16_OUTPUT_ELEMENT_BYTES
+                )
+                dense_upper = (
+                    sum(
+                        status["layers"][str(p.layer_id)]["token_rows"]
+                        for p in worker.placements
+                    )
+                    * row_bytes
+                )
+                if (
+                    any(
+                        type(value) is not int or value < 0 for value in (actual, dense)
+                    )
+                    or not useful <= dense <= dense_upper
+                    or dense % row_bytes
+                    or (dense == 0) != (useful == 0)
+                    or actual != (useful if compact_output else dense)
+                ):
+                    raise AssertionError("A output bytes contradict routed assignments")
+                per_worker[worker_id] = {
+                    "received_bytes": actual,
+                    "dense_equivalent_bytes": dense,
+                    "useful_assignment_bytes": useful,
+                }
+            for field in ("received_bytes", "dense_equivalent_bytes"):
+                total = dispatch["output_transfer"][field]
+                if type(total) is not int or total != sum(
+                    output[field] for output in per_worker.values()
+                ):
+                    raise AssertionError("A output total differs from worker channels")
+            per_client[status["client_id"]] = per_worker
+        phases.append(per_client)
+
+    before, after_counts = phases
+    for client_id, channels in after_counts.items():
+        for worker_id, output in channels.items():
+            if any(
+                output[field] < before[client_id][worker_id][field] for field in output
+            ):
+                raise AssertionError("Output counters regressed after engine warmup")
+    by_worker = {}
+    for worker_id, report in worker_reports.items():
+        actual = sum(
+            channels[worker_id]["received_bytes"] for channels in after_counts.values()
+        )
+        dense = sum(
+            channels[worker_id]["dense_equivalent_bytes"]
+            for channels in after_counts.values()
+        )
+        output = report["output_transfer"]
+        if (
+            report.get("compact_output") is not compact_output
+            or type(output["sent_bytes"]) is not int
+            or type(output["dense_equivalent_bytes"]) is not int
+            or output["sent_bytes"] != actual
+            or output["dense_equivalent_bytes"] != dense
+        ):
+            raise AssertionError("A received bytes and E sent bytes disagree")
+        by_worker[worker_id] = {
+            "received_bytes": actual,
+            "sent_bytes": output["sent_bytes"],
+            "dense_equivalent_bytes": dense,
+        }
+    actual = sum(worker["received_bytes"] for worker in by_worker.values())
+    dense = sum(worker["dense_equivalent_bytes"] for worker in by_worker.values())
+    startup_actual = sum(
+        output["received_bytes"]
+        for channels in before.values()
+        for output in channels.values()
+    )
+    startup_dense = sum(
+        output["dense_equivalent_bytes"]
+        for channels in before.values()
+        for output in channels.values()
+    )
+    return {
+        "compact_output": compact_output,
+        "count_scope": "Payload bytes including startup; request deltas exclude warmup",
+        "received_bytes": actual,
+        "sent_bytes": sum(worker["sent_bytes"] for worker in by_worker.values()),
+        "dense_equivalent_bytes": dense,
+        "avoided_output_bytes": dense - actual,
+        "request_received_bytes": actual - startup_actual,
+        "request_dense_equivalent_bytes": dense - startup_dense,
+        "by_worker": by_worker,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
@@ -945,6 +1097,11 @@ def main() -> int:
         action="store_true",
         help="Dispatch expert partitions only to owners with positive routed demand",
     )
+    parser.add_argument(
+        "--compact-output",
+        action="store_true",
+        help="Return compact assignment slots; requires --expert-demand",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--lock-path", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=300)
@@ -962,6 +1119,8 @@ def main() -> int:
         )
     if args.expert_demand and args.placement != "expert_partitioned":
         parser.error("--expert-demand requires --placement expert_partitioned")
+    if args.compact_output and not args.expert_demand:
+        parser.error("--compact-output requires --expert-demand")
     try:
         ExecutionOptions(**args.execution_options)
     except (TypeError, ValueError) as error:
@@ -1002,6 +1161,7 @@ def main() -> int:
             else "whole_layer"
         ),
         "demand_aware": args.expert_demand,
+        "compact_output": args.compact_output,
         "controller_enabled": args.controller,
         "controller_policy": args.controller_policy if args.controller else None,
     }

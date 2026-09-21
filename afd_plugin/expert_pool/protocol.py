@@ -79,6 +79,7 @@ class CallRequest:
     hidden_size: int
     top_k: int
     demand: ExpertDemand | None = None
+    compact_output: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, CallKey):
@@ -91,6 +92,10 @@ class CallRequest:
         for value in (self.hidden_size, self.top_k):
             if type(value) is not int or value <= 0:
                 raise ValueError("Invalid tensor shape")
+        if type(self.compact_output) is not bool or (
+            self.compact_output and self.demand is None
+        ):
+            raise ValueError("Compact output requires explicit expert demand")
         if self.demand is not None:
             if not isinstance(self.demand, ExpertDemand):
                 raise ValueError("Request requires typed expert demand")
@@ -100,6 +105,12 @@ class CallRequest:
 
 @dataclass(frozen=True)
 class ExecutionPlan:
+    """Bind output layout to the request and compact row count to assignments.
+
+    When request.compact_output is true, num_assignments is the exact number
+    of returned weighted rows. There is no separate unchecked transfer length.
+    """
+
     request: CallRequest
     worker_id: str
     plan_id: int

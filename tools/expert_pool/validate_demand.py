@@ -58,6 +58,7 @@ GPU_COUNT = CLIENT_COUNT + WORKER_COUNT
 DEFAULT_TIMEOUT_S = 120
 DEFAULT_ATOL = 0.01
 DEFAULT_RTOL = 0.02
+BF16_OUTPUT_ELEMENT_BYTES = 2
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,7 @@ class DemandLaunch:
     runtime: Launch
     directory: PoolDirectory
     ports: tuple[tuple[int, int], tuple[int, int]]
+    compact_output: bool = False
 
 
 class TransferRecorder:
@@ -107,6 +109,7 @@ def controller_process(
                 for index in range(CLIENT_COUNT)
             ),
             demand_aware=True,
+            compact_output=launch.compact_output,
         )
         runtime = ControllerRuntime(
             ledger,
@@ -163,6 +166,7 @@ def worker_process(
                 ),
                 controller=control,
                 demand_aware=True,
+                compact_output=launch.compact_output,
             )
             send_record(supervisor, {"kind": "ready", "role": directory.worker_id})
             worker.run()
@@ -175,6 +179,8 @@ def worker_process(
                     "client_calls": dict(worker.client_calls),
                     "layer_calls": dict(worker.layer_calls),
                     "expert_assignments": worker.expert_assignments,
+                    "compact_output": worker.compact_output,
+                    "output_transfer": dict(worker.output_transfer),
                 },
             )
     except BaseException:
@@ -241,6 +247,7 @@ def client_process(
                 ),
                 control,
                 demand_aware=True,
+                compact_output=launch.compact_output,
             )
             collector = ExpertDemandCollector(
                 num_experts, device, directory.max_tokens * directory.top_k
@@ -432,6 +439,7 @@ def client_process(
                         or request is None
                         or request.demand is None
                         or request.demand.counts != expected_counts
+                        or request.compact_output is not launch.compact_output
                     ):
                         raise AssertionError(
                             "Completed request lost its demand summary"
@@ -445,6 +453,10 @@ def client_process(
                             for key, value in transport.counters.items()
                         }
                         active = int(worker.worker_id in selected)
+                        assignments = sum(
+                            expected_counts[expert]
+                            for expert in worker.placements[0].expert_ids
+                        )
                         expected_traffic = {
                             "send_calls": active,
                             "receive_calls": active,
@@ -454,9 +466,11 @@ def client_process(
                                 + weights.numel() * weights.element_size()
                                 + ids.numel() * ids.element_size()
                             ),
-                            "receive_bytes": active
-                            * tokens
-                            * directory.top_k
+                            "receive_bytes": (
+                                assignments
+                                if launch.compact_output
+                                else active * tokens * directory.top_k
+                            )
                             * directory.hidden_size
                             * hidden.element_size(),
                         }
@@ -465,6 +479,17 @@ def client_process(
                                 "Selected/zero-hit worker transfer accounting differs"
                             )
                         traffic[worker.worker_id] = difference
+                    if launch.compact_output and sum(
+                        worker["receive_bytes"] for worker in traffic.values()
+                    ) != (
+                        tokens
+                        * directory.top_k
+                        * directory.hidden_size
+                        * hidden.element_size()
+                    ):
+                        raise AssertionError(
+                            "Compact return lost or repeated routed slots"
+                        )
                     for value, saved in zip(
                         (hidden, weights, ids), original, strict=True
                     ):
@@ -486,6 +511,12 @@ def client_process(
                                 "counts_match_exactly": True,
                                 "selected_workers": list(selected),
                                 "transfer_accounting": traffic,
+                                "compact_output": launch.compact_output,
+                                "dense_equivalent_output_bytes": len(selected)
+                                * tokens
+                                * directory.top_k
+                                * directory.hidden_size
+                                * hidden.element_size(),
                                 "inputs_unchanged": True,
                                 "native_routes_exact": natural and tokens > 0,
                                 "completion": asdict(completion),
@@ -693,6 +724,26 @@ def run(
                 raise AssertionError(
                     "Worker completed demand differs from submitted counts"
                 )
+            expected_bytes = sum(
+                case["transfer_accounting"][worker.worker_id]["receive_bytes"]
+                for case in records
+            )
+            dense_bytes = sum(
+                case["tokens"]
+                * launch.runtime.directory.top_k
+                * launch.runtime.directory.hidden_size
+                * BF16_OUTPUT_ELEMENT_BYTES
+                for case in records
+                if worker.worker_id in case["selected_workers"]
+            )
+            if (
+                report["compact_output"] is not launch.compact_output
+                or report["output_transfer"]["sent_bytes"] != expected_bytes
+                or report["output_transfer"]["dense_equivalent_bytes"] != dense_bytes
+            ):
+                raise AssertionError(
+                    "Worker output bytes differ from recorded transfers"
+                )
             if (
                 ledger["selected_worker_calls"][worker.worker_id] != expected_calls
                 or ledger["admitted_assignments_by_worker_layer_expert"][
@@ -715,6 +766,43 @@ def run(
                 raise AssertionError(
                     "A-side demand accounting differs from validation cases"
                 )
+            expected_bytes = sum(
+                traffic["receive_bytes"]
+                for case in own
+                for traffic in case["transfer_accounting"].values()
+            )
+            dense_bytes = sum(case["dense_equivalent_output_bytes"] for case in own)
+            if (
+                client["status"]["compact_output"] is not launch.compact_output
+                or client["status"]["output_transfer"]["received_bytes"]
+                != expected_bytes
+                or client["status"]["output_transfer"]["dense_equivalent_bytes"]
+                != dense_bytes
+            ):
+                raise AssertionError("A output bytes differ from recorded transfers")
+            for worker in launch.directory.workers:
+                channel = client["status"]["workers"][worker.worker_id][
+                    "output_transfer"
+                ]
+                channel_actual = sum(
+                    case["transfer_accounting"][worker.worker_id]["receive_bytes"]
+                    for case in own
+                )
+                channel_dense = sum(
+                    case["tokens"]
+                    * launch.runtime.directory.top_k
+                    * launch.runtime.directory.hidden_size
+                    * BF16_OUTPUT_ELEMENT_BYTES
+                    for case in own
+                    if worker.worker_id in case["selected_workers"]
+                )
+                if (
+                    channel["received_bytes"] != channel_actual
+                    or channel["dense_equivalent_bytes"] != channel_dense
+                ):
+                    raise AssertionError(
+                        "A channel bytes differ from recorded transfers"
+                    )
         for child in children:
             child.join(20)
             if child.exitcode != 0:
@@ -726,6 +814,17 @@ def run(
             "controller": ledger,
             "overlapping_call_pairs": overlaps,
             "all_demand_and_transfer_counts_match": True,
+            "compact_output": launch.compact_output,
+            "output_transfer": {
+                "received_bytes": sum(
+                    traffic["receive_bytes"]
+                    for case in records
+                    for traffic in case["transfer_accounting"].values()
+                ),
+                "dense_equivalent_bytes": sum(
+                    case["dense_equivalent_output_bytes"] for case in records
+                ),
+            },
         }
     finally:
         stop_children(children, owned_groups)
@@ -746,6 +845,11 @@ def main() -> int:
     parser.add_argument("--rtol", type=float, default=DEFAULT_RTOL)
     parser.add_argument("--lock-path", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--compact-output",
+        action="store_true",
+        help="Return only this worker's routed Top-k slots; input payload stays dense",
+    )
     args = parser.parse_args()
     if len(set(args.gpus)) != GPU_COUNT or min(args.gpus) < 0 or min(args.batches) <= 0:
         parser.error("Select four distinct GPUs and positive batch sizes")
@@ -779,6 +883,7 @@ def main() -> int:
         ),
         "model": str(args.model.resolve()),
         "physical_gpus": args.gpus,
+        "compact_output": args.compact_output,
         "tolerances_declared_before_execution": {"atol": args.atol, "rtol": args.rtol},
     }
     try:
@@ -858,6 +963,7 @@ def main() -> int:
                 ),
                 PoolDirectory(workers, expert_partitioned=True),
                 (ports[:WORKER_COUNT], ports[WORKER_COUNT:]),
+                compact_output=args.compact_output,
             )
             progress_path = args.output.with_suffix(".calls.jsonl")
             progress_path.touch(exist_ok=False)
