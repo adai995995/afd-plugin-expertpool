@@ -76,10 +76,7 @@ class ControllerRuntime:
                                 "snapshot",
                                 metrics={
                                     "pending": self.ledger.pending_count,
-                                    "reserved": sum(
-                                        w.active is not None
-                                        for w in self.ledger.workers.values()
-                                    ),
+                                    "reserved": self.ledger.reserved_count,
                                     "completed": sum(
                                         w.completed
                                         for w in self.ledger.workers.values()
@@ -115,7 +112,11 @@ class ControllerRuntime:
                     else:
                         raise ValueError("Unexpected client control message")
                 elif message.kind == "ready":
-                    self.ledger.ready(identity, message.detail)
+                    self.ledger.ready(
+                        identity,
+                        message.detail,
+                        receive_slots=message.metrics.get("receive_slots", 1),
+                    )
                 elif message.kind == "closed":
                     if not stopping or self.ledger.workers[identity].active is not None:
                         raise ValueError("Worker closed before draining")
@@ -176,6 +177,7 @@ def serve_controller(deployment: PoolDeployment) -> dict:
             scheduling_policy=deployment.controller.scheduling_policy,
             demand_aware=deployment.demand_aware,
             compact_output=deployment.compact_output,
+            receive_slots=deployment.receive_slots,
         )
     else:
         ledger = ControllerLedger(

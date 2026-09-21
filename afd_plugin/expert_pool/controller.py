@@ -2,14 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """CPU-only authoritative reservations for a static resident Expert Pool.
 
-There is one buffer slot per worker and one outstanding call per client.
+Whole-layer workers have one slot; partitioned workers may reserve more.
+There is one outstanding call per client.
 Progress events describe protocol phases, not measured GPU utilization.
 """
 
 import hashlib
 import json
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from afd_plugin.expert_pool.directory import PoolDirectory, ReplicaSelector
 from afd_plugin.expert_pool.protocol import CallKey, CallRequest, ExecutionPlan
@@ -43,13 +44,63 @@ class QueuedCall:
 
 
 @dataclass
-class WorkerReservation:
-    ready: bool = False
+class BufferReservation:
     generation: int = 0
     active: ExecutionPlan | None = None
-    phase: str = "offline"
+    phase: str = "idle"
+
+
+@dataclass
+class WorkerReservation:
+    ready: bool = False
+    slots: tuple[BufferReservation, ...] = field(
+        default_factory=lambda: (BufferReservation(),)
+    )
+    lifecycle: str = "offline"
     completed: int = 0
     rejected: int = 0
+
+    @property
+    def active(self) -> ExecutionPlan | None:
+        return next(
+            (slot.active for slot in self.slots if slot.active is not None), None
+        )
+
+    @active.setter
+    def active(self, plan: ExecutionPlan | None) -> None:
+        if len(self.slots) != 1:
+            raise ValueError("Reserve a specific slot in a multi-slot worker")
+        self.slots[0].active = plan
+
+    @property
+    def generation(self) -> int:
+        return sum(slot.generation for slot in self.slots)
+
+    @generation.setter
+    def generation(self, value: int) -> None:
+        if len(self.slots) != 1:
+            raise ValueError("Advance a specific slot generation")
+        self.slots[0].generation = value
+
+    @property
+    def phase(self) -> str:
+        if self.lifecycle in {"offline", "closed"}:
+            return self.lifecycle
+        if len(self.slots) == 1:
+            return self.slots[0].phase
+        return "busy" if self.active is not None else "idle"
+
+    @phase.setter
+    def phase(self, value: str) -> None:
+        if len(self.slots) != 1 and value not in {"idle", "offline", "closed"}:
+            raise ValueError("Update a specific slot phase")
+        self.lifecycle = value
+        if len(self.slots) == 1:
+            self.slots[0].phase = value
+
+    @property
+    def available_slots(self) -> int:
+        return sum(slot.active is None for slot in self.slots) if self.ready else 0
 
 
 class ControllerLedger:
@@ -101,9 +152,16 @@ class ControllerLedger:
         self.peak_reserved = 0
         self.busy_replica_bypasses = 0
 
-    def ready(self, worker_id: str, fingerprint: str) -> None:
+    def ready(
+        self, worker_id: str, fingerprint: str, *, receive_slots: int = 1
+    ) -> None:
         worker = self.workers[worker_id]
-        if worker.ready or fingerprint != directory_digest(self.directories[worker_id]):
+        if (
+            worker.ready
+            or fingerprint != directory_digest(self.directories[worker_id])
+            or type(receive_slots) is not int
+            or receive_slots != len(worker.slots)
+        ):
             raise ValueError("Duplicate readiness or mismatched resident directory")
         worker.ready = True
         worker.phase = "idle"
@@ -140,6 +198,14 @@ class ControllerLedger:
     @property
     def pending_count(self) -> int:
         return sum(len(queue) for queue in self.pending.values())
+
+    @property
+    def reserved_count(self) -> int:
+        return sum(
+            slot.active is not None
+            for worker in self.workers.values()
+            for slot in worker.slots
+        )
 
     def grant(self, now_ns: int) -> tuple[ExecutionPlan, float] | None:
         available = {
@@ -242,7 +308,17 @@ class ControllerLedger:
                     "ready": worker.ready,
                     "phase": worker.phase,
                     "generation": worker.generation,
-                    "available_slots": int(worker.ready and worker.active is None),
+                    "available_slots": worker.available_slots,
+                    "receive_slots": len(worker.slots),
+                    "slots": [
+                        {
+                            "slot_id": index,
+                            "generation": slot.generation,
+                            "phase": slot.phase,
+                            "active": asdict(slot.active) if slot.active else None,
+                        }
+                        for index, slot in enumerate(worker.slots)
+                    ],
                     "active": asdict(worker.active) if worker.active else None,
                     "completed_calls": worker.completed,
                     "rejected_calls": worker.rejected,

@@ -25,6 +25,7 @@ import time
 import traceback
 import uuid
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -33,11 +34,17 @@ from typing import TYPE_CHECKING
 import afd_plugin
 from afd_plugin.expert_pool.controller import ControllerClientIdentity
 from afd_plugin.expert_pool.controller_service import ControllerRuntime
+from afd_plugin.expert_pool.deployment import ExecutionOptions
 from afd_plugin.expert_pool.directory import PoolDirectory
 from afd_plugin.expert_pool.fanout_controller import FanoutControllerLedger
 from afd_plugin.expert_pool.placement import ExpertPlacement
+from afd_plugin.expert_pool.protocol import MAX_RECEIVE_SLOTS
 from afd_plugin.expert_pool.scheduler import StaticDirectory
-from tools.expert_pool.validate_engines import process_environment, stop_children
+from tools.expert_pool.validate_engines import (
+    process_environment,
+    stop_children,
+    verify_pipeline,
+)
 from tools.expert_pool.validate_service import (
     BusyGPUError,
     Launch,
@@ -67,6 +74,8 @@ class DemandLaunch:
     directory: PoolDirectory
     ports: tuple[tuple[int, int], tuple[int, int]]
     compact_output: bool = False
+    receive_slots: int = 1
+    pipeline_trace_dir: str | None = None
 
 
 class TransferRecorder:
@@ -110,6 +119,7 @@ def controller_process(
             ),
             demand_aware=True,
             compact_output=launch.compact_output,
+            receive_slots=launch.receive_slots,
         )
         runtime = ControllerRuntime(
             ledger,
@@ -144,10 +154,24 @@ def worker_process(
             from afd_plugin.expert_pool.executor import ExpertExecutor
             from afd_plugin.expert_pool.worker import ExpertWorker, WorkerPeer
 
+            class TracedTransport(PoolTransport):
+                # Validation-only annotations bind each NCCL launch to its
+                # direction. The production hot path has no profiler ranges.
+                def post(self, tensors, *, send):
+                    with torch.profiler.record_function(
+                        "pool.output.send" if send else "pool.input.receive"
+                    ):
+                        return super().post(tensors, send=send)
+
+            transport_type = (
+                TracedTransport
+                if launch.pipeline_trace_dir is not None
+                else PoolTransport
+            )
             device = torch.device("cuda", 0)
             directory = launch.directory.workers[worker_index]
             transports = tuple(
-                PoolTransport(
+                transport_type(
                     "127.0.0.1", row[worker_index], 0, device, launch.runtime.timeout_s
                 )
                 for row in launch.ports
@@ -155,7 +179,12 @@ def worker_process(
             worker = ExpertWorker(
                 directory,
                 {
-                    placement.layer_id: ExpertExecutor(checkpoint, placement, device)
+                    placement.layer_id: ExpertExecutor(
+                        checkpoint,
+                        placement,
+                        device,
+                        validate_values=launch.receive_slots == 1,
+                    )
                     for placement in directory.placements
                 },
                 tuple(
@@ -167,9 +196,30 @@ def worker_process(
                 controller=control,
                 demand_aware=True,
                 compact_output=launch.compact_output,
+                receive_slots=launch.receive_slots,
+                execution=ExecutionOptions(
+                    validate_worker_values=launch.receive_slots == 1,
+                    reuse_cuda_events=True,
+                    defer_output_sync=True,
+                ),
             )
             send_record(supervisor, {"kind": "ready", "role": directory.worker_id})
-            worker.run()
+            profiling = (
+                torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ]
+                )
+                if launch.pipeline_trace_dir is not None
+                else nullcontext()
+            )
+            with profiling as profile:
+                worker.run()
+            if launch.pipeline_trace_dir is not None:
+                profile.export_chrome_trace(
+                    str(Path(launch.pipeline_trace_dir) / f"{directory.worker_id}.json")
+                )
             send_record(
                 supervisor,
                 {
@@ -181,6 +231,7 @@ def worker_process(
                     "expert_assignments": worker.expert_assignments,
                     "compact_output": worker.compact_output,
                     "output_transfer": dict(worker.output_transfer),
+                    "pipeline": worker.pipeline_status(),
                 },
             )
     except BaseException:
@@ -248,6 +299,7 @@ def client_process(
                 control,
                 demand_aware=True,
                 compact_output=launch.compact_output,
+                receive_slots=launch.receive_slots,
             )
             collector = ExpertDemandCollector(
                 num_experts, device, directory.max_tokens * directory.top_k
@@ -803,6 +855,12 @@ def run(
                     raise AssertionError(
                         "A channel bytes differ from recorded transfers"
                     )
+        if launch.receive_slots > 1:
+            verify_pipeline(
+                final[CLIENT_COUNT : CLIENT_COUNT + WORKER_COUNT],
+                ledger,
+                launch.receive_slots,
+            )
         for child in children:
             child.join(20)
             if child.exitcode != 0:
@@ -850,7 +908,19 @@ def main() -> int:
         action="store_true",
         help="Return only this worker's routed Top-k slots; input payload stays dense",
     )
+    parser.add_argument("--receive-slots", type=int, default=1)
+    parser.add_argument("--pipeline-trace-dir", type=Path)
     args = parser.parse_args()
+    if not 1 <= args.receive_slots <= MAX_RECEIVE_SLOTS or (
+        args.receive_slots > 1 and not args.compact_output
+    ):
+        parser.error("Multiple receive slots require compact output")
+    if args.pipeline_trace_dir is not None:
+        if args.receive_slots == 1 or args.pipeline_trace_dir.exists():
+            parser.error(
+                "Select a new private trace directory for multi-slot validation"
+            )
+        args.pipeline_trace_dir.mkdir(parents=True)
     if len(set(args.gpus)) != GPU_COUNT or min(args.gpus) < 0 or min(args.batches) <= 0:
         parser.error("Select four distinct GPUs and positive batch sizes")
     if args.timeout <= 0 or any(
@@ -884,6 +954,10 @@ def main() -> int:
         "model": str(args.model.resolve()),
         "physical_gpus": args.gpus,
         "compact_output": args.compact_output,
+        "receive_slots": args.receive_slots,
+        "pipeline_trace_dir": str(args.pipeline_trace_dir)
+        if args.pipeline_trace_dir
+        else None,
         "tolerances_declared_before_execution": {"atol": args.atol, "rtol": args.rtol},
     }
     try:
@@ -964,6 +1038,10 @@ def main() -> int:
                 PoolDirectory(workers, expert_partitioned=True),
                 (ports[:WORKER_COUNT], ports[WORKER_COUNT:]),
                 compact_output=args.compact_output,
+                receive_slots=args.receive_slots,
+                pipeline_trace_dir=(
+                    str(args.pipeline_trace_dir) if args.pipeline_trace_dir else None
+                ),
             )
             progress_path = args.output.with_suffix(".calls.jsonl")
             progress_path.touch(exist_ok=False)

@@ -137,6 +137,7 @@ def serve(
                     controller=controller,
                     demand_aware=deployment.demand_aware,
                     compact_output=deployment.compact_output,
+                    receive_slots=deployment.receive_slots,
                 )
                 worker.run()
                 return {
@@ -151,6 +152,7 @@ def serve(
                     "demand_aware": deployment.demand_aware,
                     "compact_output": deployment.compact_output,
                     "output_transfer": dict(worker.output_transfer),
+                    "pipeline": worker.pipeline_status(),
                     "expert_assignments": worker.expert_assignments,
                     "resident_experts": {
                         str(layer): list(executor.placement.expert_ids)

@@ -3,7 +3,12 @@
 """Bounded reply demultiplexing for one parent with static expert owners."""
 
 from afd_plugin.expert_pool.demand import DispatchPlan
-from afd_plugin.expert_pool.protocol import CallRequest, ExecutionPlan, Message
+from afd_plugin.expert_pool.protocol import (
+    MAX_RECEIVE_SLOTS,
+    CallRequest,
+    ExecutionPlan,
+    Message,
+)
 
 FANOUT_REPLY_KINDS = ("grant", "output_ready", "done")
 
@@ -15,6 +20,7 @@ class FanoutReplies:
         owners: tuple[str, ...],
         *,
         dispatch_plan: DispatchPlan | None = None,
+        receive_slots: int = 1,
     ) -> None:
         if not isinstance(request, CallRequest):
             raise ValueError("Fan-out replies require a parent request")
@@ -29,6 +35,12 @@ class FanoutReplies:
         ):
             raise ValueError("Fan-out replies require unique worker identities")
         self.request = request
+        if (
+            type(receive_slots) is not int
+            or not 1 <= receive_slots <= MAX_RECEIVE_SLOTS
+        ):
+            raise ValueError("Invalid receive slot capacity")
+        self.receive_slots = receive_slots
         if (request.demand is not None) != (dispatch_plan is not None):
             raise ValueError("Demand replies require the expected dispatch plan")
         if dispatch_plan is not None and (
@@ -50,7 +62,7 @@ class FanoutReplies:
         if (
             plan.request != self.request
             or plan.worker_id not in self.next_phase
-            or plan.slot_id != 0
+            or plan.slot_id >= self.receive_slots
         ):
             raise RuntimeError("Mismatched parent, worker or buffer slot")
         worker_id = plan.worker_id

@@ -20,7 +20,12 @@ from afd_plugin.expert_pool.controlled_client import ControlledPoolClient
 from afd_plugin.expert_pool.demand import plan_expert_demand
 from afd_plugin.expert_pool.demand_gpu import ExpertDemandCollector
 from afd_plugin.expert_pool.fanout_protocol import FanoutReplies
-from afd_plugin.expert_pool.protocol import Message, receive_message, send_message
+from afd_plugin.expert_pool.protocol import (
+    MAX_RECEIVE_SLOTS,
+    Message,
+    receive_message,
+    send_message,
+)
 
 
 class FanoutPoolClient(ControlledPoolClient):
@@ -32,6 +37,7 @@ class FanoutPoolClient(ControlledPoolClient):
         *,
         demand_aware: bool = False,
         compact_output: bool = False,
+        receive_slots: int = 1,
     ) -> None:
         if scheduling_policy != "ready_first":
             raise ValueError("Expert partitions require ready-first gang admission")
@@ -45,6 +51,13 @@ class FanoutPoolClient(ControlledPoolClient):
         if type(compact_output) is not bool or (compact_output and not demand_aware):
             raise ValueError("Compact output requires expert-demand dispatch")
         self.compact_output = compact_output
+        if (
+            type(receive_slots) is not int
+            or not 1 <= receive_slots <= MAX_RECEIVE_SLOTS
+            or (receive_slots > 1 and not compact_output)
+        ):
+            raise ValueError("Multiple receive slots require compact output")
+        self.receive_slots = receive_slots
         directory = channels[0].directory
         self.output_workspace = (
             CompactOutputWorkspace(
@@ -109,6 +122,18 @@ class FanoutPoolClient(ControlledPoolClient):
                     incoming.plan.request
                 )
         return message
+
+    def _ready_output_owner(self, replies: FanoutReplies, remaining: list[str]) -> str:
+        """Drain any ready owner instead of waiting for every E to finish.
+
+        Multi-slot workers can finish two parents in different orders. Waiting
+        for all owners before receiving can leave their output sends blocked.
+        """
+        while True:
+            for owner in remaining:
+                if replies.take("output_ready", owner) is not None:
+                    return owner
+            replies.accept(receive_message(self.control, self.timeout_s))
 
     @torch.inference_mode()
     def execute(
@@ -177,7 +202,12 @@ class FanoutPoolClient(ControlledPoolClient):
                 return torch.empty_like(hidden_states), Message(
                     "empty_done", request=request, metrics=metrics
                 )
-            replies = FanoutReplies(request, owners, dispatch_plan=dispatch_plan)
+            replies = FanoutReplies(
+                request,
+                owners,
+                dispatch_plan=dispatch_plan,
+                receive_slots=self.receive_slots,
+            )
             grants = {
                 owner: self._fanout_reply(replies, "grant", owner) for owner in owners
             }
@@ -187,9 +217,11 @@ class FanoutPoolClient(ControlledPoolClient):
                     (hidden_states, topk_weights, topk_ids), send=True
                 )
             inputs_sent = time.perf_counter_ns()
-            for owner in owners:
-                self._fanout_reply(replies, "output_ready", owner)
+            if self.receive_slots == 1:
+                for owner in owners:
+                    self._fanout_reply(replies, "output_ready", owner)
             output_ready = time.perf_counter_ns()
+            ready_wait_ns = output_ready - inputs_sent
             slots = hidden_states.new_zeros(
                 (request.num_tokens, request.top_k, request.hidden_size)
             )
@@ -197,7 +229,15 @@ class FanoutPoolClient(ControlledPoolClient):
             route_indices = None if self.compact_output else topk_ids.long()
             output_restore_submit_ns = 0
             output_bytes = {}
-            for owner in owners:
+            remaining = list(owners)
+            for _ in owners:
+                if self.receive_slots > 1:
+                    waiting = time.perf_counter_ns()
+                    owner = self._ready_output_owner(replies, remaining)
+                    ready_wait_ns += time.perf_counter_ns() - waiting
+                else:
+                    owner = remaining[0]
+                remaining.remove(owner)
                 if self.compact_output:
                     assert self.output_workspace is not None
                     plan = grants[owner].plan
@@ -240,8 +280,10 @@ class FanoutPoolClient(ControlledPoolClient):
                 "client_validation_ms": (started - validation_started) / 1e6,
                 "client_admission_wait_ms": (granted - submitted) / 1e6,
                 "client_input_transfer_wall_ms": (inputs_sent - granted) / 1e6,
-                "client_output_ready_wait_ms": (output_ready - inputs_sent) / 1e6,
-                "client_output_transfer_wall_ms": (output_received - output_ready)
+                "client_output_ready_wait_ms": ready_wait_ns / 1e6,
+                "client_output_transfer_wall_ms": (
+                    output_received - inputs_sent - ready_wait_ns
+                )
                 / 1e6,
                 # Host submission only: no metrics-only CUDA synchronization.
                 "client_output_restore_submit_ms": output_restore_submit_ns / 1e6,
@@ -305,6 +347,7 @@ class FanoutPoolClient(ControlledPoolClient):
             else "weighted-top-k-slots"
         )
         result["compact_output"] = self.compact_output
+        result["receive_slots"] = self.receive_slots
         result["output_transfer"] = dict(self.output_transfer)
         for worker_id, counters in self.worker_output_transfer.items():
             result["workers"][worker_id]["output_transfer"] = dict(counters)

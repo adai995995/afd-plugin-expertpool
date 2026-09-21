@@ -15,7 +15,7 @@ from pathlib import Path
 from afd_plugin.expert_pool.controller import CONTROLLER_POLICIES
 from afd_plugin.expert_pool.directory import PoolDirectory
 from afd_plugin.expert_pool.placement import ExpertPlacement
-from afd_plugin.expert_pool.protocol import CallKey
+from afd_plugin.expert_pool.protocol import MAX_RECEIVE_SLOTS, CallKey
 from afd_plugin.expert_pool.scheduler import StaticDirectory
 
 MAX_DEPLOYMENT_BYTES = 65536
@@ -121,6 +121,7 @@ class PoolDeployment:
     dispatch_mode: str = "whole_layer"
     demand_aware: bool = False
     compact_output: bool = False
+    receive_slots: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution, ExecutionOptions):
@@ -156,6 +157,22 @@ class PoolDeployment:
             and (not self.demand_aware or self.dispatch_mode != "expert_partitioned")
         ):
             raise ValueError("Compact output requires demand-aware expert partitioning")
+        if (
+            type(self.receive_slots) is not int
+            or not 1 <= self.receive_slots <= MAX_RECEIVE_SLOTS
+            or (
+                self.receive_slots > 1
+                and (
+                    not self.compact_output
+                    or self.execution.validate_worker_values
+                    or not self.execution.defer_output_sync
+                )
+            )
+        ):
+            raise ValueError(
+                "Multiple receive slots require compact output, trusted worker "
+                "routes and deferred output synchronization"
+            )
         if not isinstance(self.dispatch_mode, str) or self.dispatch_mode not in {
             "whole_layer",
             "expert_partitioned",

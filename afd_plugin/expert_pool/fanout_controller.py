@@ -11,13 +11,20 @@ import time
 from collections import deque
 
 from afd_plugin.expert_pool.controller import (
+    BufferReservation,
     ControllerClientIdentity,
     ControllerLedger,
     QueuedCall,
+    WorkerReservation,
 )
 from afd_plugin.expert_pool.demand import DispatchPlan, plan_expert_demand
 from afd_plugin.expert_pool.directory import PoolDirectory
-from afd_plugin.expert_pool.protocol import CallKey, CallRequest, ExecutionPlan
+from afd_plugin.expert_pool.protocol import (
+    MAX_RECEIVE_SLOTS,
+    CallKey,
+    CallRequest,
+    ExecutionPlan,
+)
 
 
 class FanoutControllerLedger(ControllerLedger):
@@ -29,6 +36,7 @@ class FanoutControllerLedger(ControllerLedger):
         *,
         demand_aware: bool = False,
         compact_output: bool = False,
+        receive_slots: int = 1,
     ) -> None:
         if not directory.expert_partitioned or scheduling_policy != "ready_first":
             raise ValueError("Expert fan-out requires partitioned ready-first control")
@@ -37,6 +45,19 @@ class FanoutControllerLedger(ControllerLedger):
         if type(compact_output) is not bool or (compact_output and not demand_aware):
             raise ValueError("Compact output requires demand-aware dispatch")
         self._initialize(directory, clients, scheduling_policy)
+        if (
+            type(receive_slots) is not int
+            or not 1 <= receive_slots <= MAX_RECEIVE_SLOTS
+            or (receive_slots > 1 and not compact_output)
+        ):
+            raise ValueError("Multiple receive slots require compact output")
+        self.receive_slots = receive_slots
+        self.workers = {
+            key: WorkerReservation(
+                slots=tuple(BufferReservation() for _ in range(receive_slots))
+            )
+            for key in self.directories
+        }
         self.demand_aware = demand_aware
         self.compact_output = compact_output
         self.active_parents: dict[CallKey, tuple[ExecutionPlan, ...]] = {}
@@ -117,12 +138,12 @@ class FanoutControllerLedger(ControllerLedger):
     def grant(self, now_ns: int) -> tuple[ExecutionPlan, float] | None:
         if self.pending_child_plans:
             plan, queue_ms = self.pending_child_plans.popleft()
-            self.workers[plan.worker_id].phase = "reserved"
+            self.workers[plan.worker_id].slots[plan.slot_id].phase = "reserved"
             return plan, queue_ms
         available = {
             worker_id
             for worker_id, worker in self.workers.items()
-            if worker.ready and worker.active is None
+            if worker.available_slots
         }
         for _ in range(len(self.domains)):
             domain = self.domains[0]
@@ -149,15 +170,21 @@ class FanoutControllerLedger(ControllerLedger):
                 queue_ms = max(0, now_ns - call.enqueued_ns) / 1e6
                 for owner in owners:
                     worker = self.workers[owner]
-                    worker.generation += 1
+                    slot_id = next(
+                        index
+                        for index, slot in enumerate(worker.slots)
+                        if slot.active is None
+                    )
+                    slot = worker.slots[slot_id]
+                    slot.generation += 1
                     self.plan_sequence += 1
                     task = dispatch.task_for(owner) if dispatch is not None else None
                     plan = ExecutionPlan(
                         call.request,
                         owner,
                         self.plan_sequence,
-                        0,
-                        worker.generation,
+                        slot_id,
+                        slot.generation,
                         expert_ids=task.expert_ids if task is not None else (),
                         num_assignments=(
                             task.num_assignments if task is not None else None
@@ -172,22 +199,28 @@ class FanoutControllerLedger(ControllerLedger):
                         for expert_id in task.expert_ids:
                             assigned[expert_id] += counts[expert_id]
                     # Reserve every owner before publishing the first child.
-                    worker.active = plan
-                    worker.phase = "pending_grant"
+                    slot.active = plan
+                    slot.phase = "pending_grant"
                     plans.append(plan)
                     self.pending_child_plans.append((plan, queue_ms))
                 self.active_parents[call.request.key] = tuple(plans)
                 self.peak_reserved = max(
                     self.peak_reserved,
-                    sum(worker.active is not None for worker in self.workers.values()),
+                    self.reserved_count,
                 )
                 return self.grant(now_ns)
         return None
 
     def progress(self, worker_id: str, kind: str, plan: ExecutionPlan) -> None:
         worker = self.workers.get(worker_id)
-        if worker is None or plan.worker_id != worker_id or worker.active != plan:
+        if (
+            worker is None
+            or plan.worker_id != worker_id
+            or plan.slot_id >= len(worker.slots)
+            or worker.slots[plan.slot_id].active != plan
+        ):
             raise ValueError("Stale, duplicate or foreign worker feedback")
+        slot = worker.slots[plan.slot_id]
         transitions = {
             "grant": ("reserved", "receiving"),
             "input_ready": ("receiving", "input_ready"),
@@ -199,9 +232,11 @@ class FanoutControllerLedger(ControllerLedger):
             # Even a locally drained rejection can leave siblings in NCCL.
             # The supervisor must terminate all peers, without releasing credit.
             raise RuntimeError("Expert fan-out failed; terminate the deployment")
-        if kind not in transitions or worker.phase != transitions[kind][0]:
+        if kind not in transitions or slot.phase != transitions[kind][0]:
             raise ValueError("Out-of-order worker progress")
-        worker.phase = transitions[kind][1]
+        if kind == "executing" and any(s.phase == "executing" for s in worker.slots):
+            raise ValueError("A worker has only one compute lane")
+        slot.phase = transitions[kind][1]
         if kind != "done":
             return
         client_id = plan.request.key.client_id
@@ -209,12 +244,15 @@ class FanoutControllerLedger(ControllerLedger):
         self.completed_by_worker_client[worker_id][client_id] += 1
         self.completed_by_worker_layer[worker_id][plan.request.layer_id] += 1
         plans = self.active_parents[plan.request.key]
-        if not all(self.workers[child.worker_id].phase == "held" for child in plans):
+        if not all(
+            self.workers[child.worker_id].slots[child.slot_id].phase == "held"
+            for child in plans
+        ):
             return
         # Every child has drained its output send. The final reply may now let
         # the A submit the next layer without racing this parent's reservations.
         for child in plans:
-            reserved = self.workers[child.worker_id]
+            reserved = self.workers[child.worker_id].slots[child.slot_id]
             reserved.active = None
             reserved.phase = "idle"
         del self.active_parents[plan.request.key]
@@ -231,6 +269,7 @@ class FanoutControllerLedger(ControllerLedger):
             ),
             "demand_aware": self.demand_aware,
             "compact_output": self.compact_output,
+            "receive_slots": self.receive_slots,
             "empty_parent_calls": self.empty_parent_calls,
             "planning_cpu_ms_total": self.planning_cpu_ns / 1e6,
             "selected_worker_calls": dict(self.selected_worker_calls),

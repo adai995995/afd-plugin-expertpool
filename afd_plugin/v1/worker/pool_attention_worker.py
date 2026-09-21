@@ -109,6 +109,7 @@ class PoolAttentionWorker(Worker):
                         scheduling_policy=deployment.controller.scheduling_policy,
                         demand_aware=deployment.demand_aware,
                         compact_output=deployment.compact_output,
+                        receive_slots=deployment.receive_slots,
                     )
                 else:
                     client = ControlledPoolClient(

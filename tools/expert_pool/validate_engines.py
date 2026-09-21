@@ -38,6 +38,7 @@ from afd_plugin.expert_pool.deployment import (
     WorkerPlacement,
 )
 from afd_plugin.expert_pool.directory import PoolDirectory
+from afd_plugin.expert_pool.protocol import MAX_RECEIVE_SLOTS
 from tools.expert_pool.validate_service import (
     BusyGPUError,
     check_idle,
@@ -412,6 +413,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 ),
                 demand_aware=args.expert_demand,
                 compact_output=args.compact_output,
+                receive_slots=args.receive_slots,
             )
             directory = deployment.pool_directory()
             report["placement"] = asdict(directory)
@@ -584,6 +586,10 @@ def run(args: argparse.Namespace, report: dict) -> None:
             if controller is not None:
                 controlled = receive_record(controller, args.timeout)
                 report["controller"] = controlled
+                if args.receive_slots > 1:
+                    report["pipeline_accounting"] = verify_pipeline(
+                        report["workers"], controlled, args.receive_slots
+                    )
                 if controlled["scheduling_policy"] != args.controller_policy or any(
                     item["status"][0]["dispatch"]["policy"] != controlled["policy"]
                     for item in ready + closed
@@ -1065,6 +1071,42 @@ def verify_output_transfer(
     }
 
 
+def verify_pipeline(workers: list[dict], controller: dict, receive_slots: int) -> dict:
+    """Check each physical slot drained exactly its granted generations."""
+    if controller["receive_slots"] != receive_slots:
+        raise AssertionError("Controller slot capacity differs from deployment")
+    peak = 0
+    for worker in workers:
+        pipeline = worker["pipeline"]
+        reserved = controller["workers"][worker["worker_id"]]
+        slots = reserved["slots"]
+        if (
+            not pipeline["enabled"]
+            or pipeline["receive_slots"] != receive_slots
+            or pipeline["compute_lanes"] != 1
+            or pipeline["active_slots"] != 0
+            or not 1 <= pipeline["peak_occupied_slots"] <= receive_slots
+            or len(slots) != receive_slots
+            or any(
+                slot["active"] is not None or slot["phase"] != "idle" for slot in slots
+            )
+            or pipeline["slot_generations"] != [slot["generation"] for slot in slots]
+            or pipeline["slot_completed_calls"] != pipeline["slot_generations"]
+            or sum(pipeline["slot_completed_calls"]) != worker["completed_calls"]
+        ):
+            raise AssertionError("Pipeline slot lifecycle or accounting disagrees")
+        peak = max(peak, pipeline["peak_occupied_slots"])
+    if peak <= 1:
+        raise AssertionError("Validation did not exercise simultaneous live slots")
+    return {
+        "receive_slots": receive_slots,
+        "peak_occupied_slots": peak,
+        "slot_generations_and_completions_match": True,
+        "all_slots_drained": True,
+        "scope": "Concurrent live buffers; GPU overlap requires a device trace",
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
@@ -1108,6 +1150,7 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--logprob-atol", type=float, default=0.05)
     parser.add_argument("--execution-options", type=json.loads, default={})
+    parser.add_argument("--receive-slots", type=int, default=1)
     args = parser.parse_args()
     if not args.controller and args.controller_policy != "round_robin":
         parser.error("--controller-policy requires --controller")
@@ -1122,9 +1165,20 @@ def main() -> int:
     if args.compact_output and not args.expert_demand:
         parser.error("--compact-output requires --expert-demand")
     try:
-        ExecutionOptions(**args.execution_options)
+        execution = ExecutionOptions(**args.execution_options)
     except (TypeError, ValueError) as error:
         parser.error(str(error))
+    if not 1 <= args.receive_slots <= MAX_RECEIVE_SLOTS or (
+        args.receive_slots > 1
+        and (
+            not args.compact_output
+            or execution.validate_worker_values
+            or not execution.defer_output_sync
+        )
+    ):
+        parser.error(
+            "Multiple slots require compact output and trusted deferred execution"
+        )
     required_gpus = max(4, 2 + args.expert_workers)
     if (
         args.expert_workers < 1
@@ -1162,6 +1216,7 @@ def main() -> int:
         ),
         "demand_aware": args.expert_demand,
         "compact_output": args.compact_output,
+        "receive_slots": args.receive_slots,
         "controller_enabled": args.controller,
         "controller_policy": args.controller_policy if args.controller else None,
     }

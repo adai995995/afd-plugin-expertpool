@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Task-driven single-GPU Expert service with one reusable buffer slot.
+"""Task-driven single-GPU Expert service with bounded reusable buffer slots.
 
 The worker owns no Attention, Router, shared branch, request scheduler or KV.
 The input auditor is opt-in and intentionally expensive; it is for correctness
@@ -22,6 +22,7 @@ from afd_plugin.expert_pool.deployment import ExecutionOptions
 from afd_plugin.expert_pool.executor import ExpertExecutor
 from afd_plugin.expert_pool.profiling import WorkerProfiler
 from afd_plugin.expert_pool.protocol import (
+    MAX_RECEIVE_SLOTS,
     ExecutionPlan,
     Message,
     receive_message,
@@ -58,6 +59,7 @@ class ExpertWorker:
         controller: Connection | None = None,
         demand_aware: bool = False,
         compact_output: bool = False,
+        receive_slots: int = 1,
     ) -> None:
         if not peers or len({peer.client_id for peer in peers}) != len(peers):
             raise ValueError("Worker requires unique client endpoints")
@@ -107,6 +109,20 @@ class ExpertWorker:
                 self.scheduler.register(peer.client_id, peer.session_epoch, peer.domain)
         self.audit_inputs = audit_inputs
         self.execution = execution or ExecutionOptions()
+        if (
+            type(receive_slots) is not int
+            or not 1 <= receive_slots <= MAX_RECEIVE_SLOTS
+            or (
+                receive_slots > 1
+                and (
+                    not compact_output
+                    or self.execution.validate_worker_values
+                    or not self.execution.defer_output_sync
+                )
+            )
+        ):
+            raise ValueError("Multiple receive slots require trusted compact execution")
+        self.receive_slots = receive_slots
         self.profiler = profiler
         self.controller = controller
         self.controller_generation = 0
@@ -173,6 +189,19 @@ class ExpertWorker:
             str(p.layer_id): dict.fromkeys((str(e) for e in p.expert_ids), 0)
             for p in directory.placements
         }
+        self.pipeline = None
+        if receive_slots > 1:
+            # Lazy import avoids the Worker/typed pipeline ownership cycle.
+            from afd_plugin.expert_pool.pipeline_worker import WorkerPipeline
+
+            self.pipeline = WorkerPipeline(self, receive_slots)
+
+    def pipeline_status(self) -> dict:
+        return (
+            self.pipeline.snapshot()
+            if self.pipeline is not None
+            else {"enabled": False, "receive_slots": 1, "compute_lanes": 1}
+        )
 
     @torch.inference_mode()
     def _execute(
@@ -309,6 +338,9 @@ class ExpertWorker:
         )
 
     def _run_controlled(self) -> None:
+        if self.pipeline is not None:
+            self.pipeline.run()
+            return
         control = self.controller
         assert control is not None
         send_message(control, Message("ready", detail=directory_digest(self.directory)))
@@ -321,34 +353,39 @@ class ExpertWorker:
             if message.kind != "grant" or message.plan is None:
                 raise RuntimeError("Worker expected a reserved controller plan")
             plan = message.plan
-            self.directory.validate(plan.request)
-            if self.demand_aware != (plan.request.demand is not None):
-                raise RuntimeError("Worker and plan demand modes disagree")
-            if self.compact_output != plan.request.compact_output:
-                raise RuntimeError("Worker and plan output layouts disagree")
-            if self.demand_aware:
-                placement = self.executors[plan.request.layer_id].placement
-                demand = plan.request.demand
-                assert demand is not None
-                if len(demand.counts) != placement.num_experts or plan.expert_ids != (
-                    tuple(sorted(e for e in placement.expert_ids if demand.counts[e]))
-                ):
-                    raise RuntimeError("Plan does not match resident expert demand")
-            peer = self.peers.get(plan.request.key.client_id)
-            if (
-                peer is None
-                or peer.session_epoch != plan.request.key.session_epoch
-                or plan.worker_id != self.directory.worker_id
-                or plan.slot_id != 0
-                or plan.generation != self.controller_generation + 1
-            ):
-                raise RuntimeError("Stale or mismatched controller reservation")
+            self.validate_controlled_plan(plan, self.controller_generation + 1)
             self.controller_generation = plan.generation
             if self.profiler is not None:
                 self.profiler.before_call(self.completed_calls, plan)
             self._execute(plan, message.metrics["controller_queue_ms"])
             if self.profiler is not None:
                 self.profiler.after_call()
+
+    def validate_controlled_plan(
+        self, plan: ExecutionPlan, generation: int, *, receive_slots: int = 1
+    ) -> None:
+        self.directory.validate(plan.request)
+        if self.demand_aware != (plan.request.demand is not None):
+            raise RuntimeError("Worker and plan demand modes disagree")
+        if self.compact_output != plan.request.compact_output:
+            raise RuntimeError("Worker and plan output layouts disagree")
+        if self.demand_aware:
+            placement = self.executors[plan.request.layer_id].placement
+            demand = plan.request.demand
+            assert demand is not None
+            if len(demand.counts) != placement.num_experts or plan.expert_ids != (
+                tuple(sorted(e for e in placement.expert_ids if demand.counts[e]))
+            ):
+                raise RuntimeError("Plan does not match resident expert demand")
+        peer = self.peers.get(plan.request.key.client_id)
+        if (
+            peer is None
+            or peer.session_epoch != plan.request.key.session_epoch
+            or plan.worker_id != self.directory.worker_id
+            or plan.slot_id >= receive_slots
+            or plan.generation != generation
+        ):
+            raise RuntimeError("Stale or mismatched controller reservation")
 
     def run(self) -> None:
         connections = {peer.control: peer for peer in self.peers.values()}
