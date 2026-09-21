@@ -118,6 +118,9 @@ class ControllerRuntime:
                         message.detail,
                         receive_slots=message.metrics.get("receive_slots", 1),
                         startup_complete=message.metrics.get("startup_complete", 0),
+                        collect_cost_feedback=message.metrics.get(
+                            "collect_cost_feedback", 0
+                        ),
                         batching=BatchingOptions(
                             max_calls=message.metrics.get("batch_max_calls", 1),
                             max_tokens=message.metrics.get("batch_max_tokens", 0),
@@ -136,7 +139,12 @@ class ControllerRuntime:
                     self.ledger.workers[identity].phase = "closed"
                     del endpoints[connection]
                 elif message.plan is not None:
-                    self.ledger.progress(identity, message.kind, message.plan)
+                    if isinstance(self.ledger, FanoutControllerLedger):
+                        self.ledger.progress(
+                            identity, message.kind, message.plan, message.metrics
+                        )
+                    else:
+                        self.ledger.progress(identity, message.kind, message.plan)
                     if message.kind in {"grant", "output_ready", "done", "error"}:
                         # The ledger processes completion before the A can
                         # receive done and submit its next layer.
@@ -198,6 +206,7 @@ def serve_controller(deployment: PoolDeployment) -> dict:
             compact_output=deployment.compact_output,
             receive_slots=deployment.receive_slots,
             batching=deployment.batching,
+            collect_cost_feedback=deployment.execution.collect_cost_feedback,
         )
     else:
         ledger = ControllerLedger(

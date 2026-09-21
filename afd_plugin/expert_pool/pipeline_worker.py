@@ -66,6 +66,8 @@ class PipelineSlot:
     pack_ms: float = 0.0
     batch_calls: int = 1
     batch_tokens: int = 0
+    cost_sample: int = 0
+    batch_pack_ms: float = 0.0
 
 
 class WorkerPipeline:
@@ -202,6 +204,9 @@ class WorkerPipeline:
         merge_ms = self.merge_begin.elapsed_time(self.compute_begin)
         self.compute_gpu_ms += compute_ms
         self.merge_gpu_ms += merge_ms
+        pack_times = [
+            slot.begin.elapsed_time(slot.packed_end) for slot in self.computing
+        ]
         for index, slot in enumerate(self.computing):
             assert slot.plan is not None and slot.outgoing is not None
             slot.compute_ms = compute_ms
@@ -209,7 +214,10 @@ class WorkerPipeline:
             # charged once, to its first member, and once in the worker summary.
             slot.compute_cost_ms = compute_ms if index == 0 else 0.0
             slot.merge_cost_ms = merge_ms if index == 0 else 0.0
-            slot.pack_ms = slot.begin.elapsed_time(slot.packed_end)
+            slot.pack_ms = pack_times[index]
+            if self.worker.execution.collect_cost_feedback:
+                slot.cost_sample = int(index == 0)
+                slot.batch_pack_ms = sum(pack_times) if index == 0 else 0.0
             slot.phase = "returning"
             send_message(self.control, Message("output_ready", plan=slot.plan))
             peer = self.worker.peers[slot.plan.request.key.client_id]
@@ -264,6 +272,11 @@ class WorkerPipeline:
             }
             # Only completed output sends return credit. The Controller may
             # still hold this slot until the other children of the parent drain.
+            if worker.execution.collect_cost_feedback:
+                metrics.update(
+                    execution_cost_sample=slot.cost_sample,
+                    execution_batch_pack_gpu_ms=slot.batch_pack_ms,
+                )
             send_message(self.control, Message("done", plan=plan, metrics=metrics))
             slot.plan = None
             slot.transfer = None
@@ -403,6 +416,9 @@ class WorkerPipeline:
                 metrics={
                     "receive_slots": len(self.slots),
                     "startup_complete": int(self.worker.startup["completed"]),
+                    "collect_cost_feedback": int(
+                        self.worker.execution.collect_cost_feedback
+                    ),
                     "batch_max_calls": self.batching.max_calls,
                     "batch_max_tokens": self.batching.max_tokens,
                     "batch_max_wait_us": self.batching.max_wait_us,

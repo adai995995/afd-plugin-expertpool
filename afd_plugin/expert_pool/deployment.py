@@ -37,6 +37,7 @@ class ExecutionOptions:
     reuse_cuda_events: bool = False
     defer_output_sync: bool = False
     warmup_before_ready: bool = False
+    collect_cost_feedback: bool = False
 
     def __post_init__(self) -> None:
         if any(type(value) is not bool for value in asdict(self).values()):
@@ -185,6 +186,10 @@ class PoolDeployment:
         }:
             raise ValueError("Unknown expert dispatch mode")
         self.batching.validate_capacity(self.receive_slots, self.max_tokens)
+        if self.execution.collect_cost_feedback and self.receive_slots < 2:
+            raise ValueError(
+                "Execution cost feedback requires compact multi-slot workers"
+            )
         if type(self.expert_replicated) is not bool or (
             self.expert_replicated
             and (not self.compact_output or self.receive_slots < 2)

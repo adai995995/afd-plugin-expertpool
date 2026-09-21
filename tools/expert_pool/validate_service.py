@@ -62,10 +62,12 @@ def send_record(connection: Connection, record: dict) -> None:
     connection.send_bytes(json.dumps(record, allow_nan=False).encode())
 
 
-def receive_record(connection: Connection, timeout_s: float) -> dict:
+def receive_record(
+    connection: Connection, timeout_s: float, *, max_bytes: int = MAX_CONTROL_BYTES * 16
+) -> dict:
     if not connection.poll(timeout_s):
         raise TimeoutError("Validation child exceeded its time budget")
-    record = json.loads(connection.recv_bytes(MAX_CONTROL_BYTES * 16))
+    record = json.loads(connection.recv_bytes(max_bytes))
     if record.get("kind") == "error":
         raise RuntimeError(record["detail"])
     return record

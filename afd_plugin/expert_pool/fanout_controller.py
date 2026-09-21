@@ -23,6 +23,7 @@ from afd_plugin.expert_pool.controller import (
     QueuedCall,
     WorkerReservation,
 )
+from afd_plugin.expert_pool.cost_feedback import ExecutionCostBook, ExecutionShape
 from afd_plugin.expert_pool.demand import DispatchPlan, plan_expert_demand
 from afd_plugin.expert_pool.directory import PoolDirectory
 from afd_plugin.expert_pool.protocol import (
@@ -47,6 +48,7 @@ class FanoutControllerLedger(ControllerLedger):
         compact_output: bool = False,
         receive_slots: int = 1,
         batching: BatchingOptions = DISABLED_BATCHING,
+        collect_cost_feedback: bool = False,
     ) -> None:
         if not directory.expert_partitioned or scheduling_policy != "ready_first":
             raise ValueError("Expert fan-out requires partitioned ready-first control")
@@ -82,6 +84,21 @@ class FanoutControllerLedger(ControllerLedger):
         }
         self.demand_aware = demand_aware
         self.compact_output = compact_output
+        if type(collect_cost_feedback) is not bool or (
+            collect_cost_feedback and (not demand_aware or receive_slots < 2)
+        ):
+            raise ValueError(
+                "Execution cost feedback requires demand-aware multi-slot control"
+            )
+        self.collect_cost_feedback = collect_cost_feedback
+        self.cost_books = (
+            {key: ExecutionCostBook() for key in self.workers}
+            if collect_cost_feedback
+            else {}
+        )
+        # Retain membership through output sends, even after the compute lane
+        # is reused. At most one ticket per occupied receive slot survives.
+        self.execution_tickets: dict[int, tuple[ExecutionPlan, ...]] = {}
         self.active_batches: dict[str, BatchExecution | None] = dict.fromkeys(
             self.workers
         )
@@ -295,8 +312,17 @@ class FanoutControllerLedger(ControllerLedger):
         self.batch_calls[worker_id] += len(plans)
         self.batch_tokens[worker_id] += tokens
         self.merged_batches[worker_id] += len(plans) > 1
+        if self.collect_cost_feedback:
+            for plan in plans:
+                self.execution_tickets[plan.plan_id] = tuple(plans)
 
-    def progress(self, worker_id: str, kind: str, plan: ExecutionPlan) -> None:
+    def progress(
+        self,
+        worker_id: str,
+        kind: str,
+        plan: ExecutionPlan,
+        metrics: dict[str, float] | None = None,
+    ) -> None:
         worker = self.workers.get(worker_id)
         if (
             worker is None
@@ -323,6 +349,11 @@ class FanoutControllerLedger(ControllerLedger):
             self.batching.enabled or any(s.phase == "executing" for s in worker.slots)
         ):
             raise ValueError("A worker has only one compute lane")
+        if self.collect_cost_feedback:
+            if kind == "executing":
+                self.execution_tickets[plan.plan_id] = (plan,)
+            elif kind == "done":
+                self._record_execution_cost(plan, metrics)
         slot.phase = transitions[kind][1]
         if kind == "output_ready" and not any(
             s.phase == "executing" for s in worker.slots
@@ -349,6 +380,37 @@ class FanoutControllerLedger(ControllerLedger):
         del self.active_parents[plan.request.key]
         del self.outstanding[client_id]
         self.completed_by_client[client_id] += 1
+
+    def _record_execution_cost(
+        self, plan: ExecutionPlan, metrics: dict[str, float] | None
+    ) -> None:
+        plans = self.execution_tickets[plan.plan_id]
+        anchor = plan == plans[0]
+        required = (
+            "execution_cost_sample",
+            "execution_batch_calls",
+            "execution_batch_tokens",
+            "compute_phase_cost_gpu_ms",
+            "input_merge_phase_cost_gpu_ms",
+            "execution_batch_pack_gpu_ms",
+        )
+        if metrics is None or any(key not in metrics for key in required):
+            raise ValueError("Missing physical execution cost feedback")
+        if (
+            metrics["execution_cost_sample"] != int(anchor)
+            or metrics["execution_batch_calls"] != len(plans)
+            or metrics["execution_batch_tokens"]
+            != sum(p.request.num_tokens for p in plans)
+        ):
+            raise ValueError("Execution cost feedback has wrong batch membership")
+        timings = tuple(metrics[key] for key in required[3:])
+        if anchor:
+            self.cost_books[plan.worker_id].record(
+                ExecutionShape.from_plans(plans), *timings
+            )
+        elif any(timings):
+            raise ValueError("Physical execution cost must be charged exactly once")
+        del self.execution_tickets[plan.plan_id]
 
     def worker_loads(self) -> dict[str, WorkerLoad]:
         return {
@@ -377,6 +439,11 @@ class FanoutControllerLedger(ControllerLedger):
             "demand_aware": self.demand_aware,
             "compact_output": self.compact_output,
             "receive_slots": self.receive_slots,
+            "cost_feedback_enabled": self.collect_cost_feedback,
+            "active_cost_tickets": len(self.execution_tickets),
+            "execution_cost_by_worker": {
+                key: book.snapshot() for key, book in self.cost_books.items()
+            },
             "expert_replicated": self.directory.expert_replicated,
             "replica_selections": self.replica_selections,
             "pending_dispatch_notifications": len(self.dispatch_notifications),
