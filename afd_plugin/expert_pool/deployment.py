@@ -12,6 +12,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from afd_plugin.expert_pool.batching import BatchingOptions
 from afd_plugin.expert_pool.controller import CONTROLLER_POLICIES
 from afd_plugin.expert_pool.directory import PoolDirectory
 from afd_plugin.expert_pool.placement import ExpertPlacement
@@ -122,10 +123,13 @@ class PoolDeployment:
     demand_aware: bool = False
     compact_output: bool = False
     receive_slots: int = 1
+    batching: BatchingOptions = BatchingOptions()
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution, ExecutionOptions):
             raise ValueError("Deployment requires typed execution options")
+        if not isinstance(self.batching, BatchingOptions):
+            raise ValueError("Deployment requires typed batching options")
         if not Path(self.model).is_absolute():
             raise ValueError("Deployment requires an absolute checkpoint path")
         if not isinstance(self.model_id, str) or not 0 < len(self.model_id) <= 256:
@@ -178,6 +182,7 @@ class PoolDeployment:
             "expert_partitioned",
         }:
             raise ValueError("Unknown expert dispatch mode")
+        self.batching.validate_capacity(self.receive_slots, self.max_tokens)
         if self.dispatch_mode == "whole_layer":
             if any(worker.expert_ids is not None for worker in self.workers):
                 raise ValueError("Whole-layer dispatch requires full worker experts")
@@ -235,6 +240,7 @@ class PoolDeployment:
         raw = json.loads(payload)
         raw["clients"] = tuple(ClientEndpoint(**client) for client in raw["clients"])
         raw["execution"] = ExecutionOptions(**raw.get("execution", {}))
+        raw["batching"] = BatchingOptions(**raw.get("batching", {}))
         if raw.get("controller") is not None:
             raw["controller"] = ControllerConfig(**raw["controller"])
         if "workers" in raw:

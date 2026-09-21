@@ -138,6 +138,7 @@ def serve(
                     demand_aware=deployment.demand_aware,
                     compact_output=deployment.compact_output,
                     receive_slots=deployment.receive_slots,
+                    batching=deployment.batching,
                 )
                 worker.run()
                 return {

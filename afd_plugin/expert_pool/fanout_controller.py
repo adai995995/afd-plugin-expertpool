@@ -9,7 +9,13 @@ deployment; uncertain GPU work is never retried or recycled.
 
 import time
 from collections import deque
+from dataclasses import asdict
 
+from afd_plugin.expert_pool.batching import (
+    DISABLED_BATCHING,
+    BatchingOptions,
+    compatibility_key,
+)
 from afd_plugin.expert_pool.controller import (
     BufferReservation,
     ControllerClientIdentity,
@@ -21,6 +27,8 @@ from afd_plugin.expert_pool.demand import DispatchPlan, plan_expert_demand
 from afd_plugin.expert_pool.directory import PoolDirectory
 from afd_plugin.expert_pool.protocol import (
     MAX_RECEIVE_SLOTS,
+    BatchExecution,
+    BatchSlot,
     CallKey,
     CallRequest,
     ExecutionPlan,
@@ -37,6 +45,7 @@ class FanoutControllerLedger(ControllerLedger):
         demand_aware: bool = False,
         compact_output: bool = False,
         receive_slots: int = 1,
+        batching: BatchingOptions = DISABLED_BATCHING,
     ) -> None:
         if not directory.expert_partitioned or scheduling_policy != "ready_first":
             raise ValueError("Expert fan-out requires partitioned ready-first control")
@@ -52,6 +61,10 @@ class FanoutControllerLedger(ControllerLedger):
         ):
             raise ValueError("Multiple receive slots require compact output")
         self.receive_slots = receive_slots
+        if not isinstance(batching, BatchingOptions):
+            raise ValueError("Controller requires typed batching options")
+        batching.validate_capacity(receive_slots, directory.workers[0].max_tokens)
+        self.batching = batching
         self.workers = {
             key: WorkerReservation(
                 slots=tuple(BufferReservation() for _ in range(receive_slots))
@@ -60,6 +73,13 @@ class FanoutControllerLedger(ControllerLedger):
         }
         self.demand_aware = demand_aware
         self.compact_output = compact_output
+        self.active_batches: dict[str, BatchExecution | None] = dict.fromkeys(
+            self.workers
+        )
+        self.batch_sequences = dict.fromkeys(self.workers, 0)
+        self.batch_calls = dict.fromkeys(self.workers, 0)
+        self.batch_tokens = dict.fromkeys(self.workers, 0)
+        self.merged_batches = dict.fromkeys(self.workers, 0)
         self.active_parents: dict[CallKey, tuple[ExecutionPlan, ...]] = {}
         self.pending_child_plans: deque[tuple[ExecutionPlan, float]] = deque()
         # Requests and placement are immutable. Keep one derived plan per
@@ -211,6 +231,46 @@ class FanoutControllerLedger(ControllerLedger):
                 return self.grant(now_ns)
         return None
 
+    def start_batch(self, worker_id: str, batch: BatchExecution) -> None:
+        """Validate every member before atomically occupying the compute lane."""
+        if (
+            not self.batching.enabled
+            or worker_id not in self.workers
+            or batch.worker_id != worker_id
+            or self.active_batches[worker_id] is not None
+            or batch.sequence != self.batch_sequences[worker_id] + 1
+            or len(batch.members) > self.batching.max_calls
+        ):
+            raise ValueError("Invalid, stale or overlapping compute batch")
+        worker = self.workers[worker_id]
+        plans = []
+        for member in batch.members:
+            if member.slot_id >= len(worker.slots):
+                raise ValueError("Batch references an absent receive slot")
+            slot = worker.slots[member.slot_id]
+            if (
+                slot.phase != "input_ready"
+                or slot.active is None
+                or BatchSlot.from_plan(slot.active) != member
+            ):
+                raise ValueError("Batch member is stale or its input is not ready")
+            plans.append(slot.active)
+        tokens = sum(plan.request.num_tokens for plan in plans)
+        if (
+            len({compatibility_key(plan) for plan in plans}) != 1
+            or len({plan.request.key.client_id for plan in plans}) != len(plans)
+            or tokens > self.batching.max_tokens
+            or any(slot.phase == "executing" for slot in worker.slots)
+        ):
+            raise ValueError("Batch exceeds capacity or mixes incompatible calls")
+        for member in batch.members:
+            worker.slots[member.slot_id].phase = "executing"
+        self.active_batches[worker_id] = batch
+        self.batch_sequences[worker_id] = batch.sequence
+        self.batch_calls[worker_id] += len(plans)
+        self.batch_tokens[worker_id] += tokens
+        self.merged_batches[worker_id] += len(plans) > 1
+
     def progress(self, worker_id: str, kind: str, plan: ExecutionPlan) -> None:
         worker = self.workers.get(worker_id)
         if (
@@ -234,9 +294,15 @@ class FanoutControllerLedger(ControllerLedger):
             raise RuntimeError("Expert fan-out failed; terminate the deployment")
         if kind not in transitions or slot.phase != transitions[kind][0]:
             raise ValueError("Out-of-order worker progress")
-        if kind == "executing" and any(s.phase == "executing" for s in worker.slots):
+        if kind == "executing" and (
+            self.batching.enabled or any(s.phase == "executing" for s in worker.slots)
+        ):
             raise ValueError("A worker has only one compute lane")
         slot.phase = transitions[kind][1]
+        if kind == "output_ready" and not any(
+            s.phase == "executing" for s in worker.slots
+        ):
+            self.active_batches[worker_id] = None
         if kind != "done":
             return
         client_id = plan.request.key.client_id
@@ -270,6 +336,14 @@ class FanoutControllerLedger(ControllerLedger):
             "demand_aware": self.demand_aware,
             "compact_output": self.compact_output,
             "receive_slots": self.receive_slots,
+            "batching": asdict(self.batching),
+            "active_compute_batches": sum(
+                b is not None for b in self.active_batches.values()
+            ),
+            "compute_batches_by_worker": dict(self.batch_sequences),
+            "batched_calls_by_worker": dict(self.batch_calls),
+            "batch_tokens_by_worker": dict(self.batch_tokens),
+            "merged_batches_by_worker": dict(self.merged_batches),
             "empty_parent_calls": self.empty_parent_calls,
             "planning_cpu_ms_total": self.planning_cpu_ns / 1e6,
             "selected_worker_calls": dict(self.selected_worker_calls),

@@ -12,6 +12,7 @@ import json
 from collections import deque
 from dataclasses import asdict, dataclass, field
 
+from afd_plugin.expert_pool.batching import DISABLED_BATCHING, BatchingOptions
 from afd_plugin.expert_pool.directory import PoolDirectory, ReplicaSelector
 from afd_plugin.expert_pool.protocol import CallKey, CallRequest, ExecutionPlan
 from afd_plugin.expert_pool.scheduler import StaticDirectory
@@ -128,6 +129,7 @@ class ControllerLedger:
         if not clients or len({c.client_id for c in clients}) != len(clients):
             raise ValueError("Controller requires unique clients")
         self.directory = directory
+        self.batching = BatchingOptions()
         self.scheduling_policy = scheduling_policy
         self.directories = {d.worker_id: d for d in directory.workers}
         self.clients = {c.client_id: c for c in clients}
@@ -153,7 +155,12 @@ class ControllerLedger:
         self.busy_replica_bypasses = 0
 
     def ready(
-        self, worker_id: str, fingerprint: str, *, receive_slots: int = 1
+        self,
+        worker_id: str,
+        fingerprint: str,
+        *,
+        receive_slots: int = 1,
+        batching: BatchingOptions = DISABLED_BATCHING,
     ) -> None:
         worker = self.workers[worker_id]
         if (
@@ -161,6 +168,7 @@ class ControllerLedger:
             or fingerprint != directory_digest(self.directories[worker_id])
             or type(receive_slots) is not int
             or receive_slots != len(worker.slots)
+            or batching != self.batching
         ):
             raise ValueError("Duplicate readiness or mismatched resident directory")
         worker.ready = True

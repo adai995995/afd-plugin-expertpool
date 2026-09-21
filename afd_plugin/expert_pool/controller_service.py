@@ -11,6 +11,7 @@ from contextlib import ExitStack
 from multiprocessing.connection import Client, Connection, Listener, wait
 from pathlib import Path
 
+from afd_plugin.expert_pool.batching import BatchingOptions
 from afd_plugin.expert_pool.controller import ControllerClientIdentity, ControllerLedger
 from afd_plugin.expert_pool.deployment import PoolDeployment
 from afd_plugin.expert_pool.fanout_controller import FanoutControllerLedger
@@ -116,7 +117,17 @@ class ControllerRuntime:
                         identity,
                         message.detail,
                         receive_slots=message.metrics.get("receive_slots", 1),
+                        batching=BatchingOptions(
+                            max_calls=message.metrics.get("batch_max_calls", 1),
+                            max_tokens=message.metrics.get("batch_max_tokens", 0),
+                            max_wait_us=message.metrics.get("batch_max_wait_us", 0),
+                        ),
                     )
+                elif message.kind == "batch_executing":
+                    if not isinstance(self.ledger, FanoutControllerLedger):
+                        raise ValueError("Batch execution requires partitioned control")
+                    assert message.batch is not None
+                    self.ledger.start_batch(identity, message.batch)
                 elif message.kind == "closed":
                     if not stopping or self.ledger.workers[identity].active is not None:
                         raise ValueError("Worker closed before draining")
@@ -178,6 +189,7 @@ def serve_controller(deployment: PoolDeployment) -> dict:
             demand_aware=deployment.demand_aware,
             compact_output=deployment.compact_output,
             receive_slots=deployment.receive_slots,
+            batching=deployment.batching,
         )
     else:
         ledger = ControllerLedger(

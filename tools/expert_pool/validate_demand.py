@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import afd_plugin
+from afd_plugin.expert_pool.batching import BatchingOptions
 from afd_plugin.expert_pool.controller import ControllerClientIdentity
 from afd_plugin.expert_pool.controller_service import ControllerRuntime
 from afd_plugin.expert_pool.deployment import ExecutionOptions
@@ -43,6 +44,7 @@ from afd_plugin.expert_pool.scheduler import StaticDirectory
 from tools.expert_pool.validate_engines import (
     process_environment,
     stop_children,
+    verify_batching,
     verify_pipeline,
 )
 from tools.expert_pool.validate_service import (
@@ -75,6 +77,7 @@ class DemandLaunch:
     ports: tuple[tuple[int, int], tuple[int, int]]
     compact_output: bool = False
     receive_slots: int = 1
+    batching: BatchingOptions = BatchingOptions()
     pipeline_trace_dir: str | None = None
 
 
@@ -120,6 +123,7 @@ def controller_process(
             demand_aware=True,
             compact_output=launch.compact_output,
             receive_slots=launch.receive_slots,
+            batching=launch.batching,
         )
         runtime = ControllerRuntime(
             ledger,
@@ -163,6 +167,25 @@ def worker_process(
                     ):
                         return super().post(tensors, send=send)
 
+            execution_rows = Counter()
+
+            class ObservedExecutor(ExpertExecutor):
+                # Validation-only instrumentation counts actual executor inputs,
+                # independently of the worker's selected-batch bookkeeping.
+                def forward_slots(self, hidden_states, routing_weights, expert_ids):
+                    rows = hidden_states.shape[0]
+                    marker = (
+                        torch.profiler.record_function(f"pool.compute.tokens_{rows}")
+                        if launch.pipeline_trace_dir is not None
+                        else nullcontext()
+                    )
+                    with marker:
+                        result = super().forward_slots(
+                            hidden_states, routing_weights, expert_ids
+                        )
+                    execution_rows[rows] += 1
+                    return result
+
             transport_type = (
                 TracedTransport
                 if launch.pipeline_trace_dir is not None
@@ -179,7 +202,7 @@ def worker_process(
             worker = ExpertWorker(
                 directory,
                 {
-                    placement.layer_id: ExpertExecutor(
+                    placement.layer_id: ObservedExecutor(
                         checkpoint,
                         placement,
                         device,
@@ -197,6 +220,7 @@ def worker_process(
                 demand_aware=True,
                 compact_output=launch.compact_output,
                 receive_slots=launch.receive_slots,
+                batching=launch.batching,
                 execution=ExecutionOptions(
                     validate_worker_values=launch.receive_slots == 1,
                     reuse_cuda_events=True,
@@ -232,6 +256,7 @@ def worker_process(
                     "compact_output": worker.compact_output,
                     "output_transfer": dict(worker.output_transfer),
                     "pipeline": worker.pipeline_status(),
+                    "actual_executor_token_rows": dict(execution_rows),
                 },
             )
     except BaseException:
@@ -691,7 +716,14 @@ def run(
             )
         ]
         matrix.append(("empty", 0, seeds[-1], "native", "native"))
+        if launch.batching.enabled:
+            matrix += [
+                ("unequal", (1, max(batches)), seeds[-1], "native", "native"),
+                ("unequal_swapped", (max(batches), 1), seeds[-1], "mixed", "mixed"),
+                ("empty_peer", (max(batches), 0), seeds[-1], "native", "native"),
+            ]
         for phase, tokens, seed, left, right in matrix:
+            token_counts = tokens if isinstance(tokens, tuple) else (tokens, tokens)
             for index, routes in enumerate((left, right)):
                 send_record(
                     supervisors[index][0],
@@ -699,7 +731,7 @@ def run(
                         "op": "prepare",
                         "case": {
                             "phase": phase,
-                            "tokens": tokens,
+                            "tokens": token_counts[index],
                             "seed": seed + index,
                             "routes": routes,
                         },
@@ -861,6 +893,26 @@ def run(
                 ledger,
                 launch.receive_slots,
             )
+        if launch.batching.enabled:
+            verify_batching(
+                final[CLIENT_COUNT : CLIENT_COUNT + WORKER_COUNT],
+                ledger,
+                launch.batching,
+            )
+            for worker in final[CLIENT_COUNT : CLIENT_COUNT + WORKER_COUNT]:
+                actual = {
+                    int(k): v for k, v in worker["actual_executor_token_rows"].items()
+                }
+                stats = worker["pipeline"]["batching"]
+                if (
+                    sum(actual.values()) != stats["executions"]
+                    or sum(rows * count for rows, count in actual.items())
+                    != stats["token_rows"]
+                    or max(actual) != stats["max_executed_tokens"]
+                ):
+                    raise AssertionError(
+                        "Actual GEMM input batches differ from planned work"
+                    )
         for child in children:
             child.join(20)
             if child.exitcode != 0:
@@ -909,8 +961,18 @@ def main() -> int:
         help="Return only this worker's routed Top-k slots; input payload stays dense",
     )
     parser.add_argument("--receive-slots", type=int, default=1)
+    parser.add_argument("--batch-max-calls", type=int, default=1)
+    parser.add_argument("--batch-max-tokens", type=int, default=0)
+    parser.add_argument("--batch-wait-us", type=int, default=0)
     parser.add_argument("--pipeline-trace-dir", type=Path)
     args = parser.parse_args()
+    try:
+        batching = BatchingOptions(
+            args.batch_max_calls, args.batch_max_tokens, args.batch_wait_us
+        )
+        batching.validate_capacity(args.receive_slots, max(args.batches))
+    except (TypeError, ValueError) as error:
+        parser.error(str(error))
     if not 1 <= args.receive_slots <= MAX_RECEIVE_SLOTS or (
         args.receive_slots > 1 and not args.compact_output
     ):
@@ -955,6 +1017,7 @@ def main() -> int:
         "physical_gpus": args.gpus,
         "compact_output": args.compact_output,
         "receive_slots": args.receive_slots,
+        "batching": asdict(batching),
         "pipeline_trace_dir": str(args.pipeline_trace_dir)
         if args.pipeline_trace_dir
         else None,
@@ -1039,6 +1102,7 @@ def main() -> int:
                 (ports[:WORKER_COUNT], ports[WORKER_COUNT:]),
                 compact_output=args.compact_output,
                 receive_slots=args.receive_slots,
+                batching=batching,
                 pipeline_trace_dir=(
                     str(args.pipeline_trace_dir) if args.pipeline_trace_dir else None
                 ),

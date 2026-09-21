@@ -26,6 +26,7 @@ MESSAGE_KINDS = frozenset(
         "ready",
         "input_ready",
         "executing",
+        "batch_executing",
         "status",
         "snapshot",
         "empty_done",
@@ -160,6 +161,50 @@ class ExecutionPlan:
 
 
 @dataclass(frozen=True)
+class BatchSlot:
+    """Reference an already admitted immutable plan without repeating demand."""
+
+    plan_id: int
+    slot_id: int
+    generation: int
+
+    def __post_init__(self) -> None:
+        if (
+            any(
+                type(value) is not int or value < 0
+                for value in (self.plan_id, self.slot_id, self.generation)
+            )
+            or self.slot_id >= MAX_RECEIVE_SLOTS
+        ):
+            raise ValueError("Invalid batch slot identity")
+
+    @classmethod
+    def from_plan(cls, plan: ExecutionPlan) -> "BatchSlot":
+        return cls(plan.plan_id, plan.slot_id, plan.generation)
+
+
+@dataclass(frozen=True)
+class BatchExecution:
+    worker_id: str
+    sequence: int
+    members: tuple[BatchSlot, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.worker_id, str)
+            or not 0 < len(self.worker_id) <= 128
+            or type(self.sequence) is not int
+            or self.sequence <= 0
+            or not isinstance(self.members, tuple)
+            or not 1 <= len(self.members) <= MAX_RECEIVE_SLOTS
+            or any(not isinstance(member, BatchSlot) for member in self.members)
+            or len({member.slot_id for member in self.members}) != len(self.members)
+            or len({member.plan_id for member in self.members}) != len(self.members)
+        ):
+            raise ValueError("Invalid compute batch identity")
+
+
+@dataclass(frozen=True)
 class Message:
     kind: str
     request: CallRequest | None = None
@@ -167,6 +212,7 @@ class Message:
     detail: str = ""
     metrics: dict[str, float] = field(default_factory=dict)
     digests: dict[str, str] = field(default_factory=dict)
+    batch: BatchExecution | None = None
 
     def __post_init__(self) -> None:
         if self.request is not None and not isinstance(self.request, CallRequest):
@@ -175,6 +221,15 @@ class Message:
             raise ValueError("Invalid plan object")
         if self.kind not in MESSAGE_KINDS:
             raise ValueError("Unknown control message")
+        if self.kind == "batch_executing":
+            if (
+                not isinstance(self.batch, BatchExecution)
+                or self.plan is not None
+                or self.request is not None
+            ):
+                raise ValueError("Batch execution requires a batch identity only")
+        elif self.batch is not None:
+            raise ValueError("Unexpected batch identity")
         if not isinstance(self.detail, str) or len(self.detail) > 2048:
             raise ValueError("Invalid error detail")
         if self.kind == "submit" and (self.request is None or self.plan is not None):
@@ -247,8 +302,23 @@ def decode_message(payload: bytes) -> Message:
         raise ValueError("Control message exceeds size limit")
     try:
         data = json.loads(payload)
-        if set(data) != {"kind", "request", "plan", "detail", "metrics", "digests"}:
+        if set(data) != {
+            "kind",
+            "request",
+            "plan",
+            "detail",
+            "metrics",
+            "digests",
+            "batch",
+        }:
             raise ValueError("Unexpected message fields")
+        if data["batch"] is not None:
+            batch = data["batch"]
+            if not isinstance(batch, dict) or not isinstance(batch["members"], list):
+                raise ValueError("Malformed compute batch identity")
+            data["batch"] = BatchExecution(
+                **{**batch, "members": tuple(BatchSlot(**m) for m in batch["members"])}
+            )
         if data["request"] is not None:
             data["request"] = _decode_request(data["request"])
         if data["plan"] is not None:

@@ -16,6 +16,7 @@ from multiprocessing.connection import Connection, wait
 import torch
 
 from afd_plugin.connectors.gpu.pool import PoolTransport
+from afd_plugin.expert_pool.batching import DISABLED_BATCHING, BatchingOptions
 from afd_plugin.expert_pool.compact_output import CompactOutputWorkspace
 from afd_plugin.expert_pool.controller import directory_digest
 from afd_plugin.expert_pool.deployment import ExecutionOptions
@@ -60,6 +61,7 @@ class ExpertWorker:
         demand_aware: bool = False,
         compact_output: bool = False,
         receive_slots: int = 1,
+        batching: BatchingOptions = DISABLED_BATCHING,
     ) -> None:
         if not peers or len({peer.client_id for peer in peers}) != len(peers):
             raise ValueError("Worker requires unique client endpoints")
@@ -123,6 +125,10 @@ class ExpertWorker:
         ):
             raise ValueError("Multiple receive slots require trusted compact execution")
         self.receive_slots = receive_slots
+        if not isinstance(batching, BatchingOptions):
+            raise ValueError("Worker requires typed batching options")
+        batching.validate_capacity(receive_slots, directory.max_tokens)
+        self.batching = batching
         self.profiler = profiler
         self.controller = controller
         self.controller_generation = 0

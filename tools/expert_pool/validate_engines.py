@@ -29,6 +29,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 
 import afd_plugin
+from afd_plugin.expert_pool.batching import BatchingOptions
 from afd_plugin.expert_pool.controller import CONTROLLER_POLICIES
 from afd_plugin.expert_pool.deployment import (
     ClientEndpoint,
@@ -414,6 +415,9 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 demand_aware=args.expert_demand,
                 compact_output=args.compact_output,
                 receive_slots=args.receive_slots,
+                batching=BatchingOptions(
+                    args.batch_max_calls, args.batch_max_tokens, args.batch_wait_us
+                ),
             )
             directory = deployment.pool_directory()
             report["placement"] = asdict(directory)
@@ -589,6 +593,10 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 if args.receive_slots > 1:
                     report["pipeline_accounting"] = verify_pipeline(
                         report["workers"], controlled, args.receive_slots
+                    )
+                if deployment.batching.enabled:
+                    report["batching_accounting"] = verify_batching(
+                        report["workers"], controlled, deployment.batching
                     )
                 if controlled["scheduling_policy"] != args.controller_policy or any(
                     item["status"][0]["dispatch"]["policy"] != controlled["policy"]
@@ -1107,6 +1115,50 @@ def verify_pipeline(workers: list[dict], controller: dict, receive_slots: int) -
     }
 
 
+def verify_batching(
+    workers: list[dict], controller: dict, options: BatchingOptions
+) -> dict:
+    """Independent admission/execution accounting; require actual merged work."""
+    if (
+        controller["batching"] != asdict(options)
+        or controller["active_compute_batches"]
+    ):
+        raise AssertionError("Batch configuration or compute lane did not drain")
+    merged = 0
+    executions = 0
+    calls = 0
+    for worker in workers:
+        key = worker["worker_id"]
+        stats = worker["pipeline"]["batching"]
+        histogram = {int(k): v for k, v in stats["calls_per_execution"].items()}
+        own_merged = sum(v for k, v in histogram.items() if k > 1)
+        if (
+            any(stats[k] != v for k, v in asdict(options).items())
+            or set(histogram) != set(range(1, options.max_calls + 1))
+            or sum(histogram.values()) != stats["executions"]
+            or sum(k * v for k, v in histogram.items()) != stats["calls"]
+            or stats["calls"] != worker["completed_calls"]
+            or stats["calls"] != controller["batched_calls_by_worker"][key]
+            or stats["executions"] != controller["compute_batches_by_worker"][key]
+            or stats["token_rows"] != controller["batch_tokens_by_worker"][key]
+            or own_merged != controller["merged_batches_by_worker"][key]
+            or stats["max_executed_tokens"] > options.max_tokens
+        ):
+            raise AssertionError("Actual batches differ from admitted work/capacity")
+        merged += own_merged
+        executions += stats["executions"]
+        calls += stats["calls"]
+    if not merged:
+        raise AssertionError("Validation did not execute any cross-client batch")
+    return {
+        "merged_executions": merged,
+        "executions": executions,
+        "calls": calls,
+        "all_members_drained": True,
+        "scope": "Real merged Expert execution; no performance or SLO claim",
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
@@ -1151,7 +1203,17 @@ def main() -> int:
     parser.add_argument("--logprob-atol", type=float, default=0.05)
     parser.add_argument("--execution-options", type=json.loads, default={})
     parser.add_argument("--receive-slots", type=int, default=1)
+    parser.add_argument("--batch-max-calls", type=int, default=1)
+    parser.add_argument("--batch-max-tokens", type=int, default=0)
+    parser.add_argument("--batch-wait-us", type=int, default=0)
     args = parser.parse_args()
+    try:
+        batching = BatchingOptions(
+            args.batch_max_calls, args.batch_max_tokens, args.batch_wait_us
+        )
+        batching.validate_capacity(args.receive_slots, MAX_BATCH_TOKENS)
+    except (TypeError, ValueError) as error:
+        parser.error(str(error))
     if not args.controller and args.controller_policy != "round_robin":
         parser.error("--controller-policy requires --controller")
     if args.placement == "expert_partitioned" and (
@@ -1217,6 +1279,7 @@ def main() -> int:
         "demand_aware": args.expert_demand,
         "compact_output": args.compact_output,
         "receive_slots": args.receive_slots,
+        "batching": asdict(batching),
         "controller_enabled": args.controller,
         "controller_policy": args.controller_policy if args.controller else None,
     }
