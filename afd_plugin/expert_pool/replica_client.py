@@ -30,7 +30,11 @@ class ReplicaPoolClient:
         self.selector = ReplicaSelector(self.directory, client_offset)
 
     def _initialize_channels(
-        self, channels: tuple[PoolClient, ...], *, expert_partitioned: bool = False
+        self,
+        channels: tuple[PoolClient, ...],
+        *,
+        expert_partitioned: bool = False,
+        expert_replicated: bool = False,
     ) -> None:
         """Bind fresh channels; subclasses supply a compatible dispatch policy."""
         if not channels:
@@ -48,6 +52,7 @@ class ReplicaPoolClient:
         self.directory = PoolDirectory(
             tuple(channel.directory for channel in channels),
             expert_partitioned=expert_partitioned,
+            expert_replicated=expert_replicated,
         )
         self.channels = {channel.directory.worker_id: channel for channel in channels}
         self.client_id = first.client_id

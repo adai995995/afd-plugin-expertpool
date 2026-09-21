@@ -18,7 +18,10 @@ import torch
 
 from afd_plugin.connectors.gpu.pool import PoolTransfer
 from afd_plugin.expert_pool.batching import ReadyCall, select_batch
-from afd_plugin.expert_pool.compact_output import CompactOutputWorkspace
+from afd_plugin.expert_pool.compact_output import (
+    CompactOutputWorkspace,
+    selection_ownership,
+)
 from afd_plugin.expert_pool.controller import directory_digest
 from afd_plugin.expert_pool.protocol import (
     BatchExecution,
@@ -50,6 +53,7 @@ class PipelineSlot:
     transfer: PoolTransfer | None = None
     outgoing: torch.Tensor | None = None
     result: torch.Tensor | None = None
+    task_ownership: torch.Tensor | None = None
     started_ns: int = 0
     ready_ns: int = 0
     compute_submitted_ns: int = 0
@@ -263,7 +267,7 @@ class WorkerPipeline:
             send_message(self.control, Message("done", plan=plan, metrics=metrics))
             slot.plan = None
             slot.transfer = None
-            slot.outgoing = slot.result = None
+            slot.outgoing = slot.result = slot.task_ownership = None
             slot.phase = "idle"
             slot.completed += 1
         return progressed
@@ -353,7 +357,24 @@ class WorkerPipeline:
                     offset = end
             self.compute_begin.record()
             layer = plans[0].request.layer_id
-            result = self.worker.executors[layer].forward_slots(*inputs)
+            assignment_mask = None
+            if self.worker.expert_replicated:
+                masks = []
+                for slot, plan in zip(selected, plans, strict=True):
+                    slot.task_ownership = selection_ownership(
+                        plan.expert_ids,
+                        self.worker.ownership[layer].numel(),
+                        self.worker.device,
+                    )
+                    masks.append(
+                        slot.task_ownership[slot.ids[: plan.request.num_tokens].long()]
+                    )
+                assignment_mask = (
+                    masks[0] if len(masks) == 1 else torch.cat(masks, dim=0)
+                )
+            result = self.worker.executors[layer].forward_slots(
+                *inputs, assignment_mask=assignment_mask
+            )
             self.compute_end.record()
             offset = 0
             for slot, plan in zip(selected, plans, strict=True):
@@ -364,7 +385,9 @@ class WorkerPipeline:
                 slot.outgoing = slot.workspace.pack(
                     slot.result,
                     slot.ids[:rows],
-                    self.worker.ownership[layer],
+                    slot.task_ownership
+                    if self.worker.expert_replicated
+                    else self.worker.ownership[layer],
                     num_assignments=plan.num_assignments,
                 )
                 slot.packed_end.record()
@@ -379,6 +402,7 @@ class WorkerPipeline:
                 detail=directory_digest(self.worker.directory),
                 metrics={
                     "receive_slots": len(self.slots),
+                    "startup_complete": int(self.worker.startup["completed"]),
                     "batch_max_calls": self.batching.max_calls,
                     "batch_max_tokens": self.batching.max_tokens,
                     "batch_max_wait_us": self.batching.max_wait_us,

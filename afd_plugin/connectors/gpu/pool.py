@@ -72,6 +72,7 @@ class PoolTransport:
         timeout_s: int = 60,
         *,
         reuse_events: bool = False,
+        warmup_elements: int = 0,
     ) -> None:
         if version("vllm") != "0.26.0" or rank not in (0, 1):
             raise ValueError("Requires pinned vLLM and a two-rank channel")
@@ -97,6 +98,17 @@ class PoolTransport:
         self.closed = False
         self.pending: PoolTransfer | None = None
         self.failed = False
+        self.warmup_completed = False
+        if type(warmup_elements) is not int or warmup_elements < 0:
+            raise ValueError("Invalid startup transport buffer size")
+        if warmup_elements:
+            # Both ranks follow the same bounded handshake during bootstrap,
+            # before registration/admission. This warms send and receive paths
+            # without consuming call/slot identities or request counters.
+            payload = torch.zeros(warmup_elements, dtype=torch.bfloat16, device=device)
+            for sending in (rank == 1, rank == 0):
+                self.transfer((payload,), send=sending)
+            self.warmup_completed = True
 
     @staticmethod
     def _events() -> tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]:

@@ -79,6 +79,7 @@ class DemandLaunch:
     receive_slots: int = 1
     batching: BatchingOptions = BatchingOptions()
     pipeline_trace_dir: str | None = None
+    warmup_before_ready: bool = False
 
 
 class TransferRecorder:
@@ -125,6 +126,7 @@ def controller_process(
             receive_slots=launch.receive_slots,
             batching=launch.batching,
         )
+        ledger.requires_warmup = launch.warmup_before_ready
         runtime = ControllerRuntime(
             ledger,
             {f"client-{index}": connection for index, connection in enumerate(clients)},
@@ -172,7 +174,13 @@ def worker_process(
             class ObservedExecutor(ExpertExecutor):
                 # Validation-only instrumentation counts actual executor inputs,
                 # independently of the worker's selected-batch bookkeeping.
-                def forward_slots(self, hidden_states, routing_weights, expert_ids):
+                def forward_slots(
+                    self,
+                    hidden_states,
+                    routing_weights,
+                    expert_ids,
+                    assignment_mask=None,
+                ):
                     rows = hidden_states.shape[0]
                     marker = (
                         torch.profiler.record_function(f"pool.compute.tokens_{rows}")
@@ -181,7 +189,10 @@ def worker_process(
                     )
                     with marker:
                         result = super().forward_slots(
-                            hidden_states, routing_weights, expert_ids
+                            hidden_states,
+                            routing_weights,
+                            expert_ids,
+                            assignment_mask=assignment_mask,
                         )
                     execution_rows[rows] += 1
                     return result
@@ -195,7 +206,16 @@ def worker_process(
             directory = launch.directory.workers[worker_index]
             transports = tuple(
                 transport_type(
-                    "127.0.0.1", row[worker_index], 0, device, launch.runtime.timeout_s
+                    "127.0.0.1",
+                    row[worker_index],
+                    0,
+                    device,
+                    launch.runtime.timeout_s,
+                    warmup_elements=(
+                        directory.max_tokens * directory.top_k * directory.hidden_size
+                        if launch.warmup_before_ready
+                        else 0
+                    ),
                 )
                 for row in launch.ports
             )
@@ -221,12 +241,16 @@ def worker_process(
                 compact_output=launch.compact_output,
                 receive_slots=launch.receive_slots,
                 batching=launch.batching,
+                expert_replicated=launch.directory.expert_replicated,
                 execution=ExecutionOptions(
                     validate_worker_values=launch.receive_slots == 1,
                     reuse_cuda_events=True,
                     defer_output_sync=True,
+                    warmup_before_ready=launch.warmup_before_ready,
                 ),
             )
+            worker.prepare()
+            execution_rows.clear()
             send_record(supervisor, {"kind": "ready", "role": directory.worker_id})
             profiling = (
                 torch.profiler.profile(
@@ -257,6 +281,7 @@ def worker_process(
                     "output_transfer": dict(worker.output_transfer),
                     "pipeline": worker.pipeline_status(),
                     "actual_executor_token_rows": dict(execution_rows),
+                    "startup": worker.startup,
                 },
             )
     except BaseException:
@@ -299,7 +324,18 @@ def client_process(
             transports = tuple(
                 TransferRecorder(
                     PoolTransport(
-                        "127.0.0.1", port, 1, device, launch.runtime.timeout_s
+                        "127.0.0.1",
+                        port,
+                        1,
+                        device,
+                        launch.runtime.timeout_s,
+                        warmup_elements=(
+                            directory.max_tokens
+                            * directory.top_k
+                            * directory.hidden_size
+                            if launch.warmup_before_ready
+                            else 0
+                        ),
                     )
                 )
                 for port in launch.ports[client_index]
@@ -325,6 +361,7 @@ def client_process(
                 demand_aware=True,
                 compact_output=launch.compact_output,
                 receive_slots=launch.receive_slots,
+                expert_replicated=launch.directory.expert_replicated,
             )
             collector = ExpertDemandCollector(
                 num_experts, device, directory.max_tokens * directory.top_k
@@ -429,6 +466,8 @@ def client_process(
                                 i if i % 2 == 0 else num_experts - i
                                 for i in range(directory.top_k)
                             )
+                        elif case["routes"] == "replicated":
+                            choices = tuple(range(directory.top_k))
                         else:
                             raise ValueError("Unknown controlled routing case")
                         positions = (
@@ -485,13 +524,6 @@ def client_process(
                         raise AssertionError(
                             "Empty demand performed a GPU summary phase"
                         )
-                    selected = tuple(
-                        worker.worker_id
-                        for worker in launch.directory.workers
-                        if any(
-                            expected_counts[e] for e in worker.placements[0].expert_ids
-                        )
-                    )
                     before = [dict(transport.counters) for transport in transports]
                     send_record(supervisor, {"kind": "prepared"})
                     if (
@@ -502,6 +534,26 @@ def client_process(
                     started_ns = time.perf_counter_ns()
                     actual, completion = client.execute(layer, hidden, weights, ids)
                     finished_ns = time.perf_counter_ns()
+                    decision = client.last_dispatch
+                    if (
+                        decision is None
+                        or decision.request.demand.counts != expected_counts
+                    ):
+                        raise AssertionError("Missing or mismatched completed dispatch")
+                    selected = decision.owners
+                    selected_experts = {
+                        task.worker_id: task.expert_ids for task in decision.tasks
+                    }
+                    for task in decision.tasks:
+                        resident = next(
+                            w
+                            for w in launch.directory.workers
+                            if w.worker_id == task.worker_id
+                        )
+                        if not set(task.expert_ids) <= set(
+                            resident.placements[0].expert_ids
+                        ):
+                            raise AssertionError("Dispatch selected nonresident expert")
                     if tokens and completion.plan is None:
                         raise AssertionError(
                             "Nonempty demand lacks a completed child plan"
@@ -532,7 +584,7 @@ def client_process(
                         active = int(worker.worker_id in selected)
                         assignments = sum(
                             expected_counts[expert]
-                            for expert in worker.placements[0].expert_ids
+                            for expert in selected_experts.get(worker.worker_id, ())
                         )
                         expected_traffic = {
                             "send_calls": active,
@@ -587,6 +639,7 @@ def client_process(
                                 "counts": list(expected_counts),
                                 "counts_match_exactly": True,
                                 "selected_workers": list(selected),
+                                "selected_experts": selected_experts,
                                 "transfer_accounting": traffic,
                                 "compact_output": launch.compact_output,
                                 "dense_equivalent_output_bytes": len(selected)
@@ -716,6 +769,11 @@ def run(
             )
         ]
         matrix.append(("empty", 0, seeds[-1], "native", "native"))
+        if launch.directory.expert_replicated:
+            matrix += [
+                ("all_replicated", max(batches), seed, "replicated", "replicated")
+                for seed in seeds
+            ]
         if launch.batching.enabled:
             matrix += [
                 ("unequal", (1, max(batches)), seeds[-1], "native", "native"),
@@ -798,7 +856,11 @@ def run(
                 worker.worker_id in case["selected_workers"] for case in records
             )
             expected_counts = {
-                str(expert): sum(case["counts"][expert] for case in records)
+                str(expert): sum(
+                    case["counts"][expert]
+                    for case in records
+                    if expert in case["selected_experts"].get(worker.worker_id, ())
+                )
                 for expert in worker.placements[0].expert_ids
             }
             if (
@@ -965,6 +1027,12 @@ def main() -> int:
     parser.add_argument("--batch-max-tokens", type=int, default=0)
     parser.add_argument("--batch-wait-us", type=int, default=0)
     parser.add_argument("--pipeline-trace-dir", type=Path)
+    parser.add_argument(
+        "--expert-replicated",
+        action="store_true",
+        help="Add a second resident copy of the first Top-k experts",
+    )
+    parser.add_argument("--warmup-before-ready", action="store_true")
     args = parser.parse_args()
     try:
         batching = BatchingOptions(
@@ -977,6 +1045,8 @@ def main() -> int:
         args.receive_slots > 1 and not args.compact_output
     ):
         parser.error("Multiple receive slots require compact output")
+    if args.expert_replicated and (not args.compact_output or args.receive_slots < 2):
+        parser.error("Expert replicas require compact multi-slot execution")
     if args.pipeline_trace_dir is not None:
         if args.receive_slots == 1 or args.pipeline_trace_dir.exists():
             parser.error(
@@ -1017,6 +1087,8 @@ def main() -> int:
         "physical_gpus": args.gpus,
         "compact_output": args.compact_output,
         "receive_slots": args.receive_slots,
+        "expert_replicated": args.expert_replicated,
+        "warmup_before_ready": args.warmup_before_ready,
         "batching": asdict(batching),
         "pipeline_trace_dir": str(args.pipeline_trace_dir)
         if args.pipeline_trace_dir
@@ -1062,7 +1134,17 @@ def main() -> int:
                         ExpertPlacement(
                             args.layer,
                             num_experts,
-                            tuple(reversed(range(index, num_experts, WORKER_COUNT))),
+                            tuple(
+                                sorted(
+                                    set(range(index, num_experts, WORKER_COUNT))
+                                    | (
+                                        set(range(top_k))
+                                        if args.expert_replicated
+                                        else set()
+                                    ),
+                                    reverse=True,
+                                )
+                            ),
                         ),
                     ),
                     raw["hidden_size"],
@@ -1098,11 +1180,16 @@ def main() -> int:
                     args.atol,
                     args.rtol,
                 ),
-                PoolDirectory(workers, expert_partitioned=True),
+                PoolDirectory(
+                    workers,
+                    expert_partitioned=True,
+                    expert_replicated=args.expert_replicated,
+                ),
                 (ports[:WORKER_COUNT], ports[WORKER_COUNT:]),
                 compact_output=args.compact_output,
                 receive_slots=args.receive_slots,
                 batching=batching,
+                warmup_before_ready=args.warmup_before_ready,
                 pipeline_trace_dir=(
                     str(args.pipeline_trace_dir) if args.pipeline_trace_dir else None
                 ),

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Static expert partition dispatch with one native Top-k reduction on A.
+"""Expert partition/replica dispatch with one native Top-k reduction on A.
 
 Inputs remain complete batches and outputs retain original Top-k slots. The
 optional demand path copies only a bounded Expert count vector to the host,
-then submits to the owners with positive demand. Payloads stay on the GPU.
+then submits to the owners with positive demand. Replica mode follows the
+Controller's exact-once selection among resident copies. Payloads stay on GPU.
 """
 
 import time
@@ -15,7 +16,10 @@ import torch
 from vllm import _custom_ops as ops
 
 from afd_plugin.expert_pool.client import PoolClient
-from afd_plugin.expert_pool.compact_output import CompactOutputWorkspace
+from afd_plugin.expert_pool.compact_output import (
+    CompactOutputWorkspace,
+    selection_ownership,
+)
 from afd_plugin.expert_pool.controlled_client import ControlledPoolClient
 from afd_plugin.expert_pool.demand import plan_expert_demand
 from afd_plugin.expert_pool.demand_gpu import ExpertDemandCollector
@@ -26,6 +30,7 @@ from afd_plugin.expert_pool.protocol import (
     receive_message,
     send_message,
 )
+from afd_plugin.expert_pool.replica_dispatch import validate_dispatch
 
 
 class FanoutPoolClient(ControlledPoolClient):
@@ -38,10 +43,13 @@ class FanoutPoolClient(ControlledPoolClient):
         demand_aware: bool = False,
         compact_output: bool = False,
         receive_slots: int = 1,
+        expert_replicated: bool = False,
     ) -> None:
         if scheduling_policy != "ready_first":
             raise ValueError("Expert partitions require ready-first gang admission")
-        self._initialize_channels(channels, expert_partitioned=True)
+        self._initialize_channels(
+            channels, expert_partitioned=True, expert_replicated=expert_replicated
+        )
         self.control = control
         self.timeout_s = channels[0].timeout_s
         self.scheduling_policy = scheduling_policy
@@ -57,6 +65,16 @@ class FanoutPoolClient(ControlledPoolClient):
             or (receive_slots > 1 and not compact_output)
         ):
             raise ValueError("Multiple receive slots require compact output")
+        if expert_replicated and (not compact_output or receive_slots < 2):
+            raise ValueError("Expert replicas require compact multi-slot execution")
+        self.last_dispatch = None
+        self.worker_expert_assignments = {
+            worker.worker_id: {
+                str(p.layer_id): {str(e): 0 for e in p.expert_ids}
+                for p in worker.placements
+            }
+            for worker in self.directory.workers
+        }
         self.receive_slots = receive_slots
         directory = channels[0].directory
         self.output_workspace = (
@@ -189,6 +207,7 @@ class FanoutPoolClient(ControlledPoolClient):
                 if completion.kind != "empty_done" or completion.request != request:
                     raise RuntimeError("Empty demand completion does not match request")
                 finished = time.perf_counter_ns()
+                self.last_dispatch = dispatch_plan
                 self.parent_layer_calls[layer_id] += 1
                 self.empty_layer_calls[layer_id] += 1
                 metrics = {
@@ -202,6 +221,18 @@ class FanoutPoolClient(ControlledPoolClient):
                 return torch.empty_like(hidden_states), Message(
                     "empty_done", request=request, metrics=metrics
                 )
+            if self.directory.expert_replicated:
+                announcement = receive_message(self.control, self.timeout_s)
+                if (
+                    announcement.kind != "dispatch"
+                    or announcement.dispatch is None
+                    or announcement.dispatch.request != request
+                ):
+                    raise RuntimeError("Mismatched replica dispatch announcement")
+                dispatch_plan = announcement.dispatch
+                validate_dispatch(self.directory, dispatch_plan)
+                owners = dispatch_plan.owners
+            self.last_dispatch = dispatch_plan
             replies = FanoutReplies(
                 request,
                 owners,
@@ -254,7 +285,15 @@ class FanoutPoolClient(ControlledPoolClient):
                     self.output_workspace.scatter(
                         received,
                         topk_ids,
-                        self.ownership[(owner, layer_id)],
+                        (
+                            selection_ownership(
+                                plan.expert_ids,
+                                self.layer_expert_counts[layer_id],
+                                hidden_states.device,
+                            )
+                            if self.directory.expert_replicated
+                            else self.ownership[(owner, layer_id)]
+                        ),
                         slots,
                         num_assignments=plan.num_assignments,
                     )
@@ -294,6 +333,13 @@ class FanoutPoolClient(ControlledPoolClient):
                 "client_host_roundtrip_ms": (finished - started) / 1e6,
             }
             for owner in owners:
+                plan = grants[owner].plan
+                if request.demand is not None:
+                    assert plan is not None
+                    for expert in plan.expert_ids:
+                        self.worker_expert_assignments[owner][str(layer_id)][
+                            str(expert)
+                        ] += request.demand.counts[expert]
                 dense_bytes = slots.numel() * slots.element_size()
                 self.worker_output_transfer[owner]["received_bytes"] += output_bytes[
                     owner
@@ -348,6 +394,11 @@ class FanoutPoolClient(ControlledPoolClient):
         )
         result["compact_output"] = self.compact_output
         result["receive_slots"] = self.receive_slots
+        result["expert_replicated"] = self.directory.expert_replicated
+        result["worker_expert_assignments"] = {
+            worker: {layer: dict(counts) for layer, counts in layers.items()}
+            for worker, layers in self.worker_expert_assignments.items()
+        }
         result["output_transfer"] = dict(self.output_transfer)
         for worker_id, counters in self.worker_output_transfer.items():
             result["workers"][worker_id]["output_transfer"] = dict(counters)

@@ -130,6 +130,7 @@ class ControllerLedger:
             raise ValueError("Controller requires unique clients")
         self.directory = directory
         self.batching = BatchingOptions()
+        self.requires_warmup = False
         self.scheduling_policy = scheduling_policy
         self.directories = {d.worker_id: d for d in directory.workers}
         self.clients = {c.client_id: c for c in clients}
@@ -161,6 +162,7 @@ class ControllerLedger:
         *,
         receive_slots: int = 1,
         batching: BatchingOptions = DISABLED_BATCHING,
+        startup_complete: int = 0,
     ) -> None:
         worker = self.workers[worker_id]
         if (
@@ -169,6 +171,9 @@ class ControllerLedger:
             or type(receive_slots) is not int
             or receive_slots != len(worker.slots)
             or batching != self.batching
+            or type(startup_complete) is not int
+            or startup_complete not in (0, 1)
+            or (self.requires_warmup and not startup_complete)
         ):
             raise ValueError("Duplicate readiness or mismatched resident directory")
         worker.ready = True

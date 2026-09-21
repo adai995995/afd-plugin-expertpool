@@ -84,6 +84,13 @@ class PoolAttentionWorker(Worker):
                     self.device,
                     deployment.timeout_s,
                     reuse_events=deployment.execution.reuse_cuda_events,
+                    warmup_elements=(
+                        deployment.max_tokens
+                        * directories[endpoint.worker_id].top_k
+                        * directories[endpoint.worker_id].hidden_size
+                        if deployment.execution.warmup_before_ready
+                        else 0
+                    ),
                 )
                 startup.callback(transport.close)
                 channels.append(
@@ -110,6 +117,7 @@ class PoolAttentionWorker(Worker):
                         demand_aware=deployment.demand_aware,
                         compact_output=deployment.compact_output,
                         receive_slots=deployment.receive_slots,
+                        expert_replicated=deployment.expert_replicated,
                     )
                 else:
                     client = ControlledPoolClient(

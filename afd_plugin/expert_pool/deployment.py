@@ -36,6 +36,7 @@ class ExecutionOptions:
     validate_worker_values: bool = True
     reuse_cuda_events: bool = False
     defer_output_sync: bool = False
+    warmup_before_ready: bool = False
 
     def __post_init__(self) -> None:
         if any(type(value) is not bool for value in asdict(self).values()):
@@ -124,6 +125,7 @@ class PoolDeployment:
     compact_output: bool = False
     receive_slots: int = 1
     batching: BatchingOptions = BatchingOptions()
+    expert_replicated: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution, ExecutionOptions):
@@ -183,6 +185,13 @@ class PoolDeployment:
         }:
             raise ValueError("Unknown expert dispatch mode")
         self.batching.validate_capacity(self.receive_slots, self.max_tokens)
+        if type(self.expert_replicated) is not bool or (
+            self.expert_replicated
+            and (not self.compact_output or self.receive_slots < 2)
+        ):
+            raise ValueError(
+                "Expert replicas require compact output and multiple receive slots"
+            )
         if self.dispatch_mode == "whole_layer":
             if any(worker.expert_ids is not None for worker in self.workers):
                 raise ValueError("Whole-layer dispatch requires full worker experts")
@@ -360,6 +369,7 @@ class PoolDeployment:
         return PoolDirectory(
             tuple(directories),
             expert_partitioned=self.dispatch_mode == "expert_partitioned",
+            expert_replicated=self.expert_replicated,
         )
 
     def directory(self, worker_id: str | None = None) -> StaticDirectory:

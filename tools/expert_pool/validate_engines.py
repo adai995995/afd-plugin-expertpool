@@ -390,10 +390,19 @@ def run(args: argparse.Namespace, report: dict) -> None:
                         ),
                         expert_ids=(
                             tuple(
-                                range(
-                                    index,
-                                    model_config["n_routed_experts"],
-                                    args.expert_workers,
+                                sorted(
+                                    set(
+                                        range(
+                                            index,
+                                            model_config["n_routed_experts"],
+                                            args.expert_workers,
+                                        )
+                                    )
+                                    | (
+                                        set(range(model_config["num_experts_per_tok"]))
+                                        if args.expert_replicated
+                                        else set()
+                                    )
                                 )
                             )
                             if args.placement == "expert_partitioned"
@@ -415,6 +424,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 demand_aware=args.expert_demand,
                 compact_output=args.compact_output,
                 receive_slots=args.receive_slots,
+                expert_replicated=args.expert_replicated,
                 batching=BatchingOptions(
                     args.batch_max_calls, args.batch_max_tokens, args.batch_wait_us
                 ),
@@ -796,6 +806,22 @@ def verify_dispatch(
     }
 
 
+def selected_assignments(
+    directory: PoolDirectory, dispatch: dict, worker_id: str, layer: str
+) -> dict[str, int]:
+    """Separate resident coverage from per-call selected-copy accounting."""
+    if directory.expert_replicated:
+        return dispatch["worker_expert_assignments"][worker_id][layer]
+    worker = next(
+        worker for worker in directory.workers if worker.worker_id == worker_id
+    )
+    placement = next(p for p in worker.placements if p.layer_id == int(layer))
+    return {
+        str(e): dispatch["demand"]["expert_assignments"][layer][e]
+        for e in placement.expert_ids
+    }
+
+
 def verify_expert_demand(
     directory: PoolDirectory,
     ready: list[dict],
@@ -836,6 +862,16 @@ def verify_expert_demand(
                 raise AssertionError("Selected and completed worker layers disagree")
             if sum(selected.values()) != completed["calls"]:
                 raise AssertionError("Selected worker total is inconsistent")
+            for layer, experts in layers.items():
+                if not directory.expert_replicated:
+                    continue
+                counts = selected_assignments(
+                    directory, status["dispatch"], worker_id, layer
+                )
+                if set(counts) != {str(e) for e in experts} or any(
+                    type(n) is not int or n < 0 for n in counts.values()
+                ):
+                    raise AssertionError("Selected expert report coverage is invalid")
         for layer, expert_count in logical_counts.items():
             parent = demand["parent_layer_calls"][layer]
             empty = demand["empty_layer_calls"][layer]
@@ -854,11 +890,15 @@ def verify_expert_demand(
                     "Demand assignments do not cover routed token rows"
                 )
             selected_total = 0
+            selected_counts = [0] * expert_count
             for owner in directory.owners(int(layer)):
                 count = demand["selected_worker_layer_calls"][owner][layer]
-                owned_assignments = sum(
-                    assignments[expert] for expert in worker_layers[owner][layer]
+                physical = selected_assignments(
+                    directory, status["dispatch"], owner, layer
                 )
+                owned_assignments = sum(physical.values())
+                for expert, value in physical.items():
+                    selected_counts[int(expert)] += value
                 if (
                     type(count) is not int
                     or not 0 <= count <= parent - empty
@@ -871,11 +911,17 @@ def verify_expert_demand(
                 selected_total += count
             if selected_total < parent - empty:
                 raise AssertionError("A nonempty parent is missing all child calls")
+            if selected_counts != assignments:
+                raise AssertionError(
+                    "Replica dispatch lost or repeated expert assignments"
+                )
     expected_assignments = {
         worker_id: {
             layer: {
                 str(expert): sum(
-                    status["dispatch"]["demand"]["expert_assignments"][layer][expert]
+                    selected_assignments(
+                        directory, status["dispatch"], worker_id, layer
+                    )[str(expert)]
                     for status in after
                 )
                 for expert in experts
@@ -897,6 +943,7 @@ def verify_expert_demand(
     )
     return {
         "empty_parent_calls": empty_calls,
+        "expert_replicated": directory.expert_replicated,
         "expert_assignments_by_worker_layer_expert": expected_assignments,
         "expert_assignments": sum(
             sum(counts.values())
@@ -984,9 +1031,9 @@ def verify_output_transfer(
                 )
                 useful = (
                     sum(
-                        dispatch["demand"]["expert_assignments"][str(p.layer_id)][
-                            expert
-                        ]
+                        selected_assignments(
+                            directory, dispatch, worker_id, str(p.layer_id)
+                        )[str(expert)]
                         for p in worker.placements
                         for expert in p.expert_ids
                     )
@@ -1203,6 +1250,11 @@ def main() -> int:
     parser.add_argument("--logprob-atol", type=float, default=0.05)
     parser.add_argument("--execution-options", type=json.loads, default={})
     parser.add_argument("--receive-slots", type=int, default=1)
+    parser.add_argument(
+        "--expert-replicated",
+        action="store_true",
+        help="Replicate the first Top-k experts across the E workers",
+    )
     parser.add_argument("--batch-max-calls", type=int, default=1)
     parser.add_argument("--batch-max-tokens", type=int, default=0)
     parser.add_argument("--batch-wait-us", type=int, default=0)
@@ -1226,6 +1278,8 @@ def main() -> int:
         parser.error("--expert-demand requires --placement expert_partitioned")
     if args.compact_output and not args.expert_demand:
         parser.error("--compact-output requires --expert-demand")
+    if args.expert_replicated and (not args.compact_output or args.receive_slots < 2):
+        parser.error("Expert replicas require compact multi-slot execution")
     try:
         execution = ExecutionOptions(**args.execution_options)
     except (TypeError, ValueError) as error:
@@ -1279,6 +1333,7 @@ def main() -> int:
         "demand_aware": args.expert_demand,
         "compact_output": args.compact_output,
         "receive_slots": args.receive_slots,
+        "expert_replicated": args.expert_replicated,
         "batching": asdict(batching),
         "controller_enabled": args.controller,
         "controller_policy": args.controller_policy if args.controller else None,

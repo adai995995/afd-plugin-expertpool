@@ -117,6 +117,7 @@ class ControllerRuntime:
                         identity,
                         message.detail,
                         receive_slots=message.metrics.get("receive_slots", 1),
+                        startup_complete=message.metrics.get("startup_complete", 0),
                         batching=BatchingOptions(
                             max_calls=message.metrics.get("batch_max_calls", 1),
                             max_tokens=message.metrics.get("batch_max_tokens", 0),
@@ -150,6 +151,13 @@ class ControllerRuntime:
                 self.max_event_cpu_ms = max(self.max_event_cpu_ms, elapsed)
             while (granted := self.ledger.grant(time.perf_counter_ns())) is not None:
                 plan, queue_ms = granted
+                if isinstance(self.ledger, FanoutControllerLedger):
+                    while self.ledger.dispatch_notifications:
+                        dispatch = self.ledger.dispatch_notifications.popleft()
+                        send_message(
+                            self.clients[dispatch.request.key.client_id],
+                            Message("dispatch", dispatch=dispatch),
+                        )
                 send_message(
                     self.workers[plan.worker_id],
                     Message(
@@ -197,6 +205,7 @@ def serve_controller(deployment: PoolDeployment) -> dict:
             identities,
             scheduling_policy=deployment.controller.scheduling_policy,
         )
+    ledger.requires_warmup = deployment.execution.warmup_before_ready
     with ExitStack() as stack:
         listeners = {
             (role, identity): stack.enter_context(

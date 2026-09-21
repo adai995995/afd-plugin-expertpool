@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Immutable multi-worker coverage and CPU-only replica tie breaking.
 
-Whole-layer mode permits replicated layers; partitioned mode assigns each
-logical expert to exactly one worker. The Controller reserves the required
-workers before dispatch. Placement is static, with no migration or retry.
+Whole-layer mode permits replicated layers. Expert mode defaults to disjoint
+coverage; explicit expert_replicated placement permits multiple resident copies.
+The Controller reserves selected workers before dispatch. No migration or retry.
 """
 
 from collections.abc import Collection
@@ -18,8 +18,13 @@ from afd_plugin.expert_pool.scheduler import StaticDirectory
 class PoolDirectory:
     workers: tuple[StaticDirectory, ...]
     expert_partitioned: bool = False
+    expert_replicated: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.expert_replicated) is not bool or (
+            self.expert_replicated and not self.expert_partitioned
+        ):
+            raise ValueError("Expert replicas require explicit partitioned dispatch")
         if type(self.expert_partitioned) is not bool:
             raise ValueError("Expert partitioning must be an explicit boolean")
         if not isinstance(self.workers, tuple) or not self.workers:
@@ -54,7 +59,10 @@ class PoolDirectory:
                     raise ValueError("Replica expert counts disagree")
                 if self.expert_partitioned:
                     resident = covered.setdefault(placement.layer_id, set())
-                    if resident.intersection(placement.expert_ids):
+                    if (
+                        resident.intersection(placement.expert_ids)
+                        and not self.expert_replicated
+                    ):
                         raise ValueError("Partitioned experts require a unique owner")
                     resident.update(placement.expert_ids)
         if self.expert_partitioned and any(

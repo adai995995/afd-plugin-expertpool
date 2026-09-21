@@ -96,6 +96,13 @@ def serve(
                         device,
                         deployment.timeout_s,
                         reuse_events=deployment.execution.reuse_cuda_events,
+                        warmup_elements=(
+                            deployment.max_tokens
+                            * directory.top_k
+                            * directory.hidden_size
+                            if deployment.execution.warmup_before_ready
+                            else 0
+                        ),
                     )
                     stack.callback(transport.close)
                     peers.append(
@@ -138,6 +145,7 @@ def serve(
                     demand_aware=deployment.demand_aware,
                     compact_output=deployment.compact_output,
                     receive_slots=deployment.receive_slots,
+                    expert_replicated=deployment.expert_replicated,
                     batching=deployment.batching,
                 )
                 worker.run()
@@ -154,6 +162,8 @@ def serve(
                     "compact_output": deployment.compact_output,
                     "output_transfer": dict(worker.output_transfer),
                     "pipeline": worker.pipeline_status(),
+                    "startup": worker.startup,
+                    "expert_replicated": worker.expert_replicated,
                     "expert_assignments": worker.expert_assignments,
                     "resident_experts": {
                         str(layer): list(executor.placement.expert_ids)

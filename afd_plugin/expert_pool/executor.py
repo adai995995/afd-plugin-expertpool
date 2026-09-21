@@ -179,14 +179,29 @@ class ExpertExecutor(nn.Module):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        assignment_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return weighted BF16 [tokens, top_k, hidden] resident contributions.
 
-        Static disjoint ownership replaces a per-token assignment mask. Missing
-        local experts produce zero slots; the A performs the final reduction
-        once after collecting the unique owner for every logical route slot.
+        Disjoint placement uses the resident map alone. Replicated placement
+        also masks unselected copies, independently for each original call.
+        The A reduces once after collecting each logical route slot's owner.
         """
         self._validate_inputs(hidden_states, topk_weights, topk_ids)
+        if assignment_mask is not None:
+            if (
+                assignment_mask.shape != topk_ids.shape
+                or assignment_mask.dtype != torch.bool
+                or assignment_mask.device != self.w13.device
+            ):
+                raise ValueError("Expected a matching CUDA assignment mask")
+            if self.validate_values and bool(
+                (assignment_mask & (self.expert_map[topk_ids.long()] < 0)).any()
+            ):
+                raise ValueError("Task selected a nonresident Expert")
+            # Preserve caller routing tensors and slot order. Only the private
+            # kernel input uses the existing skip sentinel for unselected work.
+            topk_ids = topk_ids.masked_fill(~assignment_mask, -1)
         return fused_expert_slots(
             hidden_states,
             self.w13,

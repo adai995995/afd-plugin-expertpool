@@ -62,6 +62,7 @@ class ExpertWorker:
         compact_output: bool = False,
         receive_slots: int = 1,
         batching: BatchingOptions = DISABLED_BATCHING,
+        expert_replicated: bool = False,
     ) -> None:
         if not peers or len({peer.client_id for peer in peers}) != len(peers):
             raise ValueError("Worker requires unique client endpoints")
@@ -129,6 +130,19 @@ class ExpertWorker:
             raise ValueError("Worker requires typed batching options")
         batching.validate_capacity(receive_slots, directory.max_tokens)
         self.batching = batching
+        if type(expert_replicated) is not bool or (
+            expert_replicated and (receive_slots < 2 or not compact_output)
+        ):
+            raise ValueError("Expert replicas require compact multi-slot execution")
+        self.expert_replicated = expert_replicated
+        self.startup = {
+            "enabled": self.execution.warmup_before_ready,
+            "completed": False,
+            "host_ms": 0.0,
+            "kernel_shapes": [],
+            "transport_channels": 0,
+        }
+        self.prepared = False
         self.profiler = profiler
         self.controller = controller
         self.controller_generation = 0
@@ -349,7 +363,14 @@ class ExpertWorker:
             return
         control = self.controller
         assert control is not None
-        send_message(control, Message("ready", detail=directory_digest(self.directory)))
+        send_message(
+            control,
+            Message(
+                "ready",
+                detail=directory_digest(self.directory),
+                metrics={"startup_complete": int(self.startup["completed"])},
+            ),
+        )
         while True:
             wait([control])
             message = receive_message(control, 0)
@@ -379,8 +400,15 @@ class ExpertWorker:
             placement = self.executors[plan.request.layer_id].placement
             demand = plan.request.demand
             assert demand is not None
-            if len(demand.counts) != placement.num_experts or plan.expert_ids != (
-                tuple(sorted(e for e in placement.expert_ids if demand.counts[e]))
+            if len(demand.counts) != placement.num_experts:
+                raise RuntimeError("Plan demand has the wrong expert count")
+            resident_demand = tuple(
+                sorted(e for e in placement.expert_ids if demand.counts[e])
+            )
+            if (
+                not set(plan.expert_ids) <= set(resident_demand)
+                if self.expert_replicated
+                else plan.expert_ids != resident_demand
             ):
                 raise RuntimeError("Plan does not match resident expert demand")
         peer = self.peers.get(plan.request.key.client_id)
@@ -393,7 +421,82 @@ class ExpertWorker:
         ):
             raise RuntimeError("Stale or mismatched controller reservation")
 
+    @torch.inference_mode()
+    def prepare(self) -> None:
+        """Complete explicit startup work before publishing schedulable Ready.
+
+        Shapes are representative, not an exhaustive JIT guarantee. No request
+        identities, routing counts or admission credits are consumed by warmup.
+        """
+        if self.prepared:
+            return
+        started = time.perf_counter_ns()
+        if self.execution.warmup_before_ready:
+            if not all(peer.transport.warmup_completed for peer in self.peers.values()):
+                raise RuntimeError("All A/E channels must warm before worker Ready")
+            shapes = sorted(
+                {1, self.directory.max_tokens, self.batching.max_tokens} - {0}
+            )
+            rows = max(shapes)
+            hidden = torch.zeros(
+                (rows, self.directory.hidden_size),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            weights = torch.full(
+                (rows, self.directory.top_k),
+                1 / self.directory.top_k,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            for layer, executor in self.executors.items():
+                ids = (
+                    torch.tensor(
+                        [
+                            executor.placement.expert_ids[
+                                i % len(executor.placement.expert_ids)
+                            ]
+                            for i in range(self.directory.top_k)
+                        ],
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    .expand(rows, -1)
+                    .contiguous()
+                )
+                for tokens in shapes:
+                    mask = (
+                        self.ownership[layer][ids[:tokens].long()]
+                        if self.expert_replicated
+                        else None
+                    )
+                    result = (
+                        executor.forward_slots(
+                            hidden[:tokens],
+                            weights[:tokens],
+                            ids[:tokens],
+                            assignment_mask=mask,
+                        )
+                        if self.directory.allow_partial_experts
+                        else executor(hidden[:tokens], weights[:tokens], ids[:tokens])
+                    )
+                    if self.output_workspace is not None:
+                        packed_rows = min(tokens, self.directory.max_tokens)
+                        self.output_workspace.pack(
+                            result[:packed_rows],
+                            ids[:packed_rows],
+                            self.ownership[layer],
+                            num_assignments=packed_rows * self.directory.top_k,
+                        )
+            torch.cuda.synchronize(self.device)
+            self.startup.update(
+                completed=True, kernel_shapes=shapes, transport_channels=len(self.peers)
+            )
+        self.startup["host_ms"] = (time.perf_counter_ns() - started) / 1e6
+        self.prepared = True
+
     def run(self) -> None:
+        self.prepare()
         connections = {peer.control: peer for peer in self.peers.values()}
         try:
             if self.controller is not None:

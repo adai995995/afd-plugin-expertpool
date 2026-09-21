@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Atomic multi-worker reservations for static, disjoint expert partitions.
+"""Atomic multi-worker reservations for static expert placement and replicas.
 
 Every owner receives the complete input batch. A worker's completed child
 remains reserved until the whole parent drains. Dispatch errors terminate the
@@ -33,6 +33,7 @@ from afd_plugin.expert_pool.protocol import (
     CallRequest,
     ExecutionPlan,
 )
+from afd_plugin.expert_pool.replica_dispatch import WorkerLoad, select_replicas
 
 
 class FanoutControllerLedger(ControllerLedger):
@@ -60,6 +61,14 @@ class FanoutControllerLedger(ControllerLedger):
             or (receive_slots > 1 and not compact_output)
         ):
             raise ValueError("Multiple receive slots require compact output")
+        if directory.expert_replicated and (
+            not demand_aware or not compact_output or receive_slots < 2
+        ):
+            raise ValueError(
+                "Replicated experts require controlled compact multi-slot execution"
+            )
+        self.dispatch_notifications: deque[DispatchPlan] = deque()
+        self.replica_selections = 0
         self.receive_slots = receive_slots
         if not isinstance(batching, BatchingOptions):
             raise ValueError("Controller requires typed batching options")
@@ -82,8 +91,9 @@ class FanoutControllerLedger(ControllerLedger):
         self.merged_batches = dict.fromkeys(self.workers, 0)
         self.active_parents: dict[CallKey, tuple[ExecutionPlan, ...]] = {}
         self.pending_child_plans: deque[tuple[ExecutionPlan, float]] = deque()
-        # Requests and placement are immutable. Keep one derived plan per
-        # outstanding client instead of replanning on every progress event.
+        # Validate immutable demand once per outstanding client. Disjoint
+        # placement reuses that plan; replicated placement chooses live owners
+        # on admission using authoritative slot and phase feedback.
         self.pending_demand_plans: dict[CallKey, DispatchPlan] = {}
         self.empty_parent_calls = 0
         self.planning_cpu_ns = 0
@@ -175,6 +185,17 @@ class FanoutControllerLedger(ControllerLedger):
                     if self.demand_aware
                     else None
                 )
+                if self.directory.expert_replicated:
+                    started = time.perf_counter_ns()
+                    dispatch = select_replicas(
+                        self.directory,
+                        call.request,
+                        self.worker_loads(),
+                        self.replica_selections,
+                    )
+                    self.planning_cpu_ns += time.perf_counter_ns() - started
+                    if dispatch is None:
+                        continue
                 owners = (
                     dispatch.owners
                     if dispatch is not None
@@ -185,6 +206,10 @@ class FanoutControllerLedger(ControllerLedger):
                 queue.remove(call)
                 if dispatch is not None:
                     del self.pending_demand_plans[call.request.key]
+                if self.directory.expert_replicated:
+                    assert dispatch is not None
+                    self.dispatch_notifications.append(dispatch)
+                    self.replica_selections += 1
                 self._record_owners(call.request, owners)
                 plans = []
                 queue_ms = max(0, now_ns - call.enqueued_ns) / 1e6
@@ -325,6 +350,22 @@ class FanoutControllerLedger(ControllerLedger):
         del self.outstanding[client_id]
         self.completed_by_client[client_id] += 1
 
+    def worker_loads(self) -> dict[str, WorkerLoad]:
+        return {
+            key: WorkerLoad(
+                worker.available_slots,
+                sum(
+                    slot.active.num_assignments or 0
+                    for slot in worker.slots
+                    if slot.active is not None
+                    and slot.phase not in {"returning", "held"}
+                ),
+                any(slot.phase == "executing" for slot in worker.slots),
+                sum(slot.active is not None for slot in worker.slots),
+            )
+            for key, worker in self.workers.items()
+        }
+
     def snapshot(self) -> dict:
         return {
             **super().snapshot(),
@@ -336,6 +377,16 @@ class FanoutControllerLedger(ControllerLedger):
             "demand_aware": self.demand_aware,
             "compact_output": self.compact_output,
             "receive_slots": self.receive_slots,
+            "expert_replicated": self.directory.expert_replicated,
+            "replica_selections": self.replica_selections,
+            "pending_dispatch_notifications": len(self.dispatch_notifications),
+            "worker_loads": {
+                key: asdict(value) for key, value in self.worker_loads().items()
+            },
+            "replica_load_scope": (
+                "Authoritative slot/phase and assignment backlog; "
+                "not hardware utilization or latency prediction"
+            ),
             "batching": asdict(self.batching),
             "active_compute_batches": sum(
                 b is not None for b in self.active_batches.values()

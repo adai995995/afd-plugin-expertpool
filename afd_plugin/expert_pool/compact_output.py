@@ -17,6 +17,23 @@ COPY_NUM_WARPS = 4
 MAX_PREFIX_COUNT = 2**31 - 1
 
 
+def selection_ownership(
+    expert_ids: tuple[int, ...], num_experts: int, device: torch.device
+) -> torch.Tensor:
+    """Upload a bounded, CPU-validated task selection; never read GPU routes.
+
+    The controller/receiver validate residency and exact coverage. This map is
+    distinct from resident coverage. Tensor lifetime follows its creating CUDA
+    stream, including when successive calls select different physical copies.
+    """
+    selected = set(expert_ids)
+    return torch.tensor(
+        [expert in selected for expert in range(num_experts)],
+        dtype=torch.bool,
+        device=device,
+    )
+
+
 @triton.jit
 def _ownership_flags(
     route_ids,

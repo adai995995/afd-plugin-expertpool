@@ -27,6 +27,7 @@ MESSAGE_KINDS = frozenset(
         "input_ready",
         "executing",
         "batch_executing",
+        "dispatch",
         "status",
         "snapshot",
         "empty_done",
@@ -103,6 +104,72 @@ class CallRequest:
                 raise ValueError("Request requires typed expert demand")
             if sum(self.demand.counts) != self.num_tokens * self.top_k:
                 raise ValueError("Demand must count every routed top-k assignment")
+
+
+@dataclass(frozen=True)
+class ExpertTask:
+    worker_id: str
+    expert_ids: tuple[int, ...]
+    num_assignments: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.worker_id, str) or not 0 < len(self.worker_id) <= 128:
+            raise ValueError("Invalid expert task worker")
+        if (
+            not isinstance(self.expert_ids, tuple)
+            or not self.expert_ids
+            or any(type(expert) is not int or expert < 0 for expert in self.expert_ids)
+            or len(set(self.expert_ids)) != len(self.expert_ids)
+        ):
+            raise ValueError("Expert tasks require unique nonnegative expert IDs")
+        if type(self.num_assignments) is not int or self.num_assignments <= 0:
+            raise ValueError("Expert tasks require positive assignment counts")
+
+
+@dataclass(frozen=True)
+class DispatchPlan:
+    request: CallRequest
+    tasks: tuple[ExpertTask, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, CallRequest) or self.request.demand is None:
+            raise ValueError("Dispatch requires a request with expert demand")
+        if not isinstance(self.tasks, tuple) or any(
+            not isinstance(task, ExpertTask) for task in self.tasks
+        ):
+            raise ValueError("Dispatch requires immutable expert tasks")
+        if len({task.worker_id for task in self.tasks}) != len(self.tasks):
+            raise ValueError("Each worker must receive at most one expert task")
+        counts = self.request.demand.counts
+        assigned: set[int] = set()
+        for task in self.tasks:
+            if any(expert >= len(counts) for expert in task.expert_ids):
+                raise ValueError("Task expert is outside the demand range")
+            if assigned.intersection(task.expert_ids):
+                raise ValueError("Dispatch repeats a demanded expert")
+            if any(counts[expert] == 0 for expert in task.expert_ids):
+                raise ValueError("Dispatch includes an expert without demand")
+            if task.num_assignments != sum(
+                counts[expert] for expert in task.expert_ids
+            ):
+                raise ValueError("Task count disagrees with expert demand")
+            assigned.update(task.expert_ids)
+        if assigned != {expert for expert, count in enumerate(counts) if count > 0}:
+            raise ValueError("Dispatch must cover every demanded expert exactly once")
+        if sum(task.num_assignments for task in self.tasks) != (
+            self.request.num_tokens * self.request.top_k
+        ):
+            raise ValueError("Dispatch assignment accounting is incomplete")
+
+    @property
+    def owners(self) -> tuple[str, ...]:
+        return tuple(sorted(task.worker_id for task in self.tasks))
+
+    def task_for(self, worker_id: str) -> ExpertTask:
+        for task in self.tasks:
+            if task.worker_id == worker_id:
+                return task
+        raise ValueError("Worker has no demanded expert task")
 
 
 @dataclass(frozen=True)
@@ -213,6 +280,7 @@ class Message:
     metrics: dict[str, float] = field(default_factory=dict)
     digests: dict[str, str] = field(default_factory=dict)
     batch: BatchExecution | None = None
+    dispatch: DispatchPlan | None = None
 
     def __post_init__(self) -> None:
         if self.request is not None and not isinstance(self.request, CallRequest):
@@ -221,6 +289,15 @@ class Message:
             raise ValueError("Invalid plan object")
         if self.kind not in MESSAGE_KINDS:
             raise ValueError("Unknown control message")
+        if self.kind == "dispatch":
+            if (
+                not isinstance(self.dispatch, DispatchPlan)
+                or self.request is not None
+                or self.plan is not None
+            ):
+                raise ValueError("Dispatch announcement requires a validated plan only")
+        elif self.dispatch is not None:
+            raise ValueError("Unexpected dispatch announcement")
         if self.kind == "batch_executing":
             if (
                 not isinstance(self.batch, BatchExecution)
@@ -310,8 +387,31 @@ def decode_message(payload: bytes) -> Message:
             "metrics",
             "digests",
             "batch",
+            "dispatch",
         }:
             raise ValueError("Unexpected message fields")
+        if data["dispatch"] is not None:
+            decision = data["dispatch"]
+            if not isinstance(decision, dict) or not isinstance(
+                decision["tasks"], list
+            ):
+                raise ValueError("Malformed replica dispatch")
+            tasks = []
+            for task in decision["tasks"]:
+                if not isinstance(task, dict) or not isinstance(
+                    task["expert_ids"], list
+                ):
+                    raise ValueError("Malformed replica task")
+                tasks.append(
+                    ExpertTask(**{**task, "expert_ids": tuple(task["expert_ids"])})
+                )
+            data["dispatch"] = DispatchPlan(
+                **{
+                    **decision,
+                    "request": _decode_request(decision["request"]),
+                    "tasks": tuple(tasks),
+                }
+            )
         if data["batch"] is not None:
             batch = data["batch"]
             if not isinstance(batch, dict) or not isinstance(batch["members"], list):
