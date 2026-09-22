@@ -23,6 +23,7 @@ from afd_plugin.expert_pool.compact_output import (
     selection_ownership,
 )
 from afd_plugin.expert_pool.controller import directory_digest
+from afd_plugin.expert_pool.progress_wait import ProgressWaiter
 from afd_plugin.expert_pool.protocol import (
     BatchExecution,
     BatchSlot,
@@ -85,6 +86,7 @@ class WorkerPipeline:
         self.worker = worker
         self.batching = worker.batching
         self.control = worker.controller
+        self.progress_waiter = ProgressWaiter(self.control)
         self.compute_stream = torch.cuda.Stream(device=worker.device)
         self.slots = []
         for index in range(receive_slots):
@@ -449,13 +451,14 @@ class WorkerPipeline:
             progressed = self._send_completions() or progressed
             progressed = self._start_compute() or progressed
             if not progressed:
-                wait([self.control], timeout=self.next_wait_s)
+                self.progress_waiter.wait(self.next_wait_s)
 
     def snapshot(self) -> dict:
         return {
             "enabled": True,
             "receive_slots": len(self.slots),
             "compute_lanes": 1,
+            "progress_wait_backend": self.progress_waiter.backend,
             "batching": {
                 **asdict(self.batching),
                 "executions": self.batch_executions,
