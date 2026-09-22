@@ -38,6 +38,20 @@ class ProgressWaiterTests(unittest.TestCase):
             sender.join(2.0)
         self.assertFalse(sender.is_alive())
 
+    def test_any_direct_peer_can_wake_worker_without_consuming_messages(self):
+        second_reader, second_writer = Pipe(duplex=True)
+        self.addCleanup(second_reader.close)
+        self.addCleanup(second_writer.close)
+        waiter = ProgressWaiter((self.reader, second_reader))
+        second_writer.send_bytes(b"execute")
+        self.assertTrue(waiter.wait(0.0002))
+        self.assertFalse(self.reader.poll(0))
+        self.assertEqual(second_reader.recv_bytes(), b"execute")
+        self.assertFalse(waiter.wait(0))
+        self.writer.send_bytes(b"close")
+        self.assertTrue(waiter.wait(0.0002))
+        self.assertEqual(self.reader.recv_bytes(), b"close")
+
     def test_peer_close_is_readable_so_protocol_can_handle_eof(self):
         self.writer.close()
         self.assertTrue(self.waiter.wait(0.5))

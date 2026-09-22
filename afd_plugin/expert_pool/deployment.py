@@ -127,6 +127,7 @@ class PoolDeployment:
     receive_slots: int = 1
     batching: BatchingOptions = BatchingOptions()
     expert_replicated: bool = False
+    direct_dispatch: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution, ExecutionOptions):
@@ -197,11 +198,26 @@ class PoolDeployment:
             raise ValueError(
                 "Expert replicas require compact output and multiple receive slots"
             )
+        if type(self.direct_dispatch) is not bool:
+            raise ValueError("Direct dispatch must be an explicit boolean")
+        if self.direct_dispatch and (
+            self.controller is not None
+            or self.dispatch_mode != "expert_partitioned"
+            or not self.compact_output
+            or self.receive_slots < 2
+            or self.receive_slots != len(self.client_ids)
+            or self.execution.validate_worker_values
+            or not self.execution.defer_output_sync
+        ):
+            raise ValueError(
+                "Direct dispatch requires trusted compact partitions, one slot "
+                "per client, deferred output synchronization and no controller"
+            )
         if self.dispatch_mode == "whole_layer":
             if any(worker.expert_ids is not None for worker in self.workers):
                 raise ValueError("Whole-layer dispatch requires full worker experts")
         else:
-            if (
+            if not self.direct_dispatch and (
                 not isinstance(self.controller, ControllerConfig)
                 or self.controller.scheduling_policy != "ready_first"
             ):

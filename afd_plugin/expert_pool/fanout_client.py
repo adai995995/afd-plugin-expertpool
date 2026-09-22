@@ -26,6 +26,9 @@ from afd_plugin.expert_pool.demand_gpu import ExpertDemandCollector
 from afd_plugin.expert_pool.fanout_protocol import FanoutReplies
 from afd_plugin.expert_pool.protocol import (
     MAX_RECEIVE_SLOTS,
+    CallRequest,
+    DispatchPlan,
+    ExecutionPlan,
     Message,
     receive_message,
     send_message,
@@ -37,7 +40,7 @@ class FanoutPoolClient(ControlledPoolClient):
     def __init__(
         self,
         channels: tuple[PoolClient, ...],
-        control: Connection,
+        control: Connection | None,
         scheduling_policy: str = "ready_first",
         *,
         demand_aware: bool = False,
@@ -153,6 +156,49 @@ class FanoutPoolClient(ControlledPoolClient):
                     return owner
             replies.accept(receive_message(self.control, self.timeout_s))
 
+    def _submit(self, request: CallRequest) -> None:
+        send_message(self.control, Message("submit", request=request))
+
+    def _empty_reply(self, request: CallRequest) -> Message:
+        return receive_message(self.control, self.timeout_s)
+
+    def _output_received(self, plan: ExecutionPlan) -> None:
+        pass
+
+    def _finish_replies(
+        self, replies: FanoutReplies, owners: tuple[str, ...]
+    ) -> dict[str, Message]:
+        return {owner: self._fanout_reply(replies, "done", owner) for owner in owners}
+
+    def _admit(
+        self,
+        request: CallRequest,
+        dispatch_plan: DispatchPlan | None,
+        owners: tuple[str, ...],
+    ) -> tuple[tuple[str, ...], FanoutReplies, dict[str, Message]]:
+        if self.directory.expert_replicated:
+            announcement = receive_message(self.control, self.timeout_s)
+            if (
+                announcement.kind != "dispatch"
+                or announcement.dispatch is None
+                or announcement.dispatch.request != request
+            ):
+                raise RuntimeError("Mismatched replica dispatch announcement")
+            dispatch_plan = announcement.dispatch
+            validate_dispatch(self.directory, dispatch_plan)
+            owners = dispatch_plan.owners
+        self.last_dispatch = dispatch_plan
+        replies = FanoutReplies(
+            request,
+            owners,
+            dispatch_plan=dispatch_plan,
+            receive_slots=self.receive_slots,
+        )
+        grants = {
+            owner: self._fanout_reply(replies, "grant", owner) for owner in owners
+        }
+        return owners, replies, grants
+
     @torch.inference_mode()
     def execute(
         self,
@@ -201,9 +247,9 @@ class FanoutPoolClient(ControlledPoolClient):
             submitted = time.perf_counter_ns()
             self.sequence += 1
             issued = True
-            send_message(self.control, Message("submit", request=request))
+            self._submit(request)
             if not owners:
-                completion = receive_message(self.control, self.timeout_s)
+                completion = self._empty_reply(request)
                 if completion.kind != "empty_done" or completion.request != request:
                     raise RuntimeError("Empty demand completion does not match request")
                 finished = time.perf_counter_ns()
@@ -221,27 +267,7 @@ class FanoutPoolClient(ControlledPoolClient):
                 return torch.empty_like(hidden_states), Message(
                     "empty_done", request=request, metrics=metrics
                 )
-            if self.directory.expert_replicated:
-                announcement = receive_message(self.control, self.timeout_s)
-                if (
-                    announcement.kind != "dispatch"
-                    or announcement.dispatch is None
-                    or announcement.dispatch.request != request
-                ):
-                    raise RuntimeError("Mismatched replica dispatch announcement")
-                dispatch_plan = announcement.dispatch
-                validate_dispatch(self.directory, dispatch_plan)
-                owners = dispatch_plan.owners
-            self.last_dispatch = dispatch_plan
-            replies = FanoutReplies(
-                request,
-                owners,
-                dispatch_plan=dispatch_plan,
-                receive_slots=self.receive_slots,
-            )
-            grants = {
-                owner: self._fanout_reply(replies, "grant", owner) for owner in owners
-            }
+            owners, replies, grants = self._admit(request, dispatch_plan, owners)
             granted = time.perf_counter_ns()
             for owner in owners:
                 self.channels[owner].transport.transfer(
@@ -306,13 +332,12 @@ class FanoutPoolClient(ControlledPoolClient):
                     torch.where(mask, received, slots, out=slots)
                 output_restore_submit_ns += time.perf_counter_ns() - restore_started
                 output_bytes[owner] = received.numel() * received.element_size()
+                self._output_received(grants[owner].plan)
             output_received = time.perf_counter_ns()
             output = torch.empty_like(hidden_states)
             if request.num_tokens:
                 ops.moe_sum(slots, output)
-            completions = {
-                owner: self._fanout_reply(replies, "done", owner) for owner in owners
-            }
+            completions = self._finish_replies(replies, owners)
             finished = time.perf_counter_ns()
             metrics = {
                 **demand_metrics,
@@ -353,7 +378,7 @@ class FanoutPoolClient(ControlledPoolClient):
                 self.worker_layer_calls[owner][layer_id] += 1
                 self.selected_worker_layer_calls[owner][layer_id] += 1
                 channel = self.channels[owner]
-                if channel.metrics is not None:
+                if channel.metrics is not None and owner in completions:
                     channel.metrics.record(
                         layer_id,
                         request.num_tokens,
@@ -369,7 +394,9 @@ class FanoutPoolClient(ControlledPoolClient):
             # The public return represents the parent; its representative
             # child plan is metadata only, never a buffer-release authority.
             return output, Message(
-                "done", plan=completions[owners[-1]].plan, metrics=metrics
+                "done" if completions else "result",
+                plan=grants[owners[-1]].plan,
+                metrics=metrics,
             )
         except BaseException:
             if issued:
@@ -380,8 +407,11 @@ class FanoutPoolClient(ControlledPoolClient):
         finally:
             self.lock.release()
 
+    def _dispatch_status(self) -> dict:
+        return super().dispatch_status()
+
     def dispatch_status(self) -> dict:
-        result = super().dispatch_status()
+        result = self._dispatch_status()
         result["policy"] = (
             "controller-expert-demand-gang"
             if self.demand_aware

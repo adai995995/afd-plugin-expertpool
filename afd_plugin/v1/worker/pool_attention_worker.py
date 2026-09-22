@@ -17,6 +17,7 @@ from afd_plugin.expert_pool.client import PoolClient
 from afd_plugin.expert_pool.controlled_client import ControlledPoolClient
 from afd_plugin.expert_pool.controller_service import connect_controller
 from afd_plugin.expert_pool.deployment import PoolDeployment
+from afd_plugin.expert_pool.direct_client import DirectFanoutPoolClient
 from afd_plugin.expert_pool.fanout_client import FanoutPoolClient
 from afd_plugin.expert_pool.replica_client import ReplicaPoolClient
 from afd_plugin.model_executor.models.pool_deepseek_v2 import (
@@ -104,7 +105,14 @@ class PoolAttentionWorker(Worker):
                         validate_values=deployment.execution.validate_client_values,
                     )
                 )
-            if deployment.controller is not None:
+            if deployment.direct_dispatch:
+                client = DirectFanoutPoolClient(
+                    tuple(channels),
+                    client_slot=deployment.client_ids.index(settings["client_id"]),
+                    receive_slots=deployment.receive_slots,
+                    expert_replicated=deployment.expert_replicated,
+                )
+            elif deployment.controller is not None:
                 controller = connect_controller(
                     deployment, "client", settings["client_id"]
                 )

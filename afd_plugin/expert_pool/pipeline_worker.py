@@ -73,8 +73,12 @@ class PipelineSlot:
 
 class WorkerPipeline:
     def __init__(self, worker: ExpertWorker, receive_slots: int) -> None:
-        if worker.controller is None or worker.output_workspace is None:
-            raise ValueError("Pipeline requires controlled compact Expert partitions")
+        if (
+            worker.controller is None and not worker.direct_dispatch
+        ) or worker.output_workspace is None:
+            raise ValueError(
+                "Pipeline requires controlled or direct compact partitions"
+            )
         if (
             worker.audit_inputs
             or worker.profiler is not None
@@ -86,7 +90,11 @@ class WorkerPipeline:
         self.worker = worker
         self.batching = worker.batching
         self.control = worker.controller
-        self.progress_waiter = ProgressWaiter(self.control)
+        self.progress_waiter = ProgressWaiter(
+            self.control
+            if self.control is not None
+            else tuple(peer.control for peer in worker.peers.values())
+        )
         self.compute_stream = torch.cuda.Stream(device=worker.device)
         self.slots = []
         for index in range(receive_slots):
@@ -166,7 +174,7 @@ class WorkerPipeline:
             self.peak_occupied, sum(other.plan is not None for other in self.slots)
         )
         # A sees the grant before either peer can block waiting for payload.
-        send_message(self.control, Message("grant", plan=plan, metrics=message.metrics))
+        self._notify(Message("grant", plan=plan, metrics=message.metrics))
         peer = self.worker.peers[plan.request.key.client_id]
         rows = plan.request.num_tokens
         if self.computing and not self.computing[-1].packed_end.query():
@@ -193,7 +201,7 @@ class WorkerPipeline:
             slot.phase = "input_ready"
             if self.computing and not self.computing[-1].packed_end.query():
                 self.ready_during_compute += 1
-            send_message(self.control, Message("input_ready", plan=slot.plan))
+            self._notify(Message("input_ready", plan=slot.plan))
         self.peak_ready = max(
             self.peak_ready, sum(slot.phase == "input_ready" for slot in self.slots)
         )
@@ -221,7 +229,7 @@ class WorkerPipeline:
                 slot.cost_sample = int(index == 0)
                 slot.batch_pack_ms = sum(pack_times) if index == 0 else 0.0
             slot.phase = "returning"
-            send_message(self.control, Message("output_ready", plan=slot.plan))
+            self._notify(Message("output_ready", plan=slot.plan))
             peer = self.worker.peers[slot.plan.request.key.client_id]
             with torch.cuda.stream(self.compute_stream):
                 slot.transfer = peer.transport.post((slot.outgoing,), send=True)
@@ -279,7 +287,7 @@ class WorkerPipeline:
                     execution_cost_sample=slot.cost_sample,
                     execution_batch_pack_gpu_ms=slot.batch_pack_ms,
                 )
-            send_message(self.control, Message("done", plan=plan, metrics=metrics))
+            self._notify(Message("done", plan=plan, metrics=metrics))
             slot.plan = None
             slot.transfer = None
             slot.outgoing = slot.result = slot.task_ownership = None
@@ -338,8 +346,7 @@ class WorkerPipeline:
         if any(other.phase == "receiving" for other in self.slots):
             self.compute_during_receive += 1
         if self.batching.enabled:
-            send_message(
-                self.control,
+            self._notify(
                 Message(
                     "batch_executing",
                     batch=BatchExecution(
@@ -350,7 +357,7 @@ class WorkerPipeline:
                 ),
             )
         else:
-            send_message(self.control, Message("executing", plan=plans[0]))
+            self._notify(Message("executing", plan=plans[0]))
         with torch.cuda.stream(self.compute_stream):
             for slot in selected:
                 self.compute_stream.wait_event(slot.input_ready)
@@ -407,6 +414,9 @@ class WorkerPipeline:
                 )
                 slot.packed_end.record()
         return True
+
+    def _notify(self, message: Message) -> None:
+        send_message(self.control, message)
 
     @torch.inference_mode()
     def run(self) -> None:

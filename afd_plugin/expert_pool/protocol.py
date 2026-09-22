@@ -31,6 +31,8 @@ MESSAGE_KINDS = frozenset(
         "status",
         "snapshot",
         "empty_done",
+        "execute",
+        "result",
     }
 )
 
@@ -324,6 +326,8 @@ class Message:
             "executing",
             "output_ready",
             "done",
+            "execute",
+            "result",
         } and (self.plan is None or self.request is not None):
             raise ValueError("Execution reply requires a plan only")
         if self.kind in {"close", "closed", "ready", "status", "snapshot"} and (

@@ -40,6 +40,7 @@ from afd_plugin.expert_pool.deployment import (
 )
 from afd_plugin.expert_pool.directory import PoolDirectory
 from afd_plugin.expert_pool.protocol import MAX_RECEIVE_SLOTS
+from tools.expert_pool.direct_accounting import verify_direct_pipeline
 from tools.expert_pool.validate_service import (
     BusyGPUError,
     check_idle,
@@ -422,6 +423,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                     else "whole_layer"
                 ),
                 demand_aware=args.expert_demand,
+                direct_dispatch=args.direct_dispatch,
                 compact_output=args.compact_output,
                 receive_slots=args.receive_slots,
                 expert_replicated=args.expert_replicated,
@@ -639,6 +641,12 @@ def run(args: argparse.Namespace, report: dict) -> None:
                         )
                 if args.expert_demand:
                     verify_demand_controller(controlled, report["dispatch_accounting"])
+            if args.direct_dispatch:
+                report["direct_accounting"] = verify_direct_pipeline(
+                    report["workers"],
+                    [item["status"][0] for item in closed],
+                    args.receive_slots,
+                )
             for child in children[1:]:
                 child.join(args.timeout)
                 if child.exitcode != 0:
@@ -1250,6 +1258,7 @@ def main() -> int:
     parser.add_argument("--logprob-atol", type=float, default=0.05)
     parser.add_argument("--execution-options", type=json.loads, default={})
     parser.add_argument("--receive-slots", type=int, default=1)
+    parser.add_argument("--direct-dispatch", action="store_true")
     parser.add_argument(
         "--expert-replicated",
         action="store_true",
@@ -1268,8 +1277,17 @@ def main() -> int:
         parser.error(str(error))
     if not args.controller and args.controller_policy != "round_robin":
         parser.error("--controller-policy requires --controller")
-    if args.placement == "expert_partitioned" and (
-        not args.controller or args.controller_policy != "ready_first"
+    if args.direct_dispatch and (
+        args.controller or args.receive_slots != 2 or not args.compact_output
+    ):
+        parser.error(
+            "Direct dispatch requires two dedicated slots, compact output "
+            "and no controller"
+        )
+    if (
+        args.placement == "expert_partitioned"
+        and not args.direct_dispatch
+        and (not args.controller or args.controller_policy != "ready_first")
     ):
         parser.error(
             "Expert partitions require --controller --controller-policy ready_first"
@@ -1336,6 +1354,7 @@ def main() -> int:
         "expert_replicated": args.expert_replicated,
         "batching": asdict(batching),
         "controller_enabled": args.controller,
+        "direct_dispatch": args.direct_dispatch,
         "controller_policy": args.controller_policy if args.controller else None,
     }
     try:

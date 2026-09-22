@@ -19,17 +19,19 @@ class ProgressWaiter:
     raise exceptions in their progress loop. Neither backend consumes messages.
     """
 
-    def __init__(self, connection: Connection) -> None:
-        self.connection = connection
+    def __init__(self, connection: Connection | tuple[Connection, ...]) -> None:
+        self.connections = (
+            connection if isinstance(connection, tuple) else (connection,)
+        )
         self.backend = "select"
 
     def wait(self, timeout_s: float) -> bool:
         if self.backend == "select":
             try:
-                return bool(select.select([self.connection], [], [], timeout_s)[0])
+                return bool(select.select(self.connections, [], [], timeout_s)[0])
             except ValueError:
                 # select rejects high-numbered descriptors. The poll backend
                 # also validates closed/invalid connections, rather than
                 # treating a failed wait as successful readiness.
                 self.backend = "poll"
-        return bool(wait([self.connection], timeout=timeout_s))
+        return bool(wait(self.connections, timeout=timeout_s))

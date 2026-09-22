@@ -48,6 +48,7 @@ from tools.expert_pool.benchmark_workload import (
 from tools.expert_pool.benchmark_workload import (
     percentile as percentile,
 )
+from tools.expert_pool.direct_accounting import verify_direct_pipeline
 from tools.expert_pool.validate_engines import (
     controller_entry,
     expert_entry,
@@ -170,9 +171,12 @@ async def engine_loop(
                 receive_record, control, config["timeout"]
             )
             if command["kind"] == "close":
+                status = (
+                    await engine.collective_rpc("pool_status") if deployment else None
+                )
                 if deployment:
                     await engine.collective_rpc("close_pool")
-                send_record(control, {"kind": "closed"})
+                send_record(control, {"kind": "closed", "pool_status": status})
                 break
             if command["kind"] == "prepare":
                 if deployment:
@@ -361,7 +365,12 @@ def make_deployment(args: argparse.Namespace, temporary: Path) -> PoolDeployment
         args.timeout,
         ExecutionOptions(**args.execution_options),
         workers=placements,
-        controller=ControllerConfig(str(temporary), "ready_first"),
+        controller=(
+            None
+            if args.direct_dispatch
+            else ControllerConfig(str(temporary), "ready_first")
+        ),
+        direct_dispatch=args.direct_dispatch,
         dispatch_mode="expert_partitioned",
         demand_aware=True,
         compact_output=True,
@@ -402,7 +411,8 @@ def run_mode(
             if mode == "pool":
                 deployment = make_deployment(args, Path(temporary))
                 path.write_text(json.dumps(asdict(deployment)))
-                controller = start(controller_entry, str(path))
+                if deployment.controller is not None:
+                    controller = start(controller_entry, str(path))
                 workers = [
                     start(
                         expert_entry,
@@ -609,18 +619,26 @@ def run_mode(
                     )
             for client in clients:
                 send_record(client, {"kind": "close"})
+            closed = []
             for client in clients:
-                if receive_record(client, args.timeout)["kind"] != "closed":
+                response = receive_record(client, args.timeout)
+                if response["kind"] != "closed":
                     raise RuntimeError("Engine did not close cleanly")
-            if controller is not None:
+                closed.extend(response["pool_status"] or [])
+            if workers:
                 report["workers"] = [
                     receive_record(worker, args.timeout) for worker in workers
                 ]
+            if controller is not None:
                 report["controller"] = receive_record(controller, args.timeout)
                 if args.execution_options["collect_cost_feedback"]:
                     report["cost_accounting"] = verify_cost_accounting(
                         report["controller"], report["workers"]
                     )
+            if mode == "pool" and args.direct_dispatch:
+                report["direct_accounting"] = verify_direct_pipeline(
+                    report["workers"], closed, args.receive_slots
+                )
             for child in children:
                 child.join(args.timeout)
                 if child.exitcode != 0:
@@ -666,6 +684,7 @@ def main() -> int:
     parser.add_argument("--tpot-slo-ms", type=float, nargs=2)
     parser.add_argument("--execution-options", type=json.loads, default={})
     parser.add_argument("--receive-slots", type=int, default=2)
+    parser.add_argument("--direct-dispatch", action="store_true")
     parser.add_argument("--batch-max-calls", type=int, default=2)
     parser.add_argument("--batch-max-tokens", type=int, default=1024)
     parser.add_argument("--batch-wait-us", type=int, default=2000)
@@ -732,6 +751,8 @@ def main() -> int:
             or args.kv_cache_mib < 0
         ):
             raise ValueError("Invalid mode or memory/replica configuration")
+        if args.direct_dispatch and args.receive_slots != args.attention_workers:
+            raise ValueError("Direct dispatch needs one dedicated slot per A worker")
         if (
             min(
                 args.repeats,

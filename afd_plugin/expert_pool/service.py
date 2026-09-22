@@ -147,6 +147,7 @@ def serve(
                     receive_slots=deployment.receive_slots,
                     expert_replicated=deployment.expert_replicated,
                     batching=deployment.batching,
+                    direct_dispatch=deployment.direct_dispatch,
                 )
                 worker.run()
                 return {
@@ -164,6 +165,7 @@ def serve(
                     "pipeline": worker.pipeline_status(),
                     "startup": worker.startup,
                     "expert_replicated": worker.expert_replicated,
+                    "direct_dispatch": deployment.direct_dispatch,
                     "expert_assignments": worker.expert_assignments,
                     "resident_experts": {
                         str(layer): list(executor.placement.expert_ids)
