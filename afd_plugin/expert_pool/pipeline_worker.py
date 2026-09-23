@@ -176,7 +176,7 @@ class WorkerPipeline:
         # A sees the grant before either peer can block waiting for payload.
         self._notify(Message("grant", plan=plan, metrics=message.metrics))
         peer = self.worker.peers[plan.request.key.client_id]
-        rows = plan.request.num_tokens
+        rows = plan.input_rows or plan.request.num_tokens
         if self.computing and not self.computing[-1].packed_end.query():
             self.receives_during_compute += 1
         # The caller's stream is the ingress/default stream, not the compute
@@ -255,7 +255,10 @@ class WorkerPipeline:
                 slot.outgoing.numel() * slot.outgoing.element_size()
             )
             worker.output_transfer["dense_equivalent_bytes"] += (
-                slot.result.numel() * slot.result.element_size()
+                plan.request.num_tokens
+                * plan.request.top_k
+                * plan.request.hidden_size
+                * slot.result.element_size()
             )
             worker.completed_calls += 1
             worker.client_calls[plan.request.key.client_id] += 1
@@ -332,16 +335,20 @@ class WorkerPipeline:
         selected = tuple(self.slots[index] for index in decision.slot_ids)
         plans = tuple(slot.plan for slot in selected)
         assert all(plan is not None for plan in plans)
+        input_rows = tuple(
+            plan.input_rows or plan.request.num_tokens for plan in plans
+        )
+        execution_rows = sum(input_rows)
         self.batch_executions += 1
         self.batch_calls += len(selected)
-        self.batch_tokens += decision.num_tokens
+        self.batch_tokens += execution_rows
         self.batch_histogram[len(selected)] += 1
-        self.max_batch_tokens = max(self.max_batch_tokens, decision.num_tokens)
+        self.max_batch_tokens = max(self.max_batch_tokens, execution_rows)
         for slot in selected:
             slot.phase = "executing"
             slot.compute_submitted_ns = now_ns
             slot.batch_calls = len(selected)
-            slot.batch_tokens = decision.num_tokens
+            slot.batch_tokens = execution_rows
         self.computing = selected
         if any(other.phase == "receiving" for other in self.slots):
             self.compute_during_receive += 1
@@ -364,14 +371,14 @@ class WorkerPipeline:
             self.merge_begin.record()
             if len(selected) == 1:
                 inputs = tuple(
-                    t[: decision.num_tokens]
+                    t[:execution_rows]
                     for t in (selected[0].hidden, selected[0].weights, selected[0].ids)
                 )
             else:
-                inputs = tuple(t[: decision.num_tokens] for t in self.batch_inputs)
+                inputs = tuple(t[:execution_rows] for t in self.batch_inputs)
                 offset = 0
-                for slot, plan in zip(selected, plans, strict=True):
-                    end = offset + plan.request.num_tokens
+                for slot, rows in zip(selected, input_rows, strict=True):
+                    end = offset + rows
                     for dest, source in zip(
                         inputs, (slot.hidden, slot.weights, slot.ids), strict=True
                     ):
@@ -382,15 +389,20 @@ class WorkerPipeline:
             assignment_mask = None
             if self.worker.expert_replicated:
                 masks = []
-                for slot, plan in zip(selected, plans, strict=True):
+                for slot, plan, rows in zip(selected, plans, input_rows, strict=True):
                     slot.task_ownership = selection_ownership(
                         plan.expert_ids,
                         self.worker.ownership[layer].numel(),
                         self.worker.device,
                     )
-                    masks.append(
-                        slot.task_ownership[slot.ids[: plan.request.num_tokens].long()]
-                    )
+                    routes = slot.ids[:rows]
+                    if plan.input_rows is not None and rows < plan.request.num_tokens:
+                        masks.append(
+                            (routes >= 0)
+                            & slot.task_ownership[routes.clamp_min(0).long()]
+                        )
+                    else:
+                        masks.append(slot.task_ownership[routes.long()])
                 assignment_mask = (
                     masks[0] if len(masks) == 1 else torch.cat(masks, dim=0)
                 )
@@ -399,8 +411,7 @@ class WorkerPipeline:
             )
             self.compute_end.record()
             offset = 0
-            for slot, plan in zip(selected, plans, strict=True):
-                rows = plan.request.num_tokens
+            for slot, plan, rows in zip(selected, plans, input_rows, strict=True):
                 slot.result = result[offset : offset + rows]
                 offset += rows
                 slot.begin.record()

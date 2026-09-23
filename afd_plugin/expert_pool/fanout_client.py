@@ -71,6 +71,7 @@ class FanoutPoolClient(ControlledPoolClient):
         if expert_replicated and (not compact_output or receive_slots < 2):
             raise ValueError("Expert replicas require compact multi-slot execution")
         self.last_dispatch = None
+        self.input_pack_ms = 0.0
         self.worker_expert_assignments = {
             worker.worker_id: {
                 str(p.layer_id): {str(e): 0 for e in p.expert_ids}
@@ -175,7 +176,13 @@ class FanoutPoolClient(ControlledPoolClient):
         request: CallRequest,
         dispatch_plan: DispatchPlan | None,
         owners: tuple[str, ...],
-    ) -> tuple[tuple[str, ...], FanoutReplies, dict[str, Message]]:
+        inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[
+        tuple[str, ...],
+        FanoutReplies,
+        dict[str, Message],
+        dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ]:
         if self.directory.expert_replicated:
             announcement = receive_message(self.control, self.timeout_s)
             if (
@@ -197,7 +204,7 @@ class FanoutPoolClient(ControlledPoolClient):
         grants = {
             owner: self._fanout_reply(replies, "grant", owner) for owner in owners
         }
-        return owners, replies, grants
+        return owners, replies, grants, dict.fromkeys(owners, inputs)
 
     @torch.inference_mode()
     def execute(
@@ -267,11 +274,14 @@ class FanoutPoolClient(ControlledPoolClient):
                 return torch.empty_like(hidden_states), Message(
                     "empty_done", request=request, metrics=metrics
                 )
-            owners, replies, grants = self._admit(request, dispatch_plan, owners)
+            self.input_pack_ms = 0.0
+            owners, replies, grants, owner_inputs = self._admit(
+                request, dispatch_plan, owners, (hidden_states, topk_weights, topk_ids)
+            )
             granted = time.perf_counter_ns()
             for owner in owners:
                 self.channels[owner].transport.transfer(
-                    (hidden_states, topk_weights, topk_ids), send=True
+                    owner_inputs[owner], send=True
                 )
             inputs_sent = time.perf_counter_ns()
             if self.receive_slots == 1:
@@ -344,6 +354,7 @@ class FanoutPoolClient(ControlledPoolClient):
                 "client_validation_ms": (started - validation_started) / 1e6,
                 "client_admission_wait_ms": (granted - submitted) / 1e6,
                 "client_input_transfer_wall_ms": (inputs_sent - granted) / 1e6,
+                "client_input_pack_host_ms": self.input_pack_ms,
                 "client_output_ready_wait_ms": ready_wait_ns / 1e6,
                 "client_output_transfer_wall_ms": (
                     output_received - inputs_sent - ready_wait_ns

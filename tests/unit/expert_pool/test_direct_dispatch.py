@@ -8,6 +8,7 @@ import unittest
 from dataclasses import asdict, replace
 from pathlib import Path
 
+from afd_plugin.expert_pool.compact_input import should_pack_task
 from afd_plugin.expert_pool.controller import ControllerClientIdentity
 from afd_plugin.expert_pool.deployment import (
     ClientEndpoint,
@@ -214,8 +215,44 @@ class DirectReplyTests(unittest.TestCase):
             m = Message(kind, plan=self.first)
             self.assertEqual(decode_message(encode_message(m)), m)
 
+    def test_packed_row_count_is_bound_to_plan_and_original_shape(self):
+        original = plan()
+        for rows in (0, 1, 3, True):
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
+                replace(original, input_rows=rows)
+        packed_request = replace(
+            original.request, demand=ExpertDemand((1, 1, 1, 1), 0)
+        )
+        packed = replace(
+            original,
+            request=packed_request,
+            num_assignments=2,
+            input_rows=1,
+        )
+        self.assertEqual(
+            decode_message(encode_message(Message("execute", plan=packed))).plan,
+            packed,
+        )
+        # A may send the original dense rows when packing is enabled but its
+        # guaranteed-savings gate declines a sparse task.
+        dense_bypass = replace(packed, input_rows=packed_request.num_tokens)
+        self.assertEqual(
+            decode_message(encode_message(Message("execute", plan=dense_bypass))).plan,
+            dense_bypass,
+        )
+        old_wire = json.loads(encode_message(Message("execute", plan=original)))
+        del old_wire["plan"]["input_rows"]
+        self.assertEqual(
+            decode_message(json.dumps(old_wire).encode()).plan, original
+        )
+
 
 class DirectDeploymentTests(unittest.TestCase):
+    def test_pack_admission_requires_guaranteed_row_savings(self):
+        self.assertTrue(should_pack_task(4, 8))
+        self.assertFalse(should_pack_task(5, 8))
+        self.assertFalse(should_pack_task(8, 8))
+
     def deployment(self):
         return PoolDeployment(
             "/models/checkpoint",
@@ -244,6 +281,13 @@ class DirectDeploymentTests(unittest.TestCase):
             p = Path(folder) / "deployment.json"
             p.write_text(json.dumps(asdict(d)))
             self.assertEqual(PoolDeployment.read(p), d)
+            packed = replace(d, packed_input=True)
+            p.write_text(json.dumps(asdict(packed)))
+            self.assertEqual(PoolDeployment.read(p), packed)
+            old = asdict(d)
+            del old["packed_input"]
+            p.write_text(json.dumps(old))
+            self.assertEqual(PoolDeployment.read(p), d)
 
     def test_controller_or_shared_slots_cannot_silently_enter_direct_mode(self):
         d = self.deployment()
@@ -252,6 +296,7 @@ class DirectDeploymentTests(unittest.TestCase):
             dict(receive_slots=3),
             dict(receive_slots=1),
             dict(demand_aware=False, compact_output=False),
+            dict(direct_dispatch=False, packed_input=True),
         ]:
             with self.subTest(fields=fields), self.assertRaises(ValueError):
                 replace(d, **fields)

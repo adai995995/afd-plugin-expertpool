@@ -128,6 +128,7 @@ class PoolDeployment:
     batching: BatchingOptions = BatchingOptions()
     expert_replicated: bool = False
     direct_dispatch: bool = False
+    packed_input: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution, ExecutionOptions):
@@ -200,6 +201,10 @@ class PoolDeployment:
             )
         if type(self.direct_dispatch) is not bool:
             raise ValueError("Direct dispatch must be an explicit boolean")
+        if type(self.packed_input) is not bool or (
+            self.packed_input and not self.direct_dispatch
+        ):
+            raise ValueError("Packed input requires direct dispatch")
         if self.direct_dispatch and (
             self.controller is not None
             or self.dispatch_mode != "expert_partitioned"

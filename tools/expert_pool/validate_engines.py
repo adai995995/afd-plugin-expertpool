@@ -424,6 +424,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 ),
                 demand_aware=args.expert_demand,
                 direct_dispatch=args.direct_dispatch,
+                packed_input=args.packed_input,
                 compact_output=args.compact_output,
                 receive_slots=args.receive_slots,
                 expert_replicated=args.expert_replicated,
@@ -1259,6 +1260,7 @@ def main() -> int:
     parser.add_argument("--execution-options", type=json.loads, default={})
     parser.add_argument("--receive-slots", type=int, default=1)
     parser.add_argument("--direct-dispatch", action="store_true")
+    parser.add_argument("--packed-input", action="store_true")
     parser.add_argument(
         "--expert-replicated",
         action="store_true",
@@ -1284,6 +1286,8 @@ def main() -> int:
             "Direct dispatch requires two dedicated slots, compact output "
             "and no controller"
         )
+    if args.packed_input and not args.direct_dispatch:
+        parser.error("--packed-input requires --direct-dispatch")
     if (
         args.placement == "expert_partitioned"
         and not args.direct_dispatch
@@ -1355,6 +1359,7 @@ def main() -> int:
         "batching": asdict(batching),
         "controller_enabled": args.controller,
         "direct_dispatch": args.direct_dispatch,
+        "packed_input": args.packed_input,
         "controller_policy": args.controller_policy if args.controller else None,
     }
     try:

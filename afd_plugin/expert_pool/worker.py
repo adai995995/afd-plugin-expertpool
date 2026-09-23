@@ -64,6 +64,7 @@ class ExpertWorker:
         batching: BatchingOptions = DISABLED_BATCHING,
         expert_replicated: bool = False,
         direct_dispatch: bool = False,
+        packed_input: bool = False,
     ) -> None:
         if not peers or len({peer.client_id for peer in peers}) != len(peers):
             raise ValueError("Worker requires unique client endpoints")
@@ -80,6 +81,9 @@ class ExpertWorker:
         ):
             raise ValueError("Direct worker requires dedicated compact client slots")
         self.direct_dispatch = direct_dispatch
+        if type(packed_input) is not bool or (packed_input and not direct_dispatch):
+            raise ValueError("Packed input requires direct dispatch")
+        self.packed_input = packed_input
         if (
             directory.allow_partial_experts
             and controller is None
@@ -423,6 +427,8 @@ class ExpertWorker:
             raise RuntimeError("Worker and plan demand modes disagree")
         if self.compact_output != plan.request.compact_output:
             raise RuntimeError("Worker and plan output layouts disagree")
+        if (plan.input_rows is not None) != self.packed_input:
+            raise RuntimeError("Worker and plan input layouts disagree")
         if self.demand_aware:
             placement = self.executors[plan.request.layer_id].placement
             demand = plan.request.demand

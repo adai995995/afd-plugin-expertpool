@@ -2,10 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Local physical routing with direct endpoint replies and deferred accounting."""
 
+import time
 from contextlib import ExitStack
 from multiprocessing.connection import wait
 
+import torch
+
 from afd_plugin.expert_pool.client import PoolClient
+from afd_plugin.expert_pool.compact_input import (
+    CompactInputWorkspace,
+    should_pack_task,
+)
+from afd_plugin.expert_pool.compact_output import selection_ownership
 from afd_plugin.expert_pool.controller import directory_digest
 from afd_plugin.expert_pool.direct_dispatch import DirectReplies
 from afd_plugin.expert_pool.fanout_client import FanoutPoolClient
@@ -31,6 +39,7 @@ class DirectFanoutPoolClient(FanoutPoolClient):
         client_slot: int,
         receive_slots: int,
         expert_replicated: bool = False,
+        packed_input: bool = False,
     ) -> None:
         super().__init__(
             channels,
@@ -42,7 +51,14 @@ class DirectFanoutPoolClient(FanoutPoolClient):
         )
         if not 0 <= client_slot < receive_slots:
             raise ValueError("Direct client requires its own fixed slot")
+        if type(packed_input) is not bool:
+            raise ValueError("Packed input must be an explicit boolean")
         self.client_slot = client_slot
+        self.packed_input = packed_input
+        self.input_workspaces: dict[str, CompactInputWorkspace] = {}
+        self.input_transfer = {"sent_bytes": 0, "dense_equivalent_bytes": 0}
+        self.packed_tasks = 0
+        self.dense_tasks = 0
         self.events = DirectReplies()
         self.loads = {w: WorkerLoad(1, 0, False, 0) for w in self.channels}
         self.generations = dict.fromkeys(self.channels, 0)
@@ -55,6 +71,7 @@ class DirectFanoutPoolClient(FanoutPoolClient):
                 or message.detail != directory_digest(channel.directory)
                 or message.metrics.get("slot_id") != client_slot
                 or message.metrics.get("receive_slots") != receive_slots
+                or bool(message.metrics.get("packed_input")) != packed_input
             ):
                 raise RuntimeError(
                     "Direct worker did not bind the expected slot/directory"
@@ -101,7 +118,13 @@ class DirectFanoutPoolClient(FanoutPoolClient):
         request: CallRequest,
         dispatch_plan: DispatchPlan | None,
         owners: tuple[str, ...],
-    ) -> tuple[tuple[str, ...], FanoutReplies, dict[str, Message]]:
+        inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[
+        tuple[str, ...],
+        FanoutReplies,
+        dict[str, Message],
+        dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ]:
         if self.directory.expert_replicated:
             dispatch_plan = select_replicas(
                 self.directory, request, self.loads, self.sequence + self.client_slot
@@ -113,6 +136,53 @@ class DirectFanoutPoolClient(FanoutPoolClient):
         assert dispatch_plan is not None
         owners = dispatch_plan.owners
         self.last_dispatch = dispatch_plan
+        pack_started = time.perf_counter_ns()
+        payloads = {}
+        for owner in owners:
+            task = dispatch_plan.task_for(owner)
+            # Unique selected rows cannot exceed selected assignments. Avoid
+            # a per-owner GPU→CPU shape wait unless this bound alone proves
+            # at least a twofold input-row reduction.
+            should_pack = (
+                self.packed_input
+                and should_pack_task(task.num_assignments, request.num_tokens)
+            )
+            if should_pack:
+                if owner not in self.input_workspaces:
+                    channel = self.channels[owner]
+                    self.input_workspaces[owner] = CompactInputWorkspace(
+                        channel.directory.max_tokens,
+                        channel.directory.hidden_size,
+                        channel.directory.top_k,
+                        channel.transport.device,
+                    )
+                ownership = (
+                    selection_ownership(
+                        task.expert_ids,
+                        self.layer_expert_counts[request.layer_id],
+                        inputs[0].device,
+                    )
+                    if self.directory.expert_replicated
+                    else self.ownership[(owner, request.layer_id)]
+                )
+                payloads[owner] = self.input_workspaces[owner].pack(
+                    *inputs, ownership, num_rows=task.num_assignments
+                )
+                self.packed_tasks += 1
+            else:
+                payloads[owner] = inputs
+                self.dense_tasks += 1
+            self.input_transfer["sent_bytes"] += sum(
+                tensor.numel() * tensor.element_size() for tensor in payloads[owner]
+            )
+            self.input_transfer["dense_equivalent_bytes"] += sum(
+                tensor.numel() * tensor.element_size() for tensor in inputs
+            )
+        self.input_pack_ms = (
+            (time.perf_counter_ns() - pack_started) / 1e6
+            if self.packed_input
+            else 0.0
+        )
         replies = FanoutReplies(
             request,
             owners,
@@ -133,6 +203,7 @@ class DirectFanoutPoolClient(FanoutPoolClient):
                 generation=self.generations[owner],
                 expert_ids=task.expert_ids,
                 num_assignments=task.num_assignments,
+                input_rows=payloads[owner][0].shape[0] if self.packed_input else None,
             )
             self.events.register(plan)
             # Local plan metadata reuses the existing result assembly contract.
@@ -141,7 +212,7 @@ class DirectFanoutPoolClient(FanoutPoolClient):
             replies.accept(grants[owner])
             replies.take("grant", owner)
             send_message(self.channels[owner].control, Message("execute", plan=plan))
-        return owners, replies, grants
+        return owners, replies, grants, payloads
 
     def _ready_output_owner(self, replies: FanoutReplies, remaining: list[str]) -> str:
         while True:
@@ -173,6 +244,10 @@ class DirectFanoutPoolClient(FanoutPoolClient):
         result.update(
             policy="direct-local-expert-dispatch",
             direct_dispatch=True,
+            packed_input=self.packed_input,
+            input_transfer=dict(self.input_transfer),
+            packed_tasks=self.packed_tasks,
+            dense_tasks=self.dense_tasks,
             feedback_messages=self.feedback_messages,
             pending_feedback=len(self.events.pending),
             controller_roundtrips=0,

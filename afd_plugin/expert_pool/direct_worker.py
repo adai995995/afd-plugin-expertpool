@@ -70,6 +70,7 @@ class DirectWorkerPipeline(WorkerPipeline):
                         "slot_id": self.book.slot_ids[peer.client_id],
                         "receive_slots": len(self.slots),
                         "startup_complete": int(self.worker.startup["completed"]),
+                        "packed_input": int(self.worker.packed_input),
                     },
                 ),
             )
@@ -109,6 +110,7 @@ class DirectWorkerPipeline(WorkerPipeline):
         return {
             **super().snapshot(),
             "direct_dispatch": True,
+            "packed_input": self.worker.packed_input,
             "direct_active": len(self.book.active),
             "direct_pending": len(self.book.pending),
             "direct_closed_clients": len(self.book.closed),

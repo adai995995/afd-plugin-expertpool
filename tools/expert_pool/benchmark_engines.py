@@ -371,6 +371,7 @@ def make_deployment(args: argparse.Namespace, temporary: Path) -> PoolDeployment
             else ControllerConfig(str(temporary), "ready_first")
         ),
         direct_dispatch=args.direct_dispatch,
+        packed_input=args.packed_input,
         dispatch_mode="expert_partitioned",
         demand_aware=True,
         compact_output=True,
@@ -685,6 +686,7 @@ def main() -> int:
     parser.add_argument("--execution-options", type=json.loads, default={})
     parser.add_argument("--receive-slots", type=int, default=2)
     parser.add_argument("--direct-dispatch", action="store_true")
+    parser.add_argument("--packed-input", action="store_true")
     parser.add_argument("--batch-max-calls", type=int, default=2)
     parser.add_argument("--batch-max-tokens", type=int, default=1024)
     parser.add_argument("--batch-wait-us", type=int, default=2000)
@@ -753,6 +755,8 @@ def main() -> int:
             raise ValueError("Invalid mode or memory/replica configuration")
         if args.direct_dispatch and args.receive_slots != args.attention_workers:
             raise ValueError("Direct dispatch needs one dedicated slot per A worker")
+        if args.packed_input and not args.direct_dispatch:
+            raise ValueError("Packed input requires direct dispatch")
         if (
             min(
                 args.repeats,

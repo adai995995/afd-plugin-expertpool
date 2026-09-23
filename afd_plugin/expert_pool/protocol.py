@@ -189,6 +189,7 @@ class ExecutionPlan:
     generation: int
     expert_ids: tuple[int, ...] = ()
     num_assignments: int | None = None
+    input_rows: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -204,6 +205,17 @@ class ExecutionPlan:
             raise ValueError("Invalid plan or buffer identity")
         if not isinstance(self.expert_ids, tuple):
             raise ValueError("Plan expert IDs must be immutable")
+        if self.input_rows is not None and (
+            type(self.input_rows) is not int
+            or not 0 < self.input_rows <= self.request.num_tokens
+            or self.num_assignments is None
+            or not self.num_assignments <= self.input_rows * self.request.top_k
+            or (
+                self.input_rows != self.request.num_tokens
+                and self.input_rows > self.num_assignments
+            )
+        ):
+            raise ValueError("Invalid packed-input row count")
         if self.num_assignments is None:
             if self.expert_ids or self.request.demand is not None:
                 raise ValueError("Legacy plans cannot carry expert demand")

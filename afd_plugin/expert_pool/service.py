@@ -148,6 +148,7 @@ def serve(
                     expert_replicated=deployment.expert_replicated,
                     batching=deployment.batching,
                     direct_dispatch=deployment.direct_dispatch,
+                    packed_input=deployment.packed_input,
                 )
                 worker.run()
                 return {
@@ -166,6 +167,7 @@ def serve(
                     "startup": worker.startup,
                     "expert_replicated": worker.expert_replicated,
                     "direct_dispatch": deployment.direct_dispatch,
+                    "packed_input": deployment.packed_input,
                     "expert_assignments": worker.expert_assignments,
                     "resident_experts": {
                         str(layer): list(executor.placement.expert_ids)

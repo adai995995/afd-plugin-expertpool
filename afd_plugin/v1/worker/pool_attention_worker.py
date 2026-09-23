@@ -111,6 +111,7 @@ class PoolAttentionWorker(Worker):
                     client_slot=deployment.client_ids.index(settings["client_id"]),
                     receive_slots=deployment.receive_slots,
                     expert_replicated=deployment.expert_replicated,
+                    packed_input=deployment.packed_input,
                 )
             elif deployment.controller is not None:
                 controller = connect_controller(
