@@ -40,12 +40,19 @@ class ControllerRuntime:
         ledger: ControllerLedger,
         clients: dict[str, Connection],
         workers: dict[str, Connection],
+        *,
+        pooled_admission: bool = False,
     ) -> None:
         if set(clients) != set(ledger.clients) or set(workers) != set(ledger.workers):
             raise ValueError("Controller endpoints do not match the ledger")
+        if type(pooled_admission) is not bool or (
+            pooled_admission and not isinstance(ledger, FanoutControllerLedger)
+        ):
+            raise ValueError("Pooled admission requires a fan-out ledger")
         self.ledger = ledger
         self.clients = clients
         self.workers = workers
+        self.pooled_admission = pooled_admission
         self.event_count = 0
         self.event_cpu_ms = 0.0
         self.max_event_cpu_ms = 0.0
@@ -145,7 +152,9 @@ class ControllerRuntime:
                         )
                     else:
                         self.ledger.progress(identity, message.kind, message.plan)
-                    if message.kind in {"grant", "output_ready", "done", "error"}:
+                    if message.kind in {"grant", "output_ready", "done", "error"} and not (
+                        self.pooled_admission and message.kind == "grant"
+                    ):
                         # The ledger processes completion before the A can
                         # receive done and submit its next layer.
                         send_message(
@@ -166,6 +175,18 @@ class ControllerRuntime:
                             self.clients[dispatch.request.key.client_id],
                             Message("dispatch", dispatch=dispatch),
                         )
+                if self.pooled_admission:
+                    # The ledger already reserved this exact slot and expert
+                    # subset. A can post its direct GPU send while E receives
+                    # the same plan; E's later grant confirms progress only.
+                    send_message(
+                        self.clients[plan.request.key.client_id],
+                        Message(
+                            "grant",
+                            plan=plan,
+                            metrics={"controller_queue_ms": queue_ms},
+                        ),
+                    )
                 send_message(
                     self.workers[plan.worker_id],
                     Message(
@@ -180,6 +201,7 @@ class ControllerRuntime:
                     send_message(connection, Message("close"))
         return {
             **self.ledger.snapshot(),
+            "pooled_admission": self.pooled_admission,
             "control_events": self.event_count,
             "event_processing_ms_total": self.event_cpu_ms,
             "event_processing_ms_max": self.max_event_cpu_ms,
@@ -235,6 +257,7 @@ def serve_controller(deployment: PoolDeployment) -> dict:
             ledger,
             {key: connections[("client", key)] for key in deployment.client_ids},
             {key: connections[("worker", key)] for key in deployment.worker_ids},
+            pooled_admission=deployment.pooled_admission,
         ).run()
 
 

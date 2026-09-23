@@ -301,6 +301,31 @@ class DirectDeploymentTests(unittest.TestCase):
             with self.subTest(fields=fields), self.assertRaises(ValueError):
                 replace(d, **fields)
 
+    def test_pooled_admission_requires_controlled_expert_partitions(self):
+        controlled = replace(
+            self.deployment(),
+            direct_dispatch=False,
+            controller=ControllerConfig("/tmp/control", "ready_first"),
+            pooled_admission=True,
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "deployment.json"
+            path.write_text(json.dumps(asdict(controlled)))
+            self.assertEqual(PoolDeployment.read(path), controlled)
+            legacy = asdict(controlled)
+            del legacy["pooled_admission"]
+            path.write_text(json.dumps(legacy))
+            self.assertFalse(PoolDeployment.read(path).pooled_admission)
+        for fields in (
+            {"direct_dispatch": True, "controller": None},
+            {"controller": ControllerConfig("/tmp/control", "round_robin")},
+            {"receive_slots": 1},
+            {"demand_aware": False, "compact_output": False},
+            {"dispatch_mode": "whole_layer"},
+        ):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                replace(controlled, **fields)
+
 
 if __name__ == "__main__":
     unittest.main()

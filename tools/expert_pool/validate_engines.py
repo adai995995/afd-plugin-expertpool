@@ -425,6 +425,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 demand_aware=args.expert_demand,
                 direct_dispatch=args.direct_dispatch,
                 packed_input=args.packed_input,
+                pooled_admission=args.pooled_admission,
                 compact_output=args.compact_output,
                 receive_slots=args.receive_slots,
                 expert_replicated=args.expert_replicated,
@@ -1261,6 +1262,7 @@ def main() -> int:
     parser.add_argument("--receive-slots", type=int, default=1)
     parser.add_argument("--direct-dispatch", action="store_true")
     parser.add_argument("--packed-input", action="store_true")
+    parser.add_argument("--pooled-admission", action="store_true")
     parser.add_argument(
         "--expert-replicated",
         action="store_true",
@@ -1288,6 +1290,19 @@ def main() -> int:
         )
     if args.packed_input and not args.direct_dispatch:
         parser.error("--packed-input requires --direct-dispatch")
+    if args.pooled_admission and (
+        not args.controller
+        or args.controller_policy != "ready_first"
+        or args.direct_dispatch
+        or args.placement != "expert_partitioned"
+        or not args.expert_demand
+        or not args.compact_output
+        or args.receive_slots < 2
+    ):
+        parser.error(
+            "--pooled-admission requires ready-first demand control, "
+            "compact expert partitions and multiple receive slots"
+        )
     if (
         args.placement == "expert_partitioned"
         and not args.direct_dispatch
@@ -1360,6 +1375,7 @@ def main() -> int:
         "controller_enabled": args.controller,
         "direct_dispatch": args.direct_dispatch,
         "packed_input": args.packed_input,
+        "pooled_admission": args.pooled_admission,
         "controller_policy": args.controller_policy if args.controller else None,
     }
     try:

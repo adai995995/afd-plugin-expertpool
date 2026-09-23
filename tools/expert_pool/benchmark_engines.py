@@ -372,6 +372,7 @@ def make_deployment(args: argparse.Namespace, temporary: Path) -> PoolDeployment
         ),
         direct_dispatch=args.direct_dispatch,
         packed_input=args.packed_input,
+        pooled_admission=args.pooled_admission,
         dispatch_mode="expert_partitioned",
         demand_aware=True,
         compact_output=True,
@@ -687,6 +688,7 @@ def main() -> int:
     parser.add_argument("--receive-slots", type=int, default=2)
     parser.add_argument("--direct-dispatch", action="store_true")
     parser.add_argument("--packed-input", action="store_true")
+    parser.add_argument("--pooled-admission", action="store_true")
     parser.add_argument("--batch-max-calls", type=int, default=2)
     parser.add_argument("--batch-max-tokens", type=int, default=1024)
     parser.add_argument("--batch-wait-us", type=int, default=2000)
@@ -757,6 +759,10 @@ def main() -> int:
             raise ValueError("Direct dispatch needs one dedicated slot per A worker")
         if args.packed_input and not args.direct_dispatch:
             raise ValueError("Packed input requires direct dispatch")
+        if args.pooled_admission and (args.direct_dispatch or args.receive_slots < 2):
+            raise ValueError(
+                "Pooled admission requires controller-backed multi-slot dispatch"
+            )
         if (
             min(
                 args.repeats,

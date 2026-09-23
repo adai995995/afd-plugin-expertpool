@@ -288,6 +288,8 @@ class DemandLedgerTests(unittest.TestCase):
 
 
 class DemandRuntimeTests(unittest.TestCase):
+    pooled_admission = False
+
     def setUp(self):
         self.book = ledger()
         self.pairs = {
@@ -297,6 +299,7 @@ class DemandRuntimeTests(unittest.TestCase):
             self.book,
             {identity: self.pairs[identity][0] for identity in ("a0", "a1")},
             {identity: self.pairs[identity][0] for identity in ("e0", "e1")},
+            pooled_admission=self.pooled_admission,
         )
         self.outcome = []
 
@@ -323,9 +326,15 @@ class DemandRuntimeTests(unittest.TestCase):
         return receive_message(self.pairs[identity][1], 2)
 
     def finish_child(self, plan):
+        if self.pooled_admission:
+            grant = self.receive(plan.request.key.client_id)
+            self.assertEqual((grant.kind, grant.plan), ("grant", plan))
         for kind in ("grant", "input_ready", "executing", "output_ready", "done"):
             self.send(plan.worker_id, Message(kind, plan=plan))
-        for kind in ("grant", "output_ready", "done"):
+        expected = ("output_ready", "done") if self.pooled_admission else (
+            "grant", "output_ready", "done"
+        )
+        for kind in expected:
             reply = self.receive(plan.request.key.client_id)
             self.assertEqual(reply.kind, kind)
             self.assertEqual(reply.plan, plan)
@@ -378,6 +387,41 @@ class DemandRuntimeTests(unittest.TestCase):
         self.assertEqual(result["outstanding"], 0)
         self.assertEqual(result["pending_child_plans"], 0)
         self.assertEqual(result["pending_demand_plans"], 0)
+
+
+class PooledAdmissionRuntimeTests(DemandRuntimeTests):
+    pooled_admission = True
+
+    def test_grant_precedes_worker_ack_and_busy_owner_stays_reserved(self):
+        for worker, resident in self.book.directories.items():
+            self.send(worker, Message("ready", detail=directory_digest(resident)))
+        first = request("a0")
+        self.send("a0", Message("submit", request=first))
+        a_grant = self.receive("a0")
+        e_grant = self.receive("e0")
+        self.assertEqual((a_grant.kind, a_grant.plan), ("grant", e_grant.plan))
+        self.assertEqual(a_grant.plan.request, first)
+        self.assertIn("controller_queue_ms", a_grant.metrics)
+
+        second = request("a1")
+        self.send("a1", Message("submit", request=second))
+        self.assertFalse(self.pairs["a1"][1].poll(0.05))
+        self.assertFalse(self.pairs["e1"][1].poll(0))
+        for kind in ("grant", "input_ready", "executing", "output_ready", "done"):
+            self.send("e0", Message(kind, plan=e_grant.plan))
+        for kind in ("output_ready", "done"):
+            self.assertEqual(self.receive("a0").kind, kind)
+        second_grant = self.receive("a1")
+        self.assertEqual(second_grant.plan.request, second)
+        self.assertEqual(self.receive("e0").plan, second_grant.plan)
+        self.assertFalse(self.pairs["a0"][1].poll(0))
+        for kind in ("grant", "input_ready", "executing", "output_ready", "done"):
+            self.send("e0", Message(kind, plan=second_grant.plan))
+        for kind in ("output_ready", "done"):
+            self.assertEqual(self.receive("a1").kind, kind)
+        result = self.close_runtime()
+        self.assertTrue(result["pooled_admission"])
+        self.assertEqual(result["completed_by_client"], {"a0": 1, "a1": 1})
 
 
 if __name__ == "__main__":

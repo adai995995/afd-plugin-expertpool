@@ -129,6 +129,7 @@ class PoolDeployment:
     expert_replicated: bool = False
     direct_dispatch: bool = False
     packed_input: bool = False
+    pooled_admission: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution, ExecutionOptions):
@@ -205,6 +206,22 @@ class PoolDeployment:
             self.packed_input and not self.direct_dispatch
         ):
             raise ValueError("Packed input requires direct dispatch")
+        if type(self.pooled_admission) is not bool or (
+            self.pooled_admission
+            and (
+                not isinstance(self.controller, ControllerConfig)
+                or self.controller.scheduling_policy != "ready_first"
+                or self.direct_dispatch
+                or self.dispatch_mode != "expert_partitioned"
+                or not self.demand_aware
+                or not self.compact_output
+                or self.receive_slots < 2
+            )
+        ):
+            raise ValueError(
+                "Pooled admission requires ready-first demand control, "
+                "compact expert partitions and multiple receive slots"
+            )
         if self.direct_dispatch and (
             self.controller is not None
             or self.dispatch_mode != "expert_partitioned"
