@@ -266,7 +266,7 @@ class WorkerPipeline:
             assert plan.request.demand is not None
             for expert in plan.expert_ids:
                 worker.expert_assignments[str(plan.request.layer_id)][str(expert)] += (
-                    plan.request.demand.counts[expert]
+                    plan.assignments_for(expert)
                 )
             metrics = {
                 "admitted_queue_ms": slot.queue_ms,
@@ -396,7 +396,9 @@ class WorkerPipeline:
                         self.worker.device,
                     )
                     routes = slot.ids[:rows]
-                    if plan.input_rows is not None and rows < plan.request.num_tokens:
+                    if plan.assignment_slices or (
+                        plan.input_rows is not None and rows < plan.request.num_tokens
+                    ):
                         masks.append(
                             (routes >= 0)
                             & slot.task_ownership[routes.clamp_min(0).long()]

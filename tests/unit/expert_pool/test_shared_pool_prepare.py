@@ -80,6 +80,41 @@ class SharedPoolPrepareTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 build_deployment(model, root, 2, 3, 16, 30)
 
+    def test_fixed_duplicate_expert_enables_assignment_split(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "model"
+            model.mkdir()
+            (model / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "deepseek_v2",
+                        "n_routed_experts": 4,
+                        "first_k_dense_replace": 1,
+                        "num_hidden_layers": 3,
+                        "moe_layer_freq": 1,
+                        "hidden_size": 8,
+                        "num_experts_per_tok": 2,
+                    }
+                )
+            )
+            deployment = build_deployment(
+                model, root, 2, 2, 16, 30,
+                replicated_experts=(0,), split_assignments=True,
+            )
+            self.assertTrue(deployment.expert_replicated)
+            self.assertTrue(deployment.split_assignments)
+            self.assertEqual(
+                deployment.pool_directory().locations(1, 0),
+                (("worker-0", 0), ("worker-1", 0)),
+            )
+            for replicas in ((), (4,), (0, 0)):
+                with self.subTest(replicas=replicas), self.assertRaises(ValueError):
+                    build_deployment(
+                        model, root, 2, 2, 16, 30,
+                        replicated_experts=replicas, split_assignments=True,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

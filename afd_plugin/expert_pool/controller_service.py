@@ -229,6 +229,7 @@ def serve_controller(deployment: PoolDeployment) -> dict:
             receive_slots=deployment.receive_slots,
             batching=deployment.batching,
             collect_cost_feedback=deployment.execution.collect_cost_feedback,
+            split_assignments=deployment.split_assignments,
         )
     else:
         ledger = ControllerLedger(

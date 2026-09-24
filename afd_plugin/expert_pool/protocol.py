@@ -109,10 +109,32 @@ class CallRequest:
 
 
 @dataclass(frozen=True)
+class AssignmentSlice:
+    """Contiguous ordinal range of one expert's token-major top-k assignments."""
+
+    expert_id: int
+    start: int
+    count: int
+
+    def __post_init__(self) -> None:
+        if (
+            any(
+                type(value) is not int
+                for value in (self.expert_id, self.start, self.count)
+            )
+            or self.expert_id < 0
+            or self.start < 0
+            or self.count <= 0
+        ):
+            raise ValueError("Invalid Expert assignment slice")
+
+
+@dataclass(frozen=True)
 class ExpertTask:
     worker_id: str
     expert_ids: tuple[int, ...]
     num_assignments: int
+    assignment_slices: tuple[AssignmentSlice, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.worker_id, str) or not 0 < len(self.worker_id) <= 128:
@@ -126,6 +148,28 @@ class ExpertTask:
             raise ValueError("Expert tasks require unique nonnegative expert IDs")
         if type(self.num_assignments) is not int or self.num_assignments <= 0:
             raise ValueError("Expert tasks require positive assignment counts")
+        if not isinstance(self.assignment_slices, tuple) or any(
+            not isinstance(item, AssignmentSlice) for item in self.assignment_slices
+        ):
+            raise ValueError("Expert task slices must be immutable")
+        if self.assignment_slices and (
+            {item.expert_id for item in self.assignment_slices} != set(self.expert_ids)
+            or len(self.assignment_slices) != len(self.expert_ids)
+            or sum(item.count for item in self.assignment_slices)
+            != self.num_assignments
+        ):
+            raise ValueError("Expert task slices disagree with its assignments")
+
+    def assignments_for(self, expert_id: int, demand: ExpertDemand) -> int:
+        if expert_id not in self.expert_ids:
+            raise ValueError("Expert is absent from task")
+        if self.assignment_slices:
+            return next(
+                item.count
+                for item in self.assignment_slices
+                if item.expert_id == expert_id
+            )
+        return demand.counts[expert_id]
 
 
 @dataclass(frozen=True)
@@ -144,20 +188,41 @@ class DispatchPlan:
             raise ValueError("Each worker must receive at most one expert task")
         counts = self.request.demand.counts
         assigned: set[int] = set()
+        ranges: dict[int, list[tuple[int, int]]] = {}
+        sliced = any(task.assignment_slices for task in self.tasks)
+        if sliced and any(not task.assignment_slices for task in self.tasks):
+            raise ValueError("Dispatch cannot mix sliced and whole-expert tasks")
         for task in self.tasks:
             if any(expert >= len(counts) for expert in task.expert_ids):
                 raise ValueError("Task expert is outside the demand range")
-            if assigned.intersection(task.expert_ids):
+            if not sliced and assigned.intersection(task.expert_ids):
                 raise ValueError("Dispatch repeats a demanded expert")
             if any(counts[expert] == 0 for expert in task.expert_ids):
                 raise ValueError("Dispatch includes an expert without demand")
-            if task.num_assignments != sum(
+            if not sliced and task.num_assignments != sum(
                 counts[expert] for expert in task.expert_ids
             ):
                 raise ValueError("Task count disagrees with expert demand")
+            for item in task.assignment_slices:
+                if item.start + item.count > counts[item.expert_id]:
+                    raise ValueError("Expert assignment slice exceeds demand")
+                ranges.setdefault(item.expert_id, []).append(
+                    (item.start, item.start + item.count)
+                )
             assigned.update(task.expert_ids)
         if assigned != {expert for expert, count in enumerate(counts) if count > 0}:
-            raise ValueError("Dispatch must cover every demanded expert exactly once")
+            raise ValueError("Dispatch must cover every demanded expert")
+        if sliced:
+            for expert, spans in ranges.items():
+                cursor = 0
+                for start, end in sorted(spans):
+                    if start != cursor:
+                        raise ValueError(
+                            "Expert assignment slices overlap or leave gaps"
+                        )
+                    cursor = end
+                if cursor != counts[expert]:
+                    raise ValueError("Expert assignment slices leave demand uncovered")
         if sum(task.num_assignments for task in self.tasks) != (
             self.request.num_tokens * self.request.top_k
         ):
@@ -190,6 +255,7 @@ class ExecutionPlan:
     expert_ids: tuple[int, ...] = ()
     num_assignments: int | None = None
     input_rows: int | None = None
+    assignment_slices: tuple[AssignmentSlice, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -205,6 +271,10 @@ class ExecutionPlan:
             raise ValueError("Invalid plan or buffer identity")
         if not isinstance(self.expert_ids, tuple):
             raise ValueError("Plan expert IDs must be immutable")
+        if not isinstance(self.assignment_slices, tuple) or any(
+            not isinstance(item, AssignmentSlice) for item in self.assignment_slices
+        ):
+            raise ValueError("Plan assignment slices must be immutable")
         if self.input_rows is not None and (
             type(self.input_rows) is not int
             or not 0 < self.input_rows <= self.request.num_tokens
@@ -235,10 +305,35 @@ class ExecutionPlan:
             raise ValueError("Invalid demand execution plan")
         if any(self.request.demand.counts[expert] == 0 for expert in self.expert_ids):
             raise ValueError("Plan cannot dispatch experts without demand")
-        if self.num_assignments != sum(
+        if self.assignment_slices:
+            if (
+                {item.expert_id for item in self.assignment_slices}
+                != set(self.expert_ids)
+                or len(self.assignment_slices) != len(self.expert_ids)
+                or any(
+                    item.start + item.count
+                    > self.request.demand.counts[item.expert_id]
+                    for item in self.assignment_slices
+                )
+                or self.num_assignments
+                != sum(item.count for item in self.assignment_slices)
+            ):
+                raise ValueError("Plan assignment slices disagree with expert demand")
+        elif self.num_assignments != sum(
             self.request.demand.counts[expert] for expert in self.expert_ids
         ):
             raise ValueError("Plan assignment count disagrees with expert demand")
+
+    def assignments_for(self, expert_id: int) -> int:
+        if expert_id not in self.expert_ids or self.request.demand is None:
+            raise ValueError("Expert is absent from plan")
+        if self.assignment_slices:
+            return next(
+                item.count
+                for item in self.assignment_slices
+                if item.expert_id == expert_id
+            )
+        return self.request.demand.counts[expert_id]
 
 
 @dataclass(frozen=True)
@@ -418,8 +513,19 @@ def decode_message(payload: bytes) -> Message:
                     task["expert_ids"], list
                 ):
                     raise ValueError("Malformed replica task")
+                slices = task.get("assignment_slices", [])
+                if not isinstance(slices, list):
+                    raise ValueError("Malformed replica assignment slices")
                 tasks.append(
-                    ExpertTask(**{**task, "expert_ids": tuple(task["expert_ids"])})
+                    ExpertTask(
+                        **{
+                            **task,
+                            "expert_ids": tuple(task["expert_ids"]),
+                            "assignment_slices": tuple(
+                                AssignmentSlice(**item) for item in slices
+                            ),
+                        }
+                    )
                 )
             data["dispatch"] = DispatchPlan(
                 **{
@@ -444,6 +550,12 @@ def decode_message(payload: bytes) -> Message:
                 if not isinstance(plan["expert_ids"], list):
                     raise ValueError("Malformed plan expert IDs")
                 plan["expert_ids"] = tuple(plan["expert_ids"])
+            slices = plan.get("assignment_slices", [])
+            if not isinstance(slices, list):
+                raise ValueError("Malformed plan assignment slices")
+            plan["assignment_slices"] = tuple(
+                AssignmentSlice(**item) for item in slices
+            )
             data["plan"] = ExecutionPlan(**plan)
         return Message(**data)
     except (KeyError, TypeError, UnicodeError) as error:

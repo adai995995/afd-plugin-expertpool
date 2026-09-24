@@ -75,9 +75,14 @@ class FanoutReplies:
         if index == 0:
             if self.dispatch_plan is not None:
                 task = self.dispatch_plan.task_for(worker_id)
-                if (plan.expert_ids, plan.num_assignments) != (
+                if (
+                    plan.expert_ids,
+                    plan.num_assignments,
+                    plan.assignment_slices,
+                ) != (
                     task.expert_ids,
                     task.num_assignments,
+                    task.assignment_slices,
                 ):
                     raise RuntimeError("Granted task disagrees with expert demand")
             if any(

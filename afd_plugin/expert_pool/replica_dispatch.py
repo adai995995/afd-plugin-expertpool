@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Static resident Expert replicas with admission-time backlog selection.
+"""Static resident replicas with admission-time backlog and optional splitting.
 
-One logical expert's assignments within a call go to exactly one resident copy.
-Backlog is an assignment-count heuristic, not a latency/SLO prediction. Every
-selected worker must have a free slot; the controller reserves them atomically.
+Assignment splitting is a correctness-first two-copy policy. Backlog is an
+assignment-count heuristic, not a latency/SLO prediction. Every selected
+worker must have a free slot; the controller reserves them atomically.
 """
 
 from dataclasses import dataclass
 
 from afd_plugin.expert_pool.directory import PoolDirectory
-from afd_plugin.expert_pool.protocol import CallRequest, DispatchPlan, ExpertTask
+from afd_plugin.expert_pool.protocol import (
+    AssignmentSlice,
+    CallRequest,
+    DispatchPlan,
+    ExpertTask,
+)
 
 
 @dataclass(frozen=True)
@@ -36,12 +41,17 @@ def select_replicas(
     request: CallRequest,
     loads: dict[str, WorkerLoad],
     tie_offset: int,
+    *,
+    split_assignments: bool = False,
 ) -> DispatchPlan | None:
     if not directory.expert_replicated or request.demand is None:
         raise ValueError("Replica selection requires a replicated demand directory")
+    if type(split_assignments) is not bool:
+        raise ValueError("Assignment splitting must be an explicit boolean")
     workers = sorted(loads)
     order = workers[tie_offset % len(workers) :] + workers[: tie_offset % len(workers)]
     assigned: dict[str, list[int]] = {}
+    slices: dict[str, list[AssignmentSlice]] = {}
     added = dict.fromkeys(workers, 0)
     counts = request.demand.counts
     # Largest-first placement balances the known ready work without reading any
@@ -56,8 +66,7 @@ def select_replicas(
         ]
         if not candidates:
             return None
-        owner = min(
-            candidates,
+        candidates.sort(
             key=lambda worker: (
                 loads[worker].pending_assignments + added[worker],
                 loads[worker].computing,
@@ -65,12 +74,28 @@ def select_replicas(
                 order.index(worker),
             ),
         )
-        assigned.setdefault(owner, []).append(expert)
-        added[owner] += counts[expert]
+        active = candidates[: min(counts[expert], 2 if split_assignments else 1)]
+        start = 0
+        for index, owner in enumerate(active):
+            share = (counts[expert] - start + len(active) - index - 1) // (
+                len(active) - index
+            )
+            assigned.setdefault(owner, []).append(expert)
+            if split_assignments:
+                slices.setdefault(owner, []).append(
+                    AssignmentSlice(expert, start, share)
+                )
+            added[owner] += share
+            start += share
     return DispatchPlan(
         request,
         tuple(
-            ExpertTask(worker, tuple(sorted(experts)), added[worker])
+            ExpertTask(
+                worker,
+                tuple(sorted(experts)),
+                added[worker],
+                tuple(sorted(slices.get(worker, ()), key=lambda item: item.expert_id)),
+            )
             for worker, experts in sorted(assigned.items())
         ),
     )

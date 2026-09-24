@@ -43,7 +43,7 @@ class ExecutionShape:
         for plan in plans:
             if plan.request.demand is None or plan.num_assignments is None:
                 raise ValueError("Execution cost requires validated expert demand")
-            selected = {e: plan.request.demand.counts[e] for e in plan.expert_ids}
+            selected = {e: plan.assignments_for(e) for e in plan.expert_ids}
             if sum(selected.values()) != plan.num_assignments:
                 raise ValueError("Execution cost demand does not match dispatch")
             for expert, count in selected.items():

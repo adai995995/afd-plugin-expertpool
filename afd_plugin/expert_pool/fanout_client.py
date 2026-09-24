@@ -15,6 +15,7 @@ from multiprocessing.connection import Connection
 import torch
 from vllm import _custom_ops as ops
 
+from afd_plugin.expert_pool.assignment_slices import route_ids_by_worker
 from afd_plugin.expert_pool.client import PoolClient
 from afd_plugin.expert_pool.compact_output import (
     CompactOutputWorkspace,
@@ -72,6 +73,7 @@ class FanoutPoolClient(ControlledPoolClient):
             raise ValueError("Expert replicas require compact multi-slot execution")
         self.last_dispatch = None
         self.input_pack_ms = 0.0
+        self.output_routes: dict[str, torch.Tensor] = {}
         self.worker_expert_assignments = {
             worker.worker_id: {
                 str(p.layer_id): {str(e): 0 for e in p.expert_ids}
@@ -204,7 +206,18 @@ class FanoutPoolClient(ControlledPoolClient):
         grants = {
             owner: self._fanout_reply(replies, "grant", owner) for owner in owners
         }
-        return owners, replies, grants, dict.fromkeys(owners, inputs)
+        if dispatch_plan is not None and any(
+            task.assignment_slices for task in dispatch_plan.tasks
+        ):
+            routes = route_ids_by_worker(inputs[2], dispatch_plan)
+            self.output_routes = routes
+            owner_inputs = {
+                owner: (inputs[0], inputs[1], routes[owner]) for owner in owners
+            }
+        else:
+            self.output_routes = {}
+            owner_inputs = dict.fromkeys(owners, inputs)
+        return owners, replies, grants, owner_inputs
 
     @torch.inference_mode()
     def execute(
@@ -320,7 +333,7 @@ class FanoutPoolClient(ControlledPoolClient):
                 if self.compact_output:
                     self.output_workspace.scatter(
                         received,
-                        topk_ids,
+                        self.output_routes.get(owner, topk_ids),
                         (
                             selection_ownership(
                                 plan.expert_ids,
@@ -375,7 +388,7 @@ class FanoutPoolClient(ControlledPoolClient):
                     for expert in plan.expert_ids:
                         self.worker_expert_assignments[owner][str(layer_id)][
                             str(expert)
-                        ] += request.demand.counts[expert]
+                        ] += plan.assignments_for(expert)
                 dense_bytes = slots.numel() * slots.element_size()
                 self.worker_output_transfer[owner]["received_bytes"] += output_bytes[
                     owner

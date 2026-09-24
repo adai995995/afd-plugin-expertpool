@@ -130,6 +130,7 @@ class PoolDeployment:
     direct_dispatch: bool = False
     packed_input: bool = False
     pooled_admission: bool = False
+    split_assignments: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution, ExecutionOptions):
@@ -199,6 +200,13 @@ class PoolDeployment:
         ):
             raise ValueError(
                 "Expert replicas require compact output and multiple receive slots"
+            )
+        if type(self.split_assignments) is not bool or (
+            self.split_assignments
+            and (not self.expert_replicated or not self.pooled_admission)
+        ):
+            raise ValueError(
+                "Assignment splitting requires replicated pooled admission"
             )
         if type(self.direct_dispatch) is not bool:
             raise ValueError("Direct dispatch must be an explicit boolean")

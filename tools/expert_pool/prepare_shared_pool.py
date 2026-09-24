@@ -48,6 +48,9 @@ def build_deployment(
     worker_count: int,
     max_tokens: int,
     timeout_s: int,
+    *,
+    replicated_experts: tuple[int, ...] = (),
+    split_assignments: bool = False,
 ) -> PoolDeployment:
     """Describe one shared E pool and distinct A clients without loading weights."""
 
@@ -65,6 +68,17 @@ def build_deployment(
     expert_count = config["n_routed_experts"]
     if worker_count > expert_count:
         raise ValueError("Every E worker must own at least one routed Expert")
+    if (
+        not isinstance(replicated_experts, tuple)
+        or any(
+            type(expert) is not int or not 0 <= expert < expert_count
+            for expert in replicated_experts
+        )
+        or len(set(replicated_experts)) != len(replicated_experts)
+        or (replicated_experts and worker_count < 2)
+        or (split_assignments and not replicated_experts)
+    ):
+        raise ValueError("Assignment splitting needs valid resident replicas")
     ports = iter(_free_ports(client_count * worker_count))
     clients = tuple(
         ClientEndpoint(
@@ -81,7 +95,12 @@ def build_deployment(
     workers = tuple(
         WorkerPlacement(
             f"worker-{worker_index}",
-            expert_ids=tuple(range(worker_index, expert_count, worker_count)),
+            expert_ids=tuple(
+                sorted(
+                    set(range(worker_index, expert_count, worker_count))
+                    | set(replicated_experts)
+                )
+            ),
         )
         for worker_index in range(worker_count)
     )
@@ -105,6 +124,8 @@ def build_deployment(
         compact_output=True,
         receive_slots=client_count,
         pooled_admission=True,
+        expert_replicated=bool(replicated_experts),
+        split_assignments=split_assignments,
     )
     deployment.pool_directory()
     return deployment
@@ -133,6 +154,8 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--replicate-expert", action="append", type=int, default=[])
+    parser.add_argument("--split-assignments", action="store_true")
     args = parser.parse_args()
     if not args.output.is_absolute():
         parser.error("--output must be an absolute path")
@@ -145,6 +168,8 @@ def main() -> None:
             args.workers,
             args.max_tokens,
             args.timeout,
+            replicated_experts=tuple(args.replicate_expert),
+            split_assignments=args.split_assignments,
         )
         write_private_deployment(args.output, deployment)
     except BaseException:

@@ -49,6 +49,7 @@ class FanoutControllerLedger(ControllerLedger):
         receive_slots: int = 1,
         batching: BatchingOptions = DISABLED_BATCHING,
         collect_cost_feedback: bool = False,
+        split_assignments: bool = False,
     ) -> None:
         if not directory.expert_partitioned or scheduling_policy != "ready_first":
             raise ValueError("Expert fan-out requires partitioned ready-first control")
@@ -69,6 +70,11 @@ class FanoutControllerLedger(ControllerLedger):
             raise ValueError(
                 "Replicated experts require controlled compact multi-slot execution"
             )
+        if type(split_assignments) is not bool or (
+            split_assignments and not directory.expert_replicated
+        ):
+            raise ValueError("Assignment splitting requires resident Expert replicas")
+        self.split_assignments = split_assignments
         self.dispatch_notifications: deque[DispatchPlan] = deque()
         self.replica_selections = 0
         self.receive_slots = receive_slots
@@ -209,6 +215,7 @@ class FanoutControllerLedger(ControllerLedger):
                         call.request,
                         self.worker_loads(),
                         self.replica_selections,
+                        split_assignments=self.split_assignments,
                     )
                     self.planning_cpu_ns += time.perf_counter_ns() - started
                     if dispatch is None:
@@ -251,15 +258,19 @@ class FanoutControllerLedger(ControllerLedger):
                         num_assignments=(
                             task.num_assignments if task is not None else None
                         ),
+                        assignment_slices=(
+                            task.assignment_slices if task is not None else ()
+                        ),
                     )
                     if task is not None:
                         assert call.request.demand is not None
-                        counts = call.request.demand.counts
                         assigned = self.admitted_assignments[owner][
                             call.request.layer_id
                         ]
                         for expert_id in task.expert_ids:
-                            assigned[expert_id] += counts[expert_id]
+                            assigned[expert_id] += task.assignments_for(
+                                expert_id, call.request.demand
+                            )
                     # Reserve every owner before publishing the first child.
                     slot.active = plan
                     slot.phase = "pending_grant"
@@ -445,6 +456,7 @@ class FanoutControllerLedger(ControllerLedger):
                 key: book.snapshot() for key, book in self.cost_books.items()
             },
             "expert_replicated": self.directory.expert_replicated,
+            "split_assignments": self.split_assignments,
             "replica_selections": self.replica_selections,
             "pending_dispatch_notifications": len(self.dispatch_notifications),
             "worker_loads": {

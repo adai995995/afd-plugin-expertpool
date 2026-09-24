@@ -382,7 +382,7 @@ class ExpertWorker:
             assert plan.request.demand is not None
             for expert in plan.expert_ids:
                 self.expert_assignments[str(plan.request.layer_id)][str(expert)] += (
-                    plan.request.demand.counts[expert]
+                    plan.assignments_for(expert)
                 )
         send_message(
             control, Message("done", plan=plan, metrics=metrics, digests=digests)
