@@ -18,6 +18,7 @@ from pathlib import Path
 
 from afd_plugin.expert_pool.controller_service import connect_controller
 from afd_plugin.expert_pool.deployment import PoolDeployment
+from afd_plugin.expert_pool.protocol import enable_tcp_nodelay
 
 
 def serve(
@@ -99,6 +100,8 @@ def serve(
                 peers = []
                 for listener, endpoint in zip(listeners, endpoints, strict=True):
                     control = listener.accept()
+                    if endpoint.control_host:
+                        enable_tcp_nodelay(control)
                     stack.callback(control.close)
                     transport = PoolTransport(
                         endpoint.nccl_host,

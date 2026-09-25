@@ -19,6 +19,7 @@ from afd_plugin.expert_pool.controller_service import connect_controller
 from afd_plugin.expert_pool.deployment import PoolDeployment
 from afd_plugin.expert_pool.direct_client import DirectFanoutPoolClient
 from afd_plugin.expert_pool.fanout_client import FanoutPoolClient
+from afd_plugin.expert_pool.protocol import enable_tcp_nodelay
 from afd_plugin.expert_pool.replica_client import ReplicaPoolClient
 from afd_plugin.model_executor.models.pool_deepseek_v2 import (
     PoolDeepseekV2ForCausalLM,
@@ -78,6 +79,8 @@ class PoolAttentionWorker(Worker):
                                 else None
                             ),
                         )
+                        if endpoint.control_host:
+                            enable_tcp_nodelay(control)
                         break
                     except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
                         if time.monotonic() >= deadline:

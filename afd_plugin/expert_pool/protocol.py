@@ -8,6 +8,7 @@ the buffer generation must match before any transfer or buffer reuse.
 
 import json
 import math
+import socket
 from dataclasses import asdict, dataclass, field
 from multiprocessing.connection import Connection
 
@@ -564,6 +565,18 @@ def decode_message(payload: bytes) -> Message:
 
 def send_message(connection: Connection, message: Message) -> None:
     connection.send_bytes(encode_message(message))
+
+
+def enable_tcp_nodelay(connection: Connection) -> Connection:
+    """Avoid delayed ACK/Nagle stalls between small control messages.
+
+    ``fromfd`` duplicates the descriptor, so closing the temporary socket
+    leaves the multiprocessing Connection responsible for its own lifetime.
+    Call this only for an AF_INET control connection.
+    """
+    with socket.fromfd(connection.fileno(), socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return connection
 
 
 def receive_message(connection: Connection, timeout_s: float) -> Message:

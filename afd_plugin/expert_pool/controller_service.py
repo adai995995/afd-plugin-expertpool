@@ -15,7 +15,12 @@ from afd_plugin.expert_pool.batching import BatchingOptions
 from afd_plugin.expert_pool.controller import ControllerClientIdentity, ControllerLedger
 from afd_plugin.expert_pool.deployment import PoolDeployment
 from afd_plugin.expert_pool.fanout_controller import FanoutControllerLedger
-from afd_plugin.expert_pool.protocol import Message, receive_message, send_message
+from afd_plugin.expert_pool.protocol import (
+    Message,
+    enable_tcp_nodelay,
+    receive_message,
+    send_message,
+)
 
 CONNECT_RETRY_S = 0.05
 
@@ -27,11 +32,12 @@ def connect_controller(
     deadline = time.monotonic() + deployment.timeout_s
     while True:
         try:
-            return Client(
+            connection = Client(
                 address,
                 family=family,
                 authkey=deployment.control_authkey if family == "AF_INET" else None,
             )
+            return enable_tcp_nodelay(connection) if family == "AF_INET" else connection
         except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
             if time.monotonic() >= deadline:
                 raise TimeoutError("Controller did not become available") from None
@@ -267,6 +273,8 @@ def serve_controller(deployment: PoolDeployment) -> dict:
         connections = {}
         for key, listener in listeners.items():
             connection = listener.accept()
+            if deployment.controller.tcp_host:
+                enable_tcp_nodelay(connection)
             stack.callback(connection.close)
             connections[key] = connection
         return ControllerRuntime(

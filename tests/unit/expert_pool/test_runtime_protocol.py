@@ -4,8 +4,10 @@
 
 import json
 import multiprocessing
+import socket
 import unittest
 from dataclasses import replace
+from multiprocessing.connection import Connection
 
 from afd_plugin.expert_pool.placement import ExpertPlacement
 from afd_plugin.expert_pool.protocol import (
@@ -14,6 +16,7 @@ from afd_plugin.expert_pool.protocol import (
     CallRequest,
     Message,
     decode_message,
+    enable_tcp_nodelay,
     encode_message,
     receive_message,
     send_message,
@@ -22,6 +25,28 @@ from afd_plugin.expert_pool.scheduler import StaticDirectory, StaticScheduler
 
 
 class RuntimeProtocolTests(unittest.TestCase):
+    def test_tcp_control_disables_nagle_without_closing_connection(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            with socket.create_connection(listener.getsockname()) as client:
+                accepted, _ = listener.accept()
+                with Connection(accepted.detach()) as connection:
+                    self.assertIs(enable_tcp_nodelay(connection), connection)
+                    with socket.fromfd(
+                        connection.fileno(), socket.AF_INET, socket.SOCK_STREAM
+                    ) as control_socket:
+                        self.assertEqual(
+                            control_socket.getsockopt(
+                                socket.IPPROTO_TCP, socket.TCP_NODELAY
+                            ),
+                            1,
+                        )
+                    connection.send_bytes(b"ready")
+                    self.assertEqual(
+                        client.makefile("rb").read(9), b"\x00\x00\x00\x05ready"
+                    )
+
     def setUp(self) -> None:
         self.directory = StaticDirectory(
             "checkpoint-a",
