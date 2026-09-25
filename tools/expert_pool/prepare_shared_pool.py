@@ -5,16 +5,18 @@
 
 This prepares metadata only. Start the controller, each E service, and each A
 service in separate processes using the generated path. All members must be on
-one host and use the same local checkpoint during this initial deployment.
+one host by default. TCP endpoints allow a fixed cross-host deployment using
+the same shared checkpoint; this is a correctness path, not a secure WAN API.
 """
 
 import argparse
 import json
 import os
+import secrets
 import socket
 import tempfile
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from afd_plugin.expert_pool.deployment import (
@@ -131,6 +133,52 @@ def build_deployment(
     return deployment
 
 
+def with_tcp_endpoints(
+    deployment: PoolDeployment,
+    worker_hosts: tuple[str, ...],
+    controller_host: str,
+    control_port_base: int,
+    nccl_port_base: int,
+) -> PoolDeployment:
+    """Bind each existing A–E pair and Controller identity to a TCP endpoint."""
+
+    if len(worker_hosts) != len(deployment.worker_ids) or not controller_host:
+        raise ValueError("TCP deployment needs one host per E and a Controller host")
+    pair_count = len(deployment.clients)
+    controller_count = len(deployment.client_ids) + len(deployment.worker_ids)
+    control_ports = range(control_port_base, control_port_base + pair_count)
+    nccl_ports = range(nccl_port_base, nccl_port_base + pair_count)
+    controller_ports = range(
+        control_port_base + pair_count,
+        control_port_base + pair_count + controller_count,
+    )
+    ports = (*control_ports, *nccl_ports, *controller_ports)
+    if min(ports) < 1024 or max(ports) > 65535 or len(ports) != len(set(ports)):
+        raise ValueError("TCP/NCCL ports must be valid and distinct")
+    host_by_worker = dict(zip(deployment.worker_ids, worker_hosts, strict=True))
+    clients = tuple(
+        replace(
+            endpoint,
+            control_host=host_by_worker[endpoint.worker_id],
+            control_port=control_port_base + index,
+            nccl_host=host_by_worker[endpoint.worker_id],
+            nccl_port=nccl_port_base + index,
+        )
+        for index, endpoint in enumerate(deployment.clients)
+    )
+    assert deployment.controller is not None
+    return replace(
+        deployment,
+        clients=clients,
+        controller=replace(
+            deployment.controller,
+            tcp_host=controller_host,
+            tcp_port_base=control_port_base + pair_count,
+        ),
+        tcp_authkey=secrets.token_hex(32),
+    )
+
+
 def write_private_deployment(path: Path, deployment: PoolDeployment) -> None:
     """Publish the immutable startup manifest without a world-readable window."""
 
@@ -156,6 +204,10 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--replicate-expert", action="append", type=int, default=[])
     parser.add_argument("--split-assignments", action="store_true")
+    parser.add_argument("--worker-host", action="append", default=[])
+    parser.add_argument("--controller-host")
+    parser.add_argument("--control-port-base", type=int)
+    parser.add_argument("--nccl-port-base", type=int)
     args = parser.parse_args()
     if not args.output.is_absolute():
         parser.error("--output must be an absolute path")
@@ -171,6 +223,25 @@ def main() -> None:
             replicated_experts=tuple(args.replicate_expert),
             split_assignments=args.split_assignments,
         )
+        if (
+            args.worker_host
+            or args.controller_host
+            or args.control_port_base is not None
+            or args.nccl_port_base is not None
+        ):
+            if (
+                not args.controller_host
+                or args.control_port_base is None
+                or args.nccl_port_base is None
+            ):
+                parser.error("TCP deployment needs Controller host and both port bases")
+            deployment = with_tcp_endpoints(
+                deployment,
+                tuple(args.worker_host),
+                args.controller_host,
+                args.control_port_base,
+                args.nccl_port_base,
+            )
         write_private_deployment(args.output, deployment)
     except BaseException:
         socket_dir.rmdir()

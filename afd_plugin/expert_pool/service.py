@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Single-host E service for independent vLLM engines; no HTTP or A/KV state.
+"""E service for independent vLLM engines; no HTTP or A/KV state.
 
 Run with one visible CUDA device and an explicit private deployment JSON.
 A launcher must supervise startup and terminate the process on a hung NCCL
@@ -63,13 +63,24 @@ def serve(
     with ExitStack() as stack:
         listeners = []
         for endpoint in endpoints:
-            parent = Path(endpoint.control_path).parent.stat()
-            if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
-                raise ValueError(
-                    "Control sockets require an owned directory with mode 0700"
-                )
+            if not endpoint.control_host:
+                parent = Path(endpoint.control_path).parent.stat()
+                if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
+                    raise ValueError(
+                        "Control sockets require an owned directory with mode 0700"
+                    )
             listeners.append(
-                stack.enter_context(Listener(endpoint.control_path, family="AF_UNIX"))
+                stack.enter_context(
+                    Listener(
+                        endpoint.control_address(),
+                        family=endpoint.control_family,
+                        authkey=(
+                            deployment.control_authkey
+                            if endpoint.control_host
+                            else None
+                        ),
+                    )
+                )
             )
         rendezvous = stack.enter_context(
             tempfile.TemporaryDirectory(prefix="pool-e-init-")
@@ -90,7 +101,7 @@ def serve(
                     control = listener.accept()
                     stack.callback(control.close)
                     transport = PoolTransport(
-                        "127.0.0.1",
+                        endpoint.nccl_host,
                         endpoint.nccl_port,
                         0,
                         device,

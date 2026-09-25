@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Explicit single-host deployment contract for independent vLLM engines.
+"""Explicit fixed-member deployment contract for independent vLLM engines.
 
 The launcher binds one immutable local checkpoint to one model_id. A shared
 architecture or tensor shape is never treated as evidence of equal weights.
-Control sockets must live in a launcher-owned private directory. They carry
-bounded JSON messages; activation tensors travel over the prebuilt NCCL pairs.
+Local control sockets live in a launcher-owned private directory. Cross-host
+control uses authenticated TCP; activation tensors use prebuilt NCCL pairs.
 """
 
+import ipaddress
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -52,6 +53,9 @@ class ClientEndpoint:
     control_path: str
     nccl_port: int
     worker_id: str = "worker-0"
+    control_host: str = ""
+    control_port: int = 0
+    nccl_host: str = "127.0.0.1"
 
     def __post_init__(self) -> None:
         CallKey(self.client_id, self.session_epoch, 0)
@@ -66,6 +70,27 @@ class ClientEndpoint:
             raise ValueError("Control socket requires a short absolute local path")
         if type(self.nccl_port) is not int or not 1024 <= self.nccl_port <= 65535:
             raise ValueError("Invalid NCCL rendezvous port")
+        if bool(self.control_host) != bool(self.control_port):
+            raise ValueError("TCP control requires both a host and a port")
+        if self.control_host:
+            ipaddress.IPv4Address(self.control_host)
+            if (
+                type(self.control_port) is not int
+                or not 1024 <= self.control_port <= 65535
+            ):
+                raise ValueError("Invalid TCP control port")
+        ipaddress.IPv4Address(self.nccl_host)
+
+    def control_address(self) -> str | tuple[str, int]:
+        return (
+            (self.control_host, self.control_port)
+            if self.control_host
+            else self.control_path
+        )
+
+    @property
+    def control_family(self) -> str:
+        return "AF_INET" if self.control_host else "AF_UNIX"
 
 
 @dataclass(frozen=True)
@@ -99,6 +124,8 @@ class WorkerPlacement:
 class ControllerConfig:
     socket_dir: str
     scheduling_policy: str = "round_robin"
+    tcp_host: str = ""
+    tcp_port_base: int = 0
 
     def __post_init__(self) -> None:
         if self.scheduling_policy not in CONTROLLER_POLICIES:
@@ -108,6 +135,15 @@ class ControllerConfig:
             or not Path(self.socket_dir).is_absolute()
         ):
             raise ValueError("Controller requires an absolute private socket directory")
+        if bool(self.tcp_host) != bool(self.tcp_port_base):
+            raise ValueError("TCP Controller requires both a host and base port")
+        if self.tcp_host:
+            ipaddress.IPv4Address(self.tcp_host)
+            if (
+                type(self.tcp_port_base) is not int
+                or not 1024 <= self.tcp_port_base <= 65535
+            ):
+                raise ValueError("Invalid TCP Controller base port")
 
 
 @dataclass(frozen=True)
@@ -131,6 +167,7 @@ class PoolDeployment:
     packed_input: bool = False
     pooled_admission: bool = False
     split_assignments: bool = False
+    tcp_authkey: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution, ExecutionOptions):
@@ -277,6 +314,25 @@ class PoolDeployment:
             values = [asdict(client)[field] for client in self.clients]
             if len(set(values)) != len(values):
                 raise ValueError(f"Duplicate client {field}")
+        tcp_addresses = [
+            endpoint.control_address()
+            for endpoint in self.clients
+            if endpoint.control_family == "AF_INET"
+        ]
+        if len(set(tcp_addresses)) != len(tcp_addresses):
+            raise ValueError("Duplicate TCP client control address")
+        tcp_control = any(endpoint.control_host for endpoint in self.clients) or (
+            self.controller is not None and bool(self.controller.tcp_host)
+        )
+        if tcp_control:
+            if len(self.tcp_authkey) != 64:
+                raise ValueError("TCP control requires a private 256-bit auth key")
+            try:
+                bytes.fromhex(self.tcp_authkey)
+            except ValueError as error:
+                raise ValueError("TCP control auth key must be hexadecimal") from error
+        elif self.tcp_authkey:
+            raise ValueError("TCP auth key requires a TCP control endpoint")
         if self.controller is not None:
             if not isinstance(self.controller, ControllerConfig):
                 raise ValueError("Deployment requires typed controller configuration")
@@ -290,6 +346,14 @@ class PoolDeployment:
             ]
             if set(paths) & {c.control_path for c in self.clients}:
                 raise ValueError("Controller and data bootstrap sockets must differ")
+            if self.controller.tcp_host and (
+                self.controller.tcp_port_base
+                + len(self.client_ids)
+                + len(self.worker_ids)
+                - 1
+                > 65535
+            ):
+                raise ValueError("TCP Controller ports exceed the valid range")
 
     @classmethod
     def read(cls, path: Path) -> "PoolDeployment":
@@ -335,6 +399,29 @@ class PoolDeployment:
         if len(path.encode()) > MAX_UNIX_PATH_BYTES:
             raise ValueError("Controller socket path is too long")
         return path
+
+    def controller_address(
+        self, role: str, identity: str
+    ) -> tuple[str | tuple[str, int], str]:
+        if self.controller is None or role not in {"client", "worker"}:
+            raise ValueError("Controller role is not configured")
+        if self.controller.tcp_host:
+            identities = self.client_ids if role == "client" else self.worker_ids
+            offset = 0 if role == "client" else len(self.client_ids)
+            return (
+                (
+                    self.controller.tcp_host,
+                    self.controller.tcp_port_base
+                    + offset
+                    + identities.index(identity),
+                ),
+                "AF_INET",
+            )
+        return self.controller_path(role, identity), "AF_UNIX"
+
+    @property
+    def control_authkey(self) -> bytes | None:
+        return bytes.fromhex(self.tcp_authkey) if self.tcp_authkey else None
 
     @property
     def worker_ids(self) -> tuple[str, ...]:

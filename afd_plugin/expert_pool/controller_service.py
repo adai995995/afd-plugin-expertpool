@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Standalone single-host control relay; GPU payloads never enter this process."""
+"""Standalone control relay; GPU payloads never enter this process."""
 
 import argparse
 import json
@@ -23,12 +23,16 @@ CONNECT_RETRY_S = 0.05
 def connect_controller(
     deployment: PoolDeployment, role: str, identity: str
 ) -> Connection:
-    path = deployment.controller_path(role, identity)
+    address, family = deployment.controller_address(role, identity)
     deadline = time.monotonic() + deployment.timeout_s
     while True:
         try:
-            return Client(path, family="AF_UNIX")
-        except (FileNotFoundError, ConnectionRefusedError):
+            return Client(
+                address,
+                family=family,
+                authkey=deployment.control_authkey if family == "AF_INET" else None,
+            )
+        except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
             if time.monotonic() >= deadline:
                 raise TimeoutError("Controller did not become available") from None
             time.sleep(CONNECT_RETRY_S)
@@ -211,9 +215,12 @@ class ControllerRuntime:
 def serve_controller(deployment: PoolDeployment) -> dict:
     if deployment.controller is None:
         raise ValueError("Controller is not configured")
-    parent = Path(deployment.controller.socket_dir).stat()
-    if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
-        raise ValueError("Controller sockets require an owned directory with mode 0700")
+    if not deployment.controller.tcp_host:
+        parent = Path(deployment.controller.socket_dir).stat()
+        if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
+            raise ValueError(
+                "Controller sockets require an owned directory with mode 0700"
+            )
     identities = tuple(
         ControllerClientIdentity(c[0].client_id, c[0].session_epoch, c[0].domain)
         for client_id in deployment.client_ids
@@ -241,7 +248,15 @@ def serve_controller(deployment: PoolDeployment) -> dict:
     with ExitStack() as stack:
         listeners = {
             (role, identity): stack.enter_context(
-                Listener(deployment.controller_path(role, identity), family="AF_UNIX")
+                Listener(
+                    deployment.controller_address(role, identity)[0],
+                    family=deployment.controller_address(role, identity)[1],
+                    authkey=(
+                        deployment.control_authkey
+                        if deployment.controller.tcp_host
+                        else None
+                    ),
+                )
             )
             for role, members in (
                 ("client", deployment.client_ids),

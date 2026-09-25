@@ -69,9 +69,17 @@ class PoolAttentionWorker(Worker):
             for endpoint in deployment.client_endpoints(settings["client_id"]):
                 while True:
                     try:
-                        control = Client(endpoint.control_path, family="AF_UNIX")
+                        control = Client(
+                            endpoint.control_address(),
+                            family=endpoint.control_family,
+                            authkey=(
+                                deployment.control_authkey
+                                if endpoint.control_host
+                                else None
+                            ),
+                        )
                         break
-                    except (FileNotFoundError, ConnectionRefusedError):
+                    except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
                         if time.monotonic() >= deadline:
                             raise TimeoutError(
                                 "E service control socket did not become ready"
@@ -79,7 +87,7 @@ class PoolAttentionWorker(Worker):
                         time.sleep(SOCKET_RETRY_INTERVAL_S)
                 startup.callback(control.close)
                 transport = PoolTransport(
-                    "127.0.0.1",
+                    endpoint.nccl_host,
                     endpoint.nccl_port,
                     1,
                     self.device,
