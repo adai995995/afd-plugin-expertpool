@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from afd_plugin.expert_pool.batching import BatchingOptions
 from afd_plugin.expert_pool.deployment import PoolDeployment
 from tools.expert_pool.prepare_shared_pool import (
     build_deployment,
@@ -39,6 +40,7 @@ class SharedPoolPrepareTests(unittest.TestCase):
             socket_dir.mkdir(mode=0o700)
             deployment = build_deployment(model, socket_dir, 2, 2, 16, 30)
             self.assertTrue(deployment.pooled_admission)
+            self.assertFalse(deployment.batching.enabled)
             self.assertEqual(deployment.client_ids, ("client-0", "client-1"))
             self.assertEqual(deployment.worker_ids, ("worker-0", "worker-1"))
             self.assertEqual(len(deployment.clients), 4)
@@ -64,6 +66,38 @@ class SharedPoolPrepareTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             with self.assertRaises(FileExistsError):
                 write_private_deployment(path, deployment)
+
+    def test_batch_options_survive_tcp_conversion_and_manifest_roundtrip(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "deepseek_v2",
+                        "n_routed_experts": 4,
+                        "first_k_dense_replace": 1,
+                        "num_hidden_layers": 3,
+                        "moe_layer_freq": 1,
+                        "hidden_size": 8,
+                        "num_experts_per_tok": 2,
+                    }
+                )
+            )
+            options = BatchingOptions(2, 32, 5000)
+            base = build_deployment(root, root, 2, 2, 16, 30, batching=options)
+            remote = with_tcp_endpoints(
+                base, ("127.0.0.1", "127.0.0.2"), "127.0.0.3", 47000, 47100
+            )
+            path = root / "deployment.json"
+            write_private_deployment(path, remote)
+            self.assertEqual(PoolDeployment.read(path).batching, options)
+            for invalid in (
+                BatchingOptions(3, 48),
+                BatchingOptions(2, 15),
+                BatchingOptions(2, 33),
+            ):
+                with self.subTest(options=invalid), self.assertRaises(ValueError):
+                    build_deployment(root, root, 2, 2, 16, 30, batching=invalid)
 
     def test_refuses_non_expert_model_and_empty_worker(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -100,8 +134,14 @@ class SharedPoolPrepareTests(unittest.TestCase):
                 )
             )
             deployment = build_deployment(
-                model, root, 2, 2, 16, 30,
-                replicated_experts=(0,), split_assignments=True,
+                model,
+                root,
+                2,
+                2,
+                16,
+                30,
+                replicated_experts=(0,),
+                split_assignments=True,
             )
             self.assertTrue(deployment.expert_replicated)
             self.assertTrue(deployment.split_assignments)
@@ -112,8 +152,14 @@ class SharedPoolPrepareTests(unittest.TestCase):
             for replicas in ((), (4,), (0, 0)):
                 with self.subTest(replicas=replicas), self.assertRaises(ValueError):
                     build_deployment(
-                        model, root, 2, 2, 16, 30,
-                        replicated_experts=replicas, split_assignments=True,
+                        model,
+                        root,
+                        2,
+                        2,
+                        16,
+                        30,
+                        replicated_experts=replicas,
+                        split_assignments=True,
                     )
 
     def test_cross_host_manifest_uses_authenticated_unique_tcp_endpoints(self):

@@ -23,6 +23,7 @@ def create_app(
     *,
     max_model_len: int = 1024,
     kv_cache_bytes: int = 256 * 1024 * 1024,
+    native_reference: bool = False,
 ):
     # Runtime imports follow CUDA_VISIBLE_DEVICES selection in main().
     from fastapi import FastAPI
@@ -37,10 +38,27 @@ def create_app(
     deployment = PoolDeployment.read(deployment_path)
     if client_id not in deployment.client_ids or not deployment.pooled_admission:
         raise ValueError("A service must belong to one pooled-admission deployment")
-    register_expert_pool()
+    if not native_reference:
+        register_expert_pool()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        pool_options = (
+            {}
+            if native_reference
+            else {
+                "worker_cls": (
+                    "afd_plugin.v1.worker.pool_attention_worker.PoolAttentionWorker"
+                ),
+                "hf_overrides": {"architectures": ["PoolDeepseekV2ForCausalLM"]},
+                "additional_config": {
+                    "expert_pool": {
+                        "deployment": str(deployment_path),
+                        "client_id": client_id,
+                    }
+                },
+            }
+        )
         engine = AsyncLLM.from_engine_args(
             AsyncEngineArgs(
                 model=deployment.model,
@@ -57,16 +75,7 @@ def create_app(
                 async_scheduling=False,
                 kernel_config={"moe_backend": "triton"},
                 disable_log_stats=True,
-                worker_cls=(
-                    "afd_plugin.v1.worker.pool_attention_worker.PoolAttentionWorker"
-                ),
-                hf_overrides={"architectures": ["PoolDeepseekV2ForCausalLM"]},
-                additional_config={
-                    "expert_pool": {
-                        "deployment": str(deployment_path),
-                        "client_id": client_id,
-                    }
-                },
+                **pool_options,
             )
         )
         app.state.engine = engine
@@ -74,7 +83,8 @@ def create_app(
             yield
         finally:
             try:
-                await engine.collective_rpc("close_pool")
+                if not native_reference:
+                    await engine.collective_rpc("close_pool")
             finally:
                 engine.shutdown(timeout=10)
 
@@ -83,13 +93,20 @@ def create_app(
     class GenerateRequest(BaseModel):
         prompt: str = Field(min_length=1)
         max_tokens: int = Field(default=16, ge=1, le=128)
+        return_logprobs: bool = False
 
     @app.get("/health")
     async def health() -> dict:
-        return {"ready": True, "client_id": client_id}
+        return {
+            "ready": True,
+            "client_id": client_id,
+            "native_reference": native_reference,
+        }
 
     @app.get("/pool/status")
     async def pool_status() -> dict:
+        if native_reference:
+            return {"client_id": client_id, "native_reference": True}
         return {
             "client_id": client_id,
             "workers": await app.state.engine.collective_rpc("pool_status"),
@@ -102,6 +119,7 @@ def create_app(
             max_tokens=request.max_tokens,
             ignore_eos=True,
             output_kind=RequestOutputKind.FINAL_ONLY,
+            logprobs=1 if request.return_logprobs else None,
         )
         final = None
         async for result in app.state.engine.generate(
@@ -111,11 +129,17 @@ def create_app(
         if final is None or not final.finished:
             raise RuntimeError("The A engine did not finish inference")
         output = final.outputs[0]
-        return {
+        response = {
             "client_id": client_id,
             "token_ids": list(output.token_ids),
             "text": output.text,
         }
+        if request.return_logprobs:
+            response["token_logprobs"] = [
+                step[token].logprob
+                for token, step in zip(output.token_ids, output.logprobs, strict=True)
+            ]
+        return response
 
     return app
 
@@ -127,6 +151,7 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--native-reference", action="store_true")
     args = parser.parse_args()
     if args.gpu < 0 or not 1 <= args.port <= 65535:
         parser.error("GPU index and HTTP port must be valid")
@@ -137,7 +162,9 @@ def main() -> None:
     import uvicorn
 
     uvicorn.run(
-        create_app(args.deployment, args.client_id),
+        create_app(
+            args.deployment, args.client_id, native_reference=args.native_reference
+        ),
         host=args.host,
         port=args.port,
         access_log=False,

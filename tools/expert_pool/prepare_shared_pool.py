@@ -19,11 +19,12 @@ import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
 
+from afd_plugin.expert_pool.batching import DISABLED_BATCHING, BatchingOptions
 from afd_plugin.expert_pool.deployment import (
+    MAX_DEPLOYMENT_BYTES,
     ClientEndpoint,
     ControllerConfig,
     ExecutionOptions,
-    MAX_DEPLOYMENT_BYTES,
     PoolDeployment,
     WorkerPlacement,
 )
@@ -53,6 +54,7 @@ def build_deployment(
     *,
     replicated_experts: tuple[int, ...] = (),
     split_assignments: bool = False,
+    batching: BatchingOptions = DISABLED_BATCHING,
 ) -> PoolDeployment:
     """Describe one shared E pool and distinct A clients without loading weights."""
 
@@ -128,6 +130,7 @@ def build_deployment(
         pooled_admission=True,
         expert_replicated=bool(replicated_experts),
         split_assignments=split_assignments,
+        batching=batching,
     )
     deployment.pool_directory()
     return deployment
@@ -204,6 +207,9 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--replicate-expert", action="append", type=int, default=[])
     parser.add_argument("--split-assignments", action="store_true")
+    parser.add_argument("--batch-max-calls", type=int, default=1)
+    parser.add_argument("--batch-max-tokens", type=int, default=0)
+    parser.add_argument("--batch-max-wait-us", type=int, default=0)
     parser.add_argument("--worker-host", action="append", default=[])
     parser.add_argument("--controller-host")
     parser.add_argument("--control-port-base", type=int)
@@ -211,6 +217,13 @@ def main() -> None:
     args = parser.parse_args()
     if not args.output.is_absolute():
         parser.error("--output must be an absolute path")
+    try:
+        batching = BatchingOptions(
+            args.batch_max_calls, args.batch_max_tokens, args.batch_max_wait_us
+        )
+        batching.validate_capacity(args.clients, args.max_tokens)
+    except ValueError as error:
+        parser.error(str(error))
     socket_dir = Path(tempfile.mkdtemp(prefix="ep-", dir="/tmp"))
     try:
         deployment = build_deployment(
@@ -222,6 +235,7 @@ def main() -> None:
             args.timeout,
             replicated_experts=tuple(args.replicate_expert),
             split_assignments=args.split_assignments,
+            batching=batching,
         )
         if (
             args.worker_host
@@ -252,6 +266,7 @@ def main() -> None:
                 "deployment": str(args.output),
                 "clients": deployment.client_ids,
                 "workers": deployment.worker_ids,
+                "batching": asdict(deployment.batching),
                 "socket_dir": str(socket_dir),
             }
         )

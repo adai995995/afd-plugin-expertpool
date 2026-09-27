@@ -11,6 +11,7 @@ from contextlib import ExitStack
 from multiprocessing.connection import Client, Connection, Listener, wait
 from pathlib import Path
 
+from afd_plugin.expert_pool.batch_audit import DEFAULT_AUDIT_RECORDS, BatchAudit
 from afd_plugin.expert_pool.batching import BatchingOptions
 from afd_plugin.expert_pool.controller import ControllerClientIdentity, ControllerLedger
 from afd_plugin.expert_pool.deployment import PoolDeployment
@@ -52,6 +53,7 @@ class ControllerRuntime:
         workers: dict[str, Connection],
         *,
         pooled_admission: bool = False,
+        batch_audit: BatchAudit | None = None,
     ) -> None:
         if set(clients) != set(ledger.clients) or set(workers) != set(ledger.workers):
             raise ValueError("Controller endpoints do not match the ledger")
@@ -63,6 +65,7 @@ class ControllerRuntime:
         self.clients = clients
         self.workers = workers
         self.pooled_admission = pooled_admission
+        self.batch_audit = batch_audit
         self.event_count = 0
         self.event_cpu_ms = 0.0
         self.max_event_cpu_ms = 0.0
@@ -149,6 +152,14 @@ class ControllerRuntime:
                         raise ValueError("Batch execution requires partitioned control")
                     assert message.batch is not None
                     self.ledger.start_batch(identity, message.batch)
+                    if self.batch_audit is not None:
+                        self.batch_audit.record_batch(
+                            message.batch,
+                            tuple(
+                                self.ledger.workers[identity].slots[m.slot_id].active
+                                for m in message.batch.members
+                            ),
+                        )
                 elif message.kind == "closed":
                     if not stopping or self.ledger.workers[identity].active is not None:
                         raise ValueError("Worker closed before draining")
@@ -162,9 +173,14 @@ class ControllerRuntime:
                         )
                     else:
                         self.ledger.progress(identity, message.kind, message.plan)
-                    if message.kind in {"grant", "output_ready", "done", "error"} and not (
-                        self.pooled_admission and message.kind == "grant"
-                    ):
+                    if message.kind == "done" and self.batch_audit is not None:
+                        self.batch_audit.record_done(message.plan)
+                    if message.kind in {
+                        "grant",
+                        "output_ready",
+                        "done",
+                        "error",
+                    } and not (self.pooled_admission and message.kind == "grant"):
                         # The ledger processes completion before the A can
                         # receive done and submit its next layer.
                         send_message(
@@ -215,10 +231,17 @@ class ControllerRuntime:
             "control_events": self.event_count,
             "event_processing_ms_total": self.event_cpu_ms,
             "event_processing_ms_max": self.max_event_cpu_ms,
+            "batch_audit": (
+                self.batch_audit.summary()
+                if self.batch_audit is not None
+                else {"enabled": False}
+            ),
         }
 
 
-def serve_controller(deployment: PoolDeployment) -> dict:
+def serve_controller(
+    deployment: PoolDeployment, *, batch_audit: BatchAudit | None = None
+) -> dict:
     if deployment.controller is None:
         raise ValueError("Controller is not configured")
     if not deployment.controller.tcp_host:
@@ -282,16 +305,32 @@ def serve_controller(deployment: PoolDeployment) -> dict:
             {key: connections[("client", key)] for key in deployment.client_ids},
             {key: connections[("worker", key)] for key in deployment.worker_ids},
             pooled_admission=deployment.pooled_admission,
+            batch_audit=batch_audit,
         ).run()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deployment", type=Path, required=True)
+    parser.add_argument("--batch-audit", type=Path)
+    parser.add_argument("--batch-audit-limit", type=int, default=DEFAULT_AUDIT_RECORDS)
     args = parser.parse_args()
-    print(
-        json.dumps(serve_controller(PoolDeployment.read(args.deployment))), flush=True
-    )
+    deployment = PoolDeployment.read(args.deployment)
+    audit = None
+    if args.batch_audit is not None:
+        if not args.batch_audit.is_absolute() or args.batch_audit.exists():
+            parser.error("--batch-audit needs a new absolute private output path")
+        if not deployment.batching.enabled:
+            parser.error("Batch audit requires enabled batching")
+        audit = BatchAudit(args.batch_audit_limit)
+    result = serve_controller(deployment, batch_audit=audit)
+    if audit is not None:
+        descriptor = os.open(
+            args.batch_audit, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        with os.fdopen(descriptor, "w") as output:
+            json.dump(audit.snapshot(), output)
+    print(json.dumps(result), flush=True)
 
 
 if __name__ == "__main__":
