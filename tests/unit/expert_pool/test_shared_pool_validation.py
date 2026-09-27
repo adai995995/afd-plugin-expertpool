@@ -63,6 +63,7 @@ def evidence():
             "worker_id": "e0",
             "completed_calls": 4,
             "client_calls": {"a0": 2, "a1": 2},
+            "resident_experts": {"1": [0, 1]},
             "pipeline": {
                 "active_slots": 0,
                 "batching": {

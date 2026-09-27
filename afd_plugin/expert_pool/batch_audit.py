@@ -11,6 +11,7 @@ from afd_plugin.expert_pool.protocol import BatchExecution, BatchSlot, Execution
 
 DEFAULT_AUDIT_RECORDS = 8192
 MAX_AUDIT_RECORDS = 65536
+AUDIT_VERSION = 2
 
 
 class BatchAudit:
@@ -40,6 +41,15 @@ class BatchAudit:
         totals: dict[str, int] = {}
         for plan in plans:
             counts = {str(e): plan.assignments_for(e) for e in plan.expert_ids}
+            assert plan.request.demand is not None
+            ranges = (
+                {
+                    str(item.expert_id): {"start": item.start, "count": item.count}
+                    for item in plan.assignment_slices
+                }
+                if plan.assignment_slices
+                else {expert: {"start": 0, "count": n} for expert, n in counts.items()}
+            )
             member = {
                 "client_id": plan.request.key.client_id,
                 "session_epoch": plan.request.key.session_epoch,
@@ -48,7 +58,12 @@ class BatchAudit:
                 "slot_id": plan.slot_id,
                 "generation": plan.generation,
                 "num_tokens": plan.request.num_tokens,
+                "top_k": plan.request.top_k,
+                "expert_demand": {
+                    str(e): n for e, n in enumerate(plan.request.demand.counts) if n
+                },
                 "expert_assignments": counts,
+                "assignment_ranges": ranges,
                 "completed": False,
             }
             members.append(member)
@@ -75,6 +90,7 @@ class BatchAudit:
 
     def summary(self) -> dict:
         return {
+            "version": AUDIT_VERSION,
             "enabled": True,
             "capacity": self.max_records,
             "observed_batches": self.observed,

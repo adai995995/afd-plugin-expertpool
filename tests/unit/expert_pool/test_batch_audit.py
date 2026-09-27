@@ -33,6 +33,15 @@ class BatchAuditTests(unittest.TestCase):
         audit = BatchAudit()
         audit.record_batch(group(plan), (plan,))
         self.assertEqual(audit.records[0]["expert_assignments"], {"0": 3, "1": 1})
+        member = audit.records[0]["members"][0]
+        self.assertEqual(
+            member["assignment_ranges"],
+            {
+                "0": {"start": 2, "count": 3},
+                "1": {"start": 0, "count": 1},
+            },
+        )
+        self.assertEqual(member["expert_demand"], {"0": 5, "1": 5})
 
     def test_overflow_is_explicit_and_does_not_grow_memory(self):
         audit = BatchAudit(1)

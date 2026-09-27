@@ -22,6 +22,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from afd_plugin.expert_pool.batch_audit import AUDIT_VERSION
+from tools.expert_pool.replica_validation import verify_replica_assignments
+
 DEFAULT_LOGPROB_ATOL = 0.05
 DEFAULT_OUTPUT_TOKENS = 8
 HEALTH_POLL_S = 0.2
@@ -274,12 +277,23 @@ def run_services(
 
 
 def verify_records(
-    requests: dict, audit: dict, controller: dict, workers: list[dict]
+    requests: dict,
+    audit: dict,
+    controller: dict,
+    workers: list[dict],
+    *,
+    require_cross_client_batch: bool = True,
+    require_replica_selection: bool = False,
+    require_assignment_split: bool = False,
 ) -> dict:
     if not requests["numerical_passed"] or not audit["enabled"]:
         raise AssertionError("Numerical comparisons and execution audit are required")
     if audit["dropped_batches"] or audit["pending_recorded_members"]:
         raise AssertionError("Truncated or incomplete audit cannot prove live batching")
+    if audit.get("version") != AUDIT_VERSION:
+        raise AssertionError(
+            "Validation requires an audit with exact assignment ranges"
+        )
     records = audit["records"]
     if (
         len(records) != audit["observed_batches"]
@@ -388,7 +402,7 @@ def verify_records(
                 raise AssertionError(
                     "A live MoE call is missing from execution records"
                 )
-    if not cross_batches or not coalesced_groups:
+    if require_cross_client_batch and (not cross_batches or not coalesced_groups):
         raise AssertionError("No live same-Expert cross-A batch was observed")
     if set(batches) != {worker["worker_id"] for worker in workers}:
         raise AssertionError("Worker shutdown evidence is incomplete")
@@ -413,7 +427,24 @@ def verify_records(
             live_calls_by_worker.get(worker, {}).get(client, 0) for client in clients
         ):
             raise AssertionError("Each E must demonstrate service to both A clients")
+    replicas = verify_replica_assignments(requests, records, workers)
+    if (
+        require_replica_selection
+        and not replicas["live_whole_experts_using_multiple_replicas"]
+    ):
+        raise AssertionError(
+            "No live whole-Expert choice used alternate resident copies"
+        )
+    if require_assignment_split and not replicas["live_split_expert_calls"]:
+        raise AssertionError("No live A call split an Expert across resident copies")
+    if (
+        require_assignment_split
+        and require_cross_client_batch
+        and not replicas["live_split_coalesced_expert_groups"]
+    ):
+        raise AssertionError("No live cross-A batch combined split Expert assignments")
     return {
+        **replicas,
         "passed": True,
         "live_execution_batches": live_batches,
         "live_cross_client_batches": cross_batches,
@@ -447,6 +478,13 @@ def main() -> None:
     verify.add_argument("--batch-audit", type=Path, required=True)
     verify.add_argument("--controller", type=Path, required=True)
     verify.add_argument("--worker", type=Path, action="append", required=True)
+    verify.add_argument(
+        "--require-cross-client-batch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    verify.add_argument("--require-replica-selection", action="store_true")
+    verify.add_argument("--require-assignment-split", action="store_true")
     verify.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not args.output.is_absolute() or args.output.exists():
@@ -473,6 +511,9 @@ def main() -> None:
             json.loads(args.batch_audit.read_text()),
             json.loads(args.controller.read_text()),
             [json.loads(path.read_text()) for path in args.worker],
+            require_cross_client_batch=args.require_cross_client_batch,
+            require_replica_selection=args.require_replica_selection,
+            require_assignment_split=args.require_assignment_split,
         )
     write_report(args.output, report)
     passed = report.get("passed", report.get("numerical_passed", False))
