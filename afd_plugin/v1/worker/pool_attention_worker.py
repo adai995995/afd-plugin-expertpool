@@ -150,7 +150,9 @@ class PoolAttentionWorker(Worker):
                     tuple(channels),
                     client_offset=deployment.client_ids.index(settings["client_id"]),
                 )
-            model.bind_pool_client(client)
+            model.bind_pool_client(
+                client, shared_expert_overlap=deployment.shared_expert_overlap
+            )
             self.pool_client = client
             startup.pop_all()  # Ownership passes to close_pool after binding.
         # ### PATCH END

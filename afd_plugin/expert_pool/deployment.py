@@ -168,6 +168,7 @@ class PoolDeployment:
     pooled_admission: bool = False
     split_assignments: bool = False
     batch_aware_replicas: bool = False
+    shared_expert_overlap: bool = False
     tcp_authkey: str = ""
 
     def __post_init__(self) -> None:
@@ -253,6 +254,8 @@ class PoolDeployment:
             raise ValueError(
                 "Batch-aware replicas require split assignments and batching"
             )
+        if type(self.shared_expert_overlap) is not bool:
+            raise ValueError("Shared expert overlap must be an explicit boolean")
         if type(self.direct_dispatch) is not bool:
             raise ValueError("Direct dispatch must be an explicit boolean")
         if type(self.packed_input) is not bool or (

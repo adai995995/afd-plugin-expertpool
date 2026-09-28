@@ -118,6 +118,10 @@ def compact_pool_status(status: dict) -> list[dict]:
             {
                 "layer_id": layer_id,
                 "router_metrics": details["router_metrics"],
+                "shared_expert_overlap": details.get("shared_expert_overlap"),
+                "shared_metrics": details.get("shared_metrics"),
+                "shared_timing_pending": details.get("shared_timing_pending"),
+                "shared_timing_dropped": details.get("shared_timing_dropped"),
                 **(
                     {"router_gpu_unready": details["router_gpu_unready"]}
                     if "router_gpu_unready" in details

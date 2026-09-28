@@ -55,6 +55,7 @@ def build_deployment(
     replicated_experts: tuple[int, ...] = (),
     split_assignments: bool = False,
     batch_aware_replicas: bool = False,
+    shared_expert_overlap: bool = False,
     batching: BatchingOptions = DISABLED_BATCHING,
 ) -> PoolDeployment:
     """Describe one shared E pool and distinct A clients without loading weights."""
@@ -132,6 +133,7 @@ def build_deployment(
         expert_replicated=bool(replicated_experts),
         split_assignments=split_assignments,
         batch_aware_replicas=batch_aware_replicas,
+        shared_expert_overlap=shared_expert_overlap,
         batching=batching,
     )
     deployment.pool_directory()
@@ -210,6 +212,11 @@ def main() -> None:
     parser.add_argument("--replicate-expert", action="append", type=int, default=[])
     parser.add_argument("--split-assignments", action="store_true")
     parser.add_argument("--batch-aware-replicas", action="store_true")
+    parser.add_argument(
+        "--shared-expert-overlap",
+        action="store_true",
+        help="Experimentally overlap A-side shared FFN with remote routed E work",
+    )
     parser.add_argument("--batch-max-calls", type=int, default=1)
     parser.add_argument("--batch-max-tokens", type=int, default=0)
     parser.add_argument("--batch-max-wait-us", type=int, default=0)
@@ -239,6 +246,7 @@ def main() -> None:
             replicated_experts=tuple(args.replicate_expert),
             split_assignments=args.split_assignments,
             batch_aware_replicas=args.batch_aware_replicas,
+            shared_expert_overlap=args.shared_expert_overlap,
             batching=batching,
         )
         if (
@@ -271,6 +279,7 @@ def main() -> None:
                 "clients": deployment.client_ids,
                 "workers": deployment.worker_ids,
                 "batching": asdict(deployment.batching),
+                "shared_expert_overlap": deployment.shared_expert_overlap,
                 "socket_dir": str(socket_dir),
             }
         )

@@ -9,6 +9,7 @@ constructs a local FusedMoE or allocates routed expert weights, even transiently
 
 import os
 import time
+from collections import deque
 from collections.abc import Iterable
 from importlib.metadata import version
 from pathlib import Path
@@ -43,6 +44,8 @@ from afd_plugin.expert_pool.client import PoolClient
 from afd_plugin.expert_pool.deployment import PoolDeployment
 from afd_plugin.expert_pool.metrics import CallMetrics
 from afd_plugin.expert_pool.replica_client import ReplicaPoolClient
+
+MAX_PENDING_SHARED_TIMINGS = 16
 
 
 def validate_pool_config(config: VllmConfig) -> None:
@@ -106,6 +109,13 @@ class PoolRemoteMoE(nn.Module):
         self.router_metrics: CallMetrics | None = None
         self.router_timing_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
         self.router_gpu_unready = 0
+        self.shared_expert_overlap = False
+        self.shared_stream: torch.cuda.Stream | None = None
+        self.shared_metrics: CallMetrics | None = None
+        self.pending_shared_timings: deque[
+            tuple[int, float, torch.cuda.Event, torch.cuda.Event]
+        ] = deque()
+        self.shared_timing_dropped = 0
         self.gate = GateLinear(
             config.hidden_size,
             config.n_routed_experts,
@@ -140,6 +150,8 @@ class PoolRemoteMoE(nn.Module):
             raise RuntimeError("Bind PoolClient before native profiling or inference")
         if hidden_states.shape[0] == 0:
             return torch.empty_like(hidden_states)
+        if self.pending_shared_timings:
+            self._collect_shared_timings()
         timing_events = self.router_timing_events
         if timing_events is not None:
             router_submit_started = time.perf_counter_ns()
@@ -151,7 +163,31 @@ class PoolRemoteMoE(nn.Module):
         if timing_events is not None:
             timing_events[1].record(torch.cuda.current_stream(hidden_states.device))
             router_submit_ms = (time.perf_counter_ns() - router_submit_started) / 1e6
-        routed, _ = self.client.execute(self.layer_id, hidden_states, weights, ids)
+        caller_stream = None
+        shared_output = None
+        shared_stream = None
+        shared_started = False
+        try:
+            if self.shared_experts is not None and self.shared_expert_overlap:
+                caller_stream = torch.cuda.current_stream(hidden_states.device)
+                if self.shared_stream is None:
+                    self.shared_stream = torch.cuda.Stream(device=hidden_states.device)
+                shared_stream = self.shared_stream
+                # Router is complete before the independent shared branch
+                # starts. The A->E transport only waits on caller_stream.
+                shared_stream.wait_stream(caller_stream)
+                shared_started = True
+                with torch.cuda.stream(shared_stream):
+                    hidden_states.record_stream(shared_stream)
+                    shared_output = self._run_shared_expert(hidden_states)
+            routed, _ = self.client.execute(
+                self.layer_id, hidden_states, weights, ids
+            )
+        finally:
+            if shared_started:
+                assert shared_stream is not None
+                # Also order a partially submitted shared branch if E fails.
+                caller_stream.wait_stream(shared_stream)
         if timing_events is not None:
             router_metrics = {"router_gate_select_submit_ms": router_submit_ms}
             if timing_events[1].query():
@@ -167,12 +203,61 @@ class PoolRemoteMoE(nn.Module):
         self.completed_calls += 1
         self.token_rows += hidden_states.shape[0]
         if self.shared_experts is not None:
-            return routed + self.shared_experts(hidden_states)
+            if shared_output is None:
+                shared_output = self._run_shared_expert(hidden_states)
+            else:
+                assert caller_stream is not None
+                shared_output.record_stream(caller_stream)
+            return routed + shared_output
         return routed
+
+    def _run_shared_expert(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert self.shared_experts is not None
+        if self.shared_metrics is None:
+            return self.shared_experts(hidden_states)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        submit_started = time.perf_counter_ns()
+        shared_output = self.shared_experts(hidden_states)
+        submit_ms = (time.perf_counter_ns() - submit_started) / 1e6
+        end.record()
+        if len(self.pending_shared_timings) == MAX_PENDING_SHARED_TIMINGS:
+            self.pending_shared_timings.popleft()
+            self.shared_timing_dropped += 1
+        self.pending_shared_timings.append(
+            (hidden_states.shape[0], submit_ms, start, end)
+        )
+        return shared_output
+
+    def _collect_shared_timings(self) -> None:
+        while self.pending_shared_timings:
+            rows, submit_ms, start, end = self.pending_shared_timings[0]
+            if not end.query():
+                break
+            self.pending_shared_timings.popleft()
+            if self.shared_metrics is not None:
+                self.shared_metrics.record(
+                    self.layer_id,
+                    rows,
+                    {
+                        # CUDA event elapsed time includes host enqueue gaps;
+                        # it is not a sum of kernel busy times.
+                        "shared_expert_stream_elapsed_ms": start.elapsed_time(end),
+                        "shared_expert_submit_host_ms": submit_ms,
+                    },
+                )
+
+    def shared_metrics_snapshot(self) -> dict | None:
+        self._collect_shared_timings()
+        return self.shared_metrics.snapshot() if self.shared_metrics is not None else None
 
     def set_router_metrics(self, enabled: bool) -> None:
         """Reset optional Router timings only between drained inference trials."""
         self.router_metrics = CallMetrics() if enabled else None
+        self.shared_metrics = CallMetrics() if enabled else None
+        self.pending_shared_timings.clear()
+        self.shared_timing_dropped = 0
         if enabled:
             self.router_timing_events = (
                 torch.cuda.Event(enable_timing=True),
@@ -389,7 +474,14 @@ class PoolDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
         )
         # ### PATCH END
 
-    def bind_pool_client(self, client: PoolClient | ReplicaPoolClient) -> None:
+    def bind_pool_client(
+        self,
+        client: PoolClient | ReplicaPoolClient,
+        *,
+        shared_expert_overlap: bool = False,
+    ) -> None:
+        if type(shared_expert_overlap) is not bool:
+            raise ValueError("Shared expert overlap must be an explicit boolean")
         expected = {p.layer_id for p in client.directory.placements}
         layers = {
             layer.layer_idx: layer.mlp
@@ -398,10 +490,20 @@ class PoolDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
         }
         if set(layers) != expected:
             raise ValueError("A model layers differ from resident E coverage")
+        if any(layer.client is not None for layer in layers.values()):
+            raise RuntimeError("Pool client is already bound")
+        # Layers cannot overlap with one another: the caller joins each shared
+        # branch before continuing to the next layer. Reuse one side stream so
+        # allocator and cuBLAS workspaces are reused across all MoE layers.
+        shared_stream = (
+            torch.cuda.Stream(device=next(self.parameters()).device)
+            if shared_expert_overlap
+            else None
+        )
         for layer in layers.values():
-            if layer.client is not None:
-                raise RuntimeError("Pool client is already bound")
             layer.client = client
+            layer.shared_expert_overlap = shared_expert_overlap
+            layer.shared_stream = shared_stream
 
     def set_router_metrics(self, enabled: bool) -> None:
         for layer in self.model.layers:
@@ -428,6 +530,12 @@ class PoolDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
                         else None
                     ),
                     "router_gpu_unready": layer.mlp.router_gpu_unready,
+                    "shared_expert_overlap": layer.mlp.shared_expert_overlap,
+                    "shared_metrics": layer.mlp.shared_metrics_snapshot(),
+                    "shared_timing_pending": len(
+                        layer.mlp.pending_shared_timings
+                    ),
+                    "shared_timing_dropped": layer.mlp.shared_timing_dropped,
                 }
                 for layer in self.model.layers
                 if isinstance(layer.mlp, PoolRemoteMoE)

@@ -6,6 +6,7 @@ import json
 import stat
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from afd_plugin.expert_pool.batching import BatchingOptions
@@ -98,6 +99,33 @@ class SharedPoolPrepareTests(unittest.TestCase):
             ):
                 with self.subTest(options=invalid), self.assertRaises(ValueError):
                     build_deployment(root, root, 2, 2, 16, 30, batching=invalid)
+
+    def test_shared_overlap_is_an_explicit_a_side_option(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "deepseek_v2",
+                        "n_routed_experts": 4,
+                        "first_k_dense_replace": 1,
+                        "num_hidden_layers": 3,
+                        "moe_layer_freq": 1,
+                        "hidden_size": 8,
+                        "num_experts_per_tok": 2,
+                    }
+                )
+            )
+            base = build_deployment(root, root, 2, 2, 16, 30)
+            self.assertFalse(base.shared_expert_overlap)
+            enabled = build_deployment(
+                root, root, 2, 2, 16, 30, shared_expert_overlap=True
+            )
+            path = root / "deployment.json"
+            write_private_deployment(path, enabled)
+            self.assertTrue(PoolDeployment.read(path).shared_expert_overlap)
+            with self.assertRaises(ValueError):
+                replace(base, shared_expert_overlap="true")
 
     def test_refuses_non_expert_model_and_empty_worker(self):
         with tempfile.TemporaryDirectory() as temporary:
