@@ -8,6 +8,7 @@ import threading
 import unittest
 from dataclasses import replace
 
+from afd_plugin.expert_pool.batching import BatchingOptions
 from afd_plugin.expert_pool.controller import ControllerClientIdentity, directory_digest
 from afd_plugin.expert_pool.controller_service import ControllerRuntime
 from afd_plugin.expert_pool.deployment import ExecutionOptions
@@ -16,6 +17,8 @@ from afd_plugin.expert_pool.fanout_controller import FanoutControllerLedger
 from afd_plugin.expert_pool.fanout_protocol import FanoutReplies
 from afd_plugin.expert_pool.placement import ExpertPlacement
 from afd_plugin.expert_pool.protocol import (
+    BatchExecution,
+    BatchSlot,
     CallKey,
     DispatchPlan,
     ExecutionPlan,
@@ -69,11 +72,110 @@ def ledger(*, warmup=False):
 def ready(book):
     for worker, resident in book.directories.items():
         book.ready(
-            worker, directory_digest(resident), receive_slots=2, startup_complete=1
+            worker,
+            directory_digest(resident),
+            receive_slots=2,
+            batching=book.batching,
+            startup_complete=1,
         )
 
 
 class ReplicaSelectionTests(unittest.TestCase):
+    def test_batch_affinity_keeps_cross_client_expert_work_on_one_copy(self):
+        options = BatchingOptions(2, 128, 5000)
+        book = FanoutControllerLedger(
+            replicated(),
+            tuple(ControllerClientIdentity(f"a{i}", 1, f"d{i}") for i in range(2)),
+            demand_aware=True,
+            compact_output=True,
+            receive_slots=2,
+            batching=options,
+            split_assignments=True,
+            batch_aware_replicas=True,
+        )
+        ready(book)
+        first = request((8, 0, 0, 0))
+        book.submit("a0", first, 0)
+        first_plans = (book.grant(1)[0], book.grant(1)[0])
+        self.assertEqual({plan.worker_id for plan in first_plans}, {"e0", "e1"})
+        for plan in first_plans:
+            book.progress(plan.worker_id, "grant", plan)
+            book.progress(plan.worker_id, "input_ready", plan)
+
+        second = replace(first, key=CallKey("a1", 1, 0))
+        book.submit("a1", second, 2)
+        selected = book.grant(3)[0]
+        self.assertEqual(selected.worker_id, "e0")
+        self.assertEqual(selected.num_assignments, 8)
+        self.assertEqual(len(book.active_parents[second.key]), 1)
+        self.assertEqual(book.snapshot()["batch_affinity_experts"], 1)
+        self.assertEqual(book.snapshot()["batch_affinity_calls"], 1)
+        book.progress(selected.worker_id, "grant", selected)
+        book.progress(selected.worker_id, "input_ready", selected)
+        anchor = next(plan for plan in first_plans if plan.worker_id == "e0")
+        book.start_batch(
+            "e0",
+            BatchExecution(
+                "e0", 1, (BatchSlot.from_plan(anchor), BatchSlot.from_plan(selected))
+            ),
+        )
+        self.assertEqual(book.snapshot()["merged_batches_by_worker"]["e0"], 1)
+
+    def test_affinity_skips_full_or_executing_slots_and_falls_back(self):
+        options = BatchingOptions(2, 64, 5000)
+        book = FanoutControllerLedger(
+            replicated(),
+            tuple(ControllerClientIdentity(f"a{i}", 1, f"d{i}") for i in range(2)),
+            demand_aware=True,
+            compact_output=True,
+            receive_slots=2,
+            batching=options,
+            split_assignments=True,
+            batch_aware_replicas=True,
+        )
+        ready(book)
+        first = request((96, 4, 0, 0))
+        book.submit("a0", first, 0)
+        plans = (book.grant(1)[0], book.grant(1)[0])
+        other = replace(request((80, 0, 0, 0)), key=CallKey("a1", 1, 0))
+        self.assertEqual(book._batch_affinity(other), {})
+        small = replace(request((8, 0, 0, 0)), key=CallKey("a1", 1, 0))
+        self.assertEqual(book._batch_affinity(replace(small, hidden_size=64)), {})
+        self.assertEqual(book._batch_affinity(small), {0: "e1"})
+        with_unique = replace(request((4, 4, 0, 0)), key=CallKey("a1", 1, 0))
+        self.assertEqual(book._batch_affinity(with_unique), {0: "e1"})
+        for plan in plans:
+            book.workers[plan.worker_id].slots[plan.slot_id].phase = "executing"
+        self.assertEqual(book._batch_affinity(small), {})
+        book.submit("a1", small, 2)
+        self.assertIsNotNone(book.grant(3))
+        self.assertEqual(len(book.active_parents[small.key]), 2)
+        self.assertEqual(book.snapshot()["batch_affinity_experts"], 0)
+
+    def test_unavailable_or_nonresident_affinity_hint_is_ignored(self):
+        loads = {w: WorkerLoad(2, 0, False, 0) for w in ("e0", "e1")}
+        call = request((8, 0, 0, 0))
+        for hint in ("absent", None):
+            dispatch = select_replicas(
+                replicated(),
+                call,
+                loads,
+                0,
+                split_assignments=True,
+                batch_affinity={0: hint},
+            )
+            self.assertEqual(dispatch.owners, ("e0", "e1"))
+        loads["e0"] = WorkerLoad(0, 0, False, 2)
+        dispatch = select_replicas(
+            replicated(),
+            call,
+            loads,
+            0,
+            split_assignments=True,
+            batch_affinity={0: "e0"},
+        )
+        self.assertEqual(dispatch.owners, ("e1",))
+
     def test_overlap_requires_opt_in_and_missing_coverage_is_still_rejected(self):
         pool = replicated()
         self.assertEqual(pool.locations(1, 0), (("e0", 0), ("e1", 1)))

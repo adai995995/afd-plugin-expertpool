@@ -266,6 +266,7 @@ def serve_controller(
             batching=deployment.batching,
             collect_cost_feedback=deployment.execution.collect_cost_feedback,
             split_assignments=deployment.split_assignments,
+            batch_aware_replicas=deployment.batch_aware_replicas,
         )
     else:
         ledger = ControllerLedger(

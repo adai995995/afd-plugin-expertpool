@@ -43,6 +43,7 @@ def select_replicas(
     tie_offset: int,
     *,
     split_assignments: bool = False,
+    batch_affinity: dict[int, str] | None = None,
 ) -> DispatchPlan | None:
     if not directory.expert_replicated or request.demand is None:
         raise ValueError("Replica selection requires a replicated demand directory")
@@ -74,7 +75,15 @@ def select_replicas(
                 order.index(worker),
             ),
         )
-        active = candidates[: min(counts[expert], 2 if split_assignments else 1)]
+        preferred = batch_affinity.get(expert) if batch_affinity is not None else None
+        # A compatible in-flight call can share one resident copy instead of
+        # splitting this Expert's work across independent worker batches.
+        # Ignore stale/nonresident hints; the Controller still owns admission.
+        active = (
+            [preferred]
+            if preferred in candidates
+            else candidates[: min(counts[expert], 2 if split_assignments else 1)]
+        )
         start = 0
         for index, owner in enumerate(active):
             share = (counts[expert] - start + len(active) - index - 1) // (

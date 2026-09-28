@@ -50,6 +50,7 @@ class FanoutControllerLedger(ControllerLedger):
         batching: BatchingOptions = DISABLED_BATCHING,
         collect_cost_feedback: bool = False,
         split_assignments: bool = False,
+        batch_aware_replicas: bool = False,
     ) -> None:
         if not directory.expert_partitioned or scheduling_policy != "ready_first":
             raise ValueError("Expert fan-out requires partitioned ready-first control")
@@ -74,12 +75,34 @@ class FanoutControllerLedger(ControllerLedger):
             split_assignments and not directory.expert_replicated
         ):
             raise ValueError("Assignment splitting requires resident Expert replicas")
+        if not isinstance(batching, BatchingOptions):
+            raise ValueError("Controller requires typed batching options")
+        if type(batch_aware_replicas) is not bool or (
+            batch_aware_replicas and (not split_assignments or not batching.enabled)
+        ):
+            raise ValueError(
+                "Batch-aware replicas require split assignments and batching"
+            )
         self.split_assignments = split_assignments
+        self.batch_aware_replicas = batch_aware_replicas
+        replica_owners: dict[int, dict[int, set[str]]] = {}
+        if batch_aware_replicas:
+            for resident in directory.workers:
+                for placement in resident.placements:
+                    owners = replica_owners.setdefault(placement.layer_id, {})
+                    for expert in placement.expert_ids:
+                        owners.setdefault(expert, set()).add(resident.worker_id)
+        self.replicated_experts = {
+            layer: frozenset(
+                expert for expert, owners in experts.items() if len(owners) > 1
+            )
+            for layer, experts in replica_owners.items()
+        }
+        self.batch_affinity_experts = 0
+        self.batch_affinity_calls = 0
         self.dispatch_notifications: deque[DispatchPlan] = deque()
         self.replica_selections = 0
         self.receive_slots = receive_slots
-        if not isinstance(batching, BatchingOptions):
-            raise ValueError("Controller requires typed batching options")
         batching.validate_capacity(receive_slots, directory.workers[0].max_tokens)
         self.batching = batching
         self.workers = {
@@ -210,12 +233,18 @@ class FanoutControllerLedger(ControllerLedger):
                 )
                 if self.directory.expert_replicated:
                     started = time.perf_counter_ns()
+                    affinity = (
+                        self._batch_affinity(call.request)
+                        if self.batch_aware_replicas
+                        else None
+                    )
                     dispatch = select_replicas(
                         self.directory,
                         call.request,
                         self.worker_loads(),
                         self.replica_selections,
                         split_assignments=self.split_assignments,
+                        batch_affinity=affinity,
                     )
                     self.planning_cpu_ns += time.perf_counter_ns() - started
                     if dispatch is None:
@@ -232,6 +261,17 @@ class FanoutControllerLedger(ControllerLedger):
                     del self.pending_demand_plans[call.request.key]
                 if self.directory.expert_replicated:
                     assert dispatch is not None
+                    if affinity:
+                        affinity_experts = sum(
+                            task.worker_id == affinity.get(expert)
+                            and task.assignments_for(expert, call.request.demand)
+                            == call.request.demand.counts[expert]
+                            for task in dispatch.tasks
+                            for expert in task.expert_ids
+                            if expert in affinity
+                        )
+                        self.batch_affinity_experts += affinity_experts
+                        self.batch_affinity_calls += affinity_experts > 0
                     self.dispatch_notifications.append(dispatch)
                     self.replica_selections += 1
                 self._record_owners(call.request, owners)
@@ -283,6 +323,63 @@ class FanoutControllerLedger(ControllerLedger):
                 )
                 return self.grant(now_ns)
         return None
+
+    def _batch_affinity(self, request: CallRequest) -> dict[int, str]:
+        """Find compatible other-client slots for already resident Experts.
+
+        This reads Controller-owned metadata only. It adds no wait, network
+        exchange, or GPU synchronization to admission.
+        """
+        assert request.demand is not None
+        replicated = self.replicated_experts.get(request.layer_id, frozenset())
+        wanted = {
+            i
+            for i, count in enumerate(request.demand.counts)
+            if count and i in replicated
+        }
+        if not wanted:
+            return {}
+        preferred: dict[int, tuple[tuple[int, int, str], str]] = {}
+        phase_rank = {
+            "input_ready": 0,
+            "receiving": 1,
+            "reserved": 2,
+            "pending_grant": 3,
+        }
+        for worker_id, worker in self.workers.items():
+            if not worker.available_slots:
+                continue
+            compatible = tuple(
+                slot
+                for slot in worker.slots
+                if slot.active is not None
+                and slot.phase in phase_rank
+                and slot.active.request.model_id == request.model_id
+                and slot.active.request.placement_version == request.placement_version
+                and slot.active.request.layer_id == request.layer_id
+                and slot.active.request.hidden_size == request.hidden_size
+                and slot.active.request.top_k == request.top_k
+                and slot.active.request.compact_output == request.compact_output
+            )
+            if len(compatible) >= self.batching.max_calls:
+                continue
+            for slot in compatible:
+                prior = slot.active
+                assert prior is not None
+                if prior.request.key.client_id == request.key.client_id or (
+                    prior.request.num_tokens + request.num_tokens
+                    > self.batching.max_tokens
+                ):
+                    continue
+                candidate = (
+                    phase_rank[slot.phase],
+                    prior.num_assignments or 0,
+                    worker_id,
+                )
+                for expert in wanted.intersection(prior.expert_ids):
+                    if expert not in preferred or candidate < preferred[expert][0]:
+                        preferred[expert] = (candidate, worker_id)
+        return {expert: choice[1] for expert, choice in preferred.items()}
 
     def start_batch(self, worker_id: str, batch: BatchExecution) -> None:
         """Validate every member before atomically occupying the compute lane."""
@@ -457,6 +554,9 @@ class FanoutControllerLedger(ControllerLedger):
             },
             "expert_replicated": self.directory.expert_replicated,
             "split_assignments": self.split_assignments,
+            "batch_aware_replicas": self.batch_aware_replicas,
+            "batch_affinity_calls": self.batch_affinity_calls,
+            "batch_affinity_experts": self.batch_affinity_experts,
             "replica_selections": self.replica_selections,
             "pending_dispatch_notifications": len(self.dispatch_notifications),
             "worker_loads": {

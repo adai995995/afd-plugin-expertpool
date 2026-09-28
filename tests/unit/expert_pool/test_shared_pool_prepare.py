@@ -145,6 +145,34 @@ class SharedPoolPrepareTests(unittest.TestCase):
             )
             self.assertTrue(deployment.expert_replicated)
             self.assertTrue(deployment.split_assignments)
+            with self.assertRaisesRegex(ValueError, "Batch-aware replicas"):
+                build_deployment(
+                    model,
+                    root,
+                    2,
+                    2,
+                    16,
+                    30,
+                    replicated_experts=(0,),
+                    split_assignments=True,
+                    batch_aware_replicas=True,
+                )
+            aware = build_deployment(
+                model,
+                root,
+                2,
+                2,
+                16,
+                30,
+                replicated_experts=(0,),
+                split_assignments=True,
+                batch_aware_replicas=True,
+                batching=BatchingOptions(2, 32, 1000),
+            )
+            self.assertTrue(aware.batch_aware_replicas)
+            private = root / "deployment.json"
+            write_private_deployment(private, aware)
+            self.assertTrue(PoolDeployment.read(private).batch_aware_replicas)
             self.assertEqual(
                 deployment.pool_directory().locations(1, 0),
                 (("worker-0", 0), ("worker-1", 0)),

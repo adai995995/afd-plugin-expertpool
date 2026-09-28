@@ -54,6 +54,7 @@ def build_deployment(
     *,
     replicated_experts: tuple[int, ...] = (),
     split_assignments: bool = False,
+    batch_aware_replicas: bool = False,
     batching: BatchingOptions = DISABLED_BATCHING,
 ) -> PoolDeployment:
     """Describe one shared E pool and distinct A clients without loading weights."""
@@ -130,6 +131,7 @@ def build_deployment(
         pooled_admission=True,
         expert_replicated=bool(replicated_experts),
         split_assignments=split_assignments,
+        batch_aware_replicas=batch_aware_replicas,
         batching=batching,
     )
     deployment.pool_directory()
@@ -207,6 +209,7 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--replicate-expert", action="append", type=int, default=[])
     parser.add_argument("--split-assignments", action="store_true")
+    parser.add_argument("--batch-aware-replicas", action="store_true")
     parser.add_argument("--batch-max-calls", type=int, default=1)
     parser.add_argument("--batch-max-tokens", type=int, default=0)
     parser.add_argument("--batch-max-wait-us", type=int, default=0)
@@ -235,6 +238,7 @@ def main() -> None:
             args.timeout,
             replicated_experts=tuple(args.replicate_expert),
             split_assignments=args.split_assignments,
+            batch_aware_replicas=args.batch_aware_replicas,
             batching=batching,
         )
         if (

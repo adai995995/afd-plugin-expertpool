@@ -167,6 +167,7 @@ class PoolDeployment:
     packed_input: bool = False
     pooled_admission: bool = False
     split_assignments: bool = False
+    batch_aware_replicas: bool = False
     tcp_authkey: str = ""
 
     def __post_init__(self) -> None:
@@ -244,6 +245,13 @@ class PoolDeployment:
         ):
             raise ValueError(
                 "Assignment splitting requires replicated pooled admission"
+            )
+        if type(self.batch_aware_replicas) is not bool or (
+            self.batch_aware_replicas
+            and (not self.split_assignments or not self.batching.enabled)
+        ):
+            raise ValueError(
+                "Batch-aware replicas require split assignments and batching"
             )
         if type(self.direct_dispatch) is not bool:
             raise ValueError("Direct dispatch must be an explicit boolean")
@@ -411,9 +419,7 @@ class PoolDeployment:
             return (
                 (
                     self.controller.tcp_host,
-                    self.controller.tcp_port_base
-                    + offset
-                    + identities.index(identity),
+                    self.controller.tcp_port_base + offset + identities.index(identity),
                 ),
                 "AF_INET",
             )
