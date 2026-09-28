@@ -27,9 +27,10 @@ def create_app(
     native_reference: bool = False,
 ):
     # Runtime imports follow CUDA_VISIBLE_DEVICES selection in main().
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException
     from fastapi.responses import StreamingResponse
     from pydantic import BaseModel, Field
+    from starlette.background import BackgroundTask
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.sampling_params import RequestOutputKind
@@ -91,11 +92,26 @@ def create_app(
                 engine.shutdown(timeout=10)
 
     app = FastAPI(lifespan=lifespan)
+    app.state.active_requests = 0
+    app.state.metrics_transition = False
 
     class GenerateRequest(BaseModel):
         prompt: str = Field(min_length=1)
         max_tokens: int = Field(default=16, ge=1, le=128)
         return_logprobs: bool = False
+
+    class MetricsRequest(BaseModel):
+        enabled: bool
+
+    def begin_request() -> None:
+        # These async handlers share one event loop. No await occurs between
+        # checking the transition and reserving this request.
+        if app.state.metrics_transition:
+            raise HTTPException(status_code=503, detail="Pool metrics are changing")
+        app.state.active_requests += 1
+
+    def end_request() -> None:
+        app.state.active_requests -= 1
 
     @app.get("/health")
     async def health() -> dict:
@@ -114,6 +130,26 @@ def create_app(
             "workers": await app.state.engine.collective_rpc("pool_status"),
         }
 
+    @app.post("/pool/metrics")
+    async def pool_metrics(request: MetricsRequest) -> dict:
+        """Reset and enable (or disable) A-side aggregates between trials."""
+        if native_reference:
+            raise HTTPException(
+                status_code=400, detail="Pool metrics require a pooled A service"
+            )
+        if app.state.active_requests or app.state.metrics_transition:
+            raise HTTPException(
+                status_code=409, detail="Drain requests before changing Pool metrics"
+            )
+        app.state.metrics_transition = True
+        try:
+            await app.state.engine.collective_rpc(
+                "pool_set_metrics", args=(request.enabled,)
+            )
+        finally:
+            app.state.metrics_transition = False
+        return {"client_id": client_id, "enabled": request.enabled}
+
     @app.post("/generate")
     async def generate(request: GenerateRequest) -> dict:
         params = SamplingParams(
@@ -123,25 +159,29 @@ def create_app(
             output_kind=RequestOutputKind.FINAL_ONLY,
             logprobs=1 if request.return_logprobs else None,
         )
-        final = None
-        async for result in app.state.engine.generate(
-            request.prompt, params, uuid.uuid4().hex
-        ):
-            final = result
-        if final is None or not final.finished:
-            raise RuntimeError("The A engine did not finish inference")
-        output = final.outputs[0]
-        response = {
-            "client_id": client_id,
-            "token_ids": list(output.token_ids),
-            "text": output.text,
-        }
-        if request.return_logprobs:
-            response["token_logprobs"] = [
-                step[token].logprob
-                for token, step in zip(output.token_ids, output.logprobs, strict=True)
-            ]
-        return response
+        begin_request()
+        try:
+            final = None
+            async for result in app.state.engine.generate(
+                request.prompt, params, uuid.uuid4().hex
+            ):
+                final = result
+            if final is None or not final.finished:
+                raise RuntimeError("The A engine did not finish inference")
+            output = final.outputs[0]
+            response = {
+                "client_id": client_id,
+                "token_ids": list(output.token_ids),
+                "text": output.text,
+            }
+            if request.return_logprobs:
+                response["token_logprobs"] = [
+                    step[token].logprob
+                    for token, step in zip(output.token_ids, output.logprobs, strict=True)
+                ]
+            return response
+        finally:
+            end_request()
 
     @app.post("/generate-stream")
     async def generate_stream(request: GenerateRequest) -> StreamingResponse:
@@ -153,25 +193,40 @@ def create_app(
             detokenize=False,
             output_kind=RequestOutputKind.DELTA,
         )
+        begin_request()
+        released = False
+
+        async def release_request() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                end_request()
 
         async def chunks():
-            finished = False
-            async for result in app.state.engine.generate(
-                request.prompt, params, uuid.uuid4().hex
-            ):
-                token_ids = list(result.outputs[0].token_ids)
-                if token_ids or result.finished:
-                    yield (
-                        json.dumps(
-                            {"token_ids": token_ids, "finished": result.finished}
-                        )
-                        + "\n"
-                    ).encode()
-                finished = result.finished
-            if not finished:
-                raise RuntimeError("The A engine did not finish inference")
+            try:
+                finished = False
+                async for result in app.state.engine.generate(
+                    request.prompt, params, uuid.uuid4().hex
+                ):
+                    token_ids = list(result.outputs[0].token_ids)
+                    if token_ids or result.finished:
+                        yield (
+                            json.dumps(
+                                {"token_ids": token_ids, "finished": result.finished}
+                            )
+                            + "\n"
+                        ).encode()
+                    finished = result.finished
+                if not finished:
+                    raise RuntimeError("The A engine did not finish inference")
+            finally:
+                await release_request()
 
-        return StreamingResponse(chunks(), media_type="application/x-ndjson")
+        return StreamingResponse(
+            chunks(),
+            media_type="application/x-ndjson",
+            background=BackgroundTask(release_request),
+        )
 
     return app
 

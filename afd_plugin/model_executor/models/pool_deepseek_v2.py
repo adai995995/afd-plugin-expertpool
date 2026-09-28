@@ -8,6 +8,7 @@ constructs a local FusedMoE or allocates routed expert weights, even transiently
 """
 
 import os
+import time
 from collections.abc import Iterable
 from importlib.metadata import version
 from pathlib import Path
@@ -40,6 +41,7 @@ from vllm.model_executor.models.deepseek_v2 import (
 from afd_plugin.expert_pool.checkpoint import DeepseekCheckpoint
 from afd_plugin.expert_pool.client import PoolClient
 from afd_plugin.expert_pool.deployment import PoolDeployment
+from afd_plugin.expert_pool.metrics import CallMetrics
 from afd_plugin.expert_pool.replica_client import ReplicaPoolClient
 
 
@@ -101,6 +103,9 @@ class PoolRemoteMoE(nn.Module):
         self.client: PoolClient | ReplicaPoolClient | None = None
         self.completed_calls = 0
         self.token_rows = 0
+        self.router_metrics: CallMetrics | None = None
+        self.router_timing_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+        self.router_gpu_unready = 0
         self.gate = GateLinear(
             config.hidden_size,
             config.n_routed_experts,
@@ -135,16 +140,47 @@ class PoolRemoteMoE(nn.Module):
             raise RuntimeError("Bind PoolClient before native profiling or inference")
         if hidden_states.shape[0] == 0:
             return torch.empty_like(hidden_states)
+        timing_events = self.router_timing_events
+        if timing_events is not None:
+            router_submit_started = time.perf_counter_ns()
+            timing_events[0].record(torch.cuda.current_stream(hidden_states.device))
         router_logits, _ = self.gate(hidden_states)
         weights, ids = self.router.select_experts(
             hidden_states, router_logits, topk_indices_dtype=torch.int32
         )
+        if timing_events is not None:
+            timing_events[1].record(torch.cuda.current_stream(hidden_states.device))
+            router_submit_ms = (time.perf_counter_ns() - router_submit_started) / 1e6
         routed, _ = self.client.execute(self.layer_id, hidden_states, weights, ids)
+        if timing_events is not None:
+            router_metrics = {"router_gate_select_submit_ms": router_submit_ms}
+            if timing_events[1].query():
+                router_gpu_ms = timing_events[0].elapsed_time(timing_events[1])
+                router_metrics["router_gate_select_gpu_ms"] = router_gpu_ms
+            else:
+                # Do not synchronize solely to read optional profiling events.
+                self.router_gpu_unready += 1
+            assert self.router_metrics is not None
+            self.router_metrics.record(
+                self.layer_id, hidden_states.shape[0], router_metrics
+            )
         self.completed_calls += 1
         self.token_rows += hidden_states.shape[0]
         if self.shared_experts is not None:
             return routed + self.shared_experts(hidden_states)
         return routed
+
+    def set_router_metrics(self, enabled: bool) -> None:
+        """Reset optional Router timings only between drained inference trials."""
+        self.router_metrics = CallMetrics() if enabled else None
+        if enabled:
+            self.router_timing_events = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+        else:
+            self.router_timing_events = None
+        self.router_gpu_unready = 0
 
 
 class PoolDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
@@ -367,6 +403,11 @@ class PoolDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
                 raise RuntimeError("Pool client is already bound")
             layer.client = client
 
+    def set_router_metrics(self, enabled: bool) -> None:
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, PoolRemoteMoE):
+                layer.mlp.set_router_metrics(enabled)
+
     def pool_status(self) -> dict:
         return {
             "routed_parameter_bytes": sum(
@@ -381,6 +422,12 @@ class PoolDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
                 str(layer.layer_idx): {
                     "calls": layer.mlp.completed_calls,
                     "token_rows": layer.mlp.token_rows,
+                    "router_metrics": (
+                        layer.mlp.router_metrics.snapshot()
+                        if layer.mlp.router_metrics is not None
+                        else None
+                    ),
+                    "router_gpu_unready": layer.mlp.router_gpu_unready,
                 }
                 for layer in self.model.layers
                 if isinstance(layer.mlp, PoolRemoteMoE)

@@ -178,7 +178,11 @@ class PoolAttentionWorker(Worker):
         """Reset scalar aggregates after warmup and before submitting requests."""
         if self.pool_client is None:
             raise RuntimeError("Pool client was not connected")
+        model = self.model_runner.get_model()
+        if not isinstance(model, PoolDeepseekV2ForCausalLM):
+            raise RuntimeError("Pool model was not loaded")
         self.pool_client.set_metrics(enabled)
+        model.set_router_metrics(enabled)
 
     def close_pool(self) -> None:
         """Call after draining requests, before terminating the native engine."""

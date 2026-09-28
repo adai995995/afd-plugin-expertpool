@@ -37,6 +37,102 @@ PROMPT_FILL = "Give a concrete example and explain the reasoning in plain langua
 START_DELAY_NS = 1_000_000_000
 
 
+def pool_control(endpoint: str, action: str, timeout_s: float) -> dict:
+    """Use HTTP only outside the timed request window; omit URLs from errors."""
+    if action == "status":
+        request = Request(endpoint + "/pool/status", method="GET")
+    else:
+        request = Request(
+            endpoint + "/pool/metrics",
+            data=json.dumps({"enabled": action == "enable"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+    try:
+        with urlopen(request, timeout=timeout_s) as response:
+            if response.status != 200:
+                raise RuntimeError("Unexpected HTTP status")
+            result = json.load(response)
+    except Exception as exception:
+        raise RuntimeError(
+            f"Pool metrics {action} failed ({type(exception).__name__})"
+        ) from None
+    if not isinstance(result, dict):
+        raise RuntimeError(f"Pool metrics {action} returned an invalid response")
+    return result
+
+
+def compact_pool_status(status: dict) -> list[dict]:
+    """Keep timing and small dispatch counters, not full deployment status."""
+    workers = status.get("workers")
+    if status.get("native_reference") or not isinstance(workers, list) or not workers:
+        raise RuntimeError("Pool metrics require a pooled A service")
+    result = []
+    for worker_index, worker in enumerate(workers):
+        if not isinstance(worker, dict) or not isinstance(
+            worker.get("call_metrics"), dict
+        ):
+            raise RuntimeError("Pooled A worker metrics were not enabled")
+        dispatch = worker.get("dispatch")
+        if not isinstance(dispatch, dict):
+            raise RuntimeError("Pooled A worker dispatch status is unavailable")
+        dispatch_workers = dispatch.get("workers", {})
+        if not isinstance(dispatch_workers, dict):
+            raise RuntimeError("Pooled A dispatch worker status is invalid")
+        small_dispatch = {
+            name: dispatch[name]
+            for name in (
+                "policy",
+                "direct_dispatch",
+                "packed_input",
+                "input_transfer",
+                "output_transfer",
+                "packed_tasks",
+                "dense_tasks",
+                "controller_roundtrips",
+            )
+            if name in dispatch
+        }
+        small_dispatch["workers"] = [
+            {
+                "worker_index": index,
+                "calls": details.get("calls"),
+                "call_metrics": details.get("call_metrics"),
+                **(
+                    {"output_transfer": details["output_transfer"]}
+                    if "output_transfer" in details
+                    else {}
+                ),
+            }
+            for index, (_, details) in enumerate(sorted(dispatch_workers.items()))
+        ]
+        small_worker = {
+            "worker_index": worker_index,
+            "call_metrics": worker["call_metrics"],
+            "dispatch": small_dispatch,
+        }
+        layers = worker.get("layers", {})
+        if not isinstance(layers, dict):
+            raise RuntimeError("Pooled A router layer status is invalid")
+        small_worker["router_layers"] = [
+            {
+                "layer_id": layer_id,
+                "router_metrics": details["router_metrics"],
+                **(
+                    {"router_gpu_unready": details["router_gpu_unready"]}
+                    if "router_gpu_unready" in details
+                    else {}
+                ),
+            }
+            for layer_id, details in sorted(
+                layers.items(), key=lambda item: int(item[0])
+            )
+            if isinstance(details, dict) and "router_metrics" in details
+        ]
+        result.append(small_worker)
+    return result
+
+
 def fetch(
     endpoint: str,
     prompt: str,
@@ -144,7 +240,10 @@ async def run(args: argparse.Namespace, services: dict[int, list[str]]) -> dict:
                     if record["status"] != "completed":
                         raise RuntimeError("Service warmup failed")
 
-    start_ns = time.perf_counter_ns() + START_DELAY_NS
+    collect_metrics = getattr(args, "collect_pool_metrics", False)
+    if not collect_metrics:
+        # Keep the original scheduling anchor in the default benchmark mode.
+        start_ns = time.perf_counter_ns() + START_DELAY_NS
     trace = []
     for domain, endpoints in services.items():
         offsets = arrival_offsets(
@@ -189,7 +288,50 @@ async def run(args: argparse.Namespace, services: dict[int, list[str]]) -> dict:
             length_class=item["length_class"],
         )
 
-    records = await asyncio.gather(*(scheduled(item) for item in trace))
+    service_keys = [
+        (domain, replica, endpoint)
+        for domain, endpoints in services.items()
+        for replica, endpoint in enumerate(endpoints)
+    ]
+    enabled_endpoints: list[str] = []
+    metrics_before: list[list[dict]] = []
+    metrics_after: list[list[dict]] = []
+    try:
+        if collect_metrics:
+            # Enable once per unique A service, after both warmup shapes have
+            # completed. Status reads are outside the timed request window.
+            for endpoint in dict.fromkeys(endpoint for _, _, endpoint in service_keys):
+                await asyncio.to_thread(pool_control, endpoint, "enable", args.timeout)
+                enabled_endpoints.append(endpoint)
+            for _, _, endpoint in service_keys:
+                status = await asyncio.to_thread(
+                    pool_control, endpoint, "status", args.timeout
+                )
+                metrics_before.append(compact_pool_status(status))
+
+        if collect_metrics:
+            start_ns = time.perf_counter_ns() + START_DELAY_NS
+        records = await asyncio.gather(*(scheduled(item) for item in trace))
+
+        if collect_metrics:
+            for _, _, endpoint in service_keys:
+                status = await asyncio.to_thread(
+                    pool_control, endpoint, "status", args.timeout
+                )
+                metrics_after.append(compact_pool_status(status))
+    finally:
+        # Always turn off the optional critical-path instrumentation, even if
+        # a generation request or status read fails.
+        disable_errors = await asyncio.gather(
+            *(
+                asyncio.to_thread(pool_control, endpoint, "disable", args.timeout)
+                for endpoint in reversed(enabled_endpoints)
+            ),
+            return_exceptions=True,
+        )
+        if any(isinstance(error, BaseException) for error in disable_errors):
+            raise RuntimeError("Could not disable Pool metrics on every service")
+
     window = (start_ns, max(record["finished_ns"] for record in records))
     slos = {
         domain: (args.ttft_slo_ms[domain], args.tpot_slo_ms[domain])
@@ -199,7 +341,7 @@ async def run(args: argparse.Namespace, services: dict[int, list[str]]) -> dict:
         (item["domain"], item["index"], item["offset_ns"], item["prompt"])
         for item in trace
     ]
-    return {
+    result = {
         "kind": "expert-pool-http-open-loop-v1",
         "trace_sha256": hashlib.sha256(
             json.dumps(trace_identity, separators=(",", ":")).encode()
@@ -227,6 +369,22 @@ async def run(args: argparse.Namespace, services: dict[int, list[str]]) -> dict:
         },
         "records": records,
     }
+    if collect_metrics:
+        result["pool_metrics"] = {
+            "services": [
+                {
+                    "domain": domain,
+                    "replica": replica,
+                    "before": before,
+                    "after": after,
+                }
+                for (domain, replica, _), before, after in zip(
+                    service_keys, metrics_before, metrics_after, strict=True
+                )
+            ]
+        }
+        result["configuration"]["collect_pool_metrics"] = True
+    return result
 
 
 def main() -> None:
@@ -242,6 +400,11 @@ def main() -> None:
     parser.add_argument("--short-repeats", type=int, default=6)
     parser.add_argument("--long-repeats", type=int, default=18)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument(
+        "--collect-pool-metrics",
+        action="store_true",
+        help="Reset and collect pooled A worker timings for only the measured trace",
+    )
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--ttft-slo-ms", type=float, nargs=2, required=True)
     parser.add_argument("--tpot-slo-ms", type=float, nargs=2, required=True)

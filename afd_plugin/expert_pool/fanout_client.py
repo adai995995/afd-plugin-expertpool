@@ -73,6 +73,7 @@ class FanoutPoolClient(ControlledPoolClient):
             raise ValueError("Expert replicas require compact multi-slot execution")
         self.last_dispatch = None
         self.input_pack_ms = 0.0
+        self._admission_phase_ns: tuple[int, int, int] = (0, 0, 0)
         self.output_routes: dict[str, torch.Tensor] = {}
         self.worker_expert_assignments = {
             worker.worker_id: {
@@ -185,8 +186,12 @@ class FanoutPoolClient(ControlledPoolClient):
         dict[str, Message],
         dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     ]:
+        dispatch_wait_ns = 0
+        route_mapping_ns = 0
         if self.directory.expert_replicated:
+            dispatch_started = time.perf_counter_ns()
             announcement = receive_message(self.control, self.timeout_s)
+            dispatch_wait_ns = time.perf_counter_ns() - dispatch_started
             if (
                 announcement.kind != "dispatch"
                 or announcement.dispatch is None
@@ -203,13 +208,19 @@ class FanoutPoolClient(ControlledPoolClient):
             dispatch_plan=dispatch_plan,
             receive_slots=self.receive_slots,
         )
+        grants_started = time.perf_counter_ns()
         grants = {
             owner: self._fanout_reply(replies, "grant", owner) for owner in owners
         }
+        grant_wait_ns = time.perf_counter_ns() - grants_started
         if dispatch_plan is not None and any(
             task.assignment_slices for task in dispatch_plan.tasks
         ):
+            route_started = time.perf_counter_ns()
             routes = route_ids_by_worker(inputs[2], dispatch_plan)
+            # This is host submission time; measuring GPU completion here
+            # would synchronize the A stream in the inference hot path.
+            route_mapping_ns = time.perf_counter_ns() - route_started
             self.output_routes = routes
             owner_inputs = {
                 owner: (inputs[0], inputs[1], routes[owner]) for owner in owners
@@ -217,6 +228,11 @@ class FanoutPoolClient(ControlledPoolClient):
         else:
             self.output_routes = {}
             owner_inputs = dict.fromkeys(owners, inputs)
+        self._admission_phase_ns = (
+            dispatch_wait_ns,
+            grant_wait_ns,
+            route_mapping_ns,
+        )
         return owners, replies, grants, owner_inputs
 
     @torch.inference_mode()
@@ -280,14 +296,28 @@ class FanoutPoolClient(ControlledPoolClient):
                     **demand_metrics,
                     "client_validation_ms": (started - validation_started) / 1e6,
                     "client_admission_wait_ms": (finished - submitted) / 1e6,
+                    "client_admission_dispatch_wait_ms": 0.0,
+                    "client_admission_grant_wait_ms": 0.0,
+                    "client_admission_route_mapping_submit_ms": 0.0,
+                    "client_admission_residual_ms": (finished - submitted) / 1e6,
                     "client_host_roundtrip_ms": (finished - started) / 1e6,
                 }
+                empty_output = torch.empty_like(hidden_states)
+                accounting_finished = time.perf_counter_ns()
+                metrics["client_post_completion_accounting_ms"] = (
+                    accounting_finished - finished
+                ) / 1e6
+                metrics["client_call_total_host_ms"] = (
+                    accounting_finished - validation_started
+                ) / 1e6
                 if self.metrics is not None:
                     self.metrics.record(layer_id, 0, metrics)
-                return torch.empty_like(hidden_states), Message(
+                return empty_output, Message(
                     "empty_done", request=request, metrics=metrics
                 )
             self.input_pack_ms = 0.0
+            # Direct dispatch overrides _admit and has no Controller wait.
+            self._admission_phase_ns = (0, 0, 0)
             owners, replies, grants, owner_inputs = self._admit(
                 request, dispatch_plan, owners, (hidden_states, topk_weights, topk_ids)
             )
@@ -362,10 +392,23 @@ class FanoutPoolClient(ControlledPoolClient):
                 ops.moe_sum(slots, output)
             completions = self._finish_replies(replies, owners)
             finished = time.perf_counter_ns()
+            dispatch_wait_ns, grant_wait_ns, route_mapping_ns = (
+                self._admission_phase_ns
+            )
+            admission_ns = granted - submitted
             metrics = {
                 **demand_metrics,
                 "client_validation_ms": (started - validation_started) / 1e6,
-                "client_admission_wait_ms": (granted - submitted) / 1e6,
+                "client_admission_wait_ms": admission_ns / 1e6,
+                "client_admission_dispatch_wait_ms": dispatch_wait_ns / 1e6,
+                "client_admission_grant_wait_ms": grant_wait_ns / 1e6,
+                "client_admission_route_mapping_submit_ms": route_mapping_ns / 1e6,
+                # Includes submit, dispatch validation, reply bookkeeping,
+                # and local plan construction not covered by the three phases.
+                "client_admission_residual_ms": (
+                    admission_ns - dispatch_wait_ns - grant_wait_ns - route_mapping_ns
+                )
+                / 1e6,
                 "client_input_transfer_wall_ms": (inputs_sent - granted) / 1e6,
                 "client_input_pack_host_ms": self.input_pack_ms,
                 "client_output_ready_wait_ms": ready_wait_ns / 1e6,
@@ -408,13 +451,20 @@ class FanoutPoolClient(ControlledPoolClient):
                         request.num_tokens,
                         {**grants[owner].metrics, **completions[owner].metrics},
                     )
-            if self.metrics is not None:
-                self.metrics.record(layer_id, request.num_tokens, metrics)
             self.parent_layer_calls[layer_id] += 1
             if request.demand is not None:
                 counts = self.expert_assignments[layer_id]
                 for expert, assignments in enumerate(request.demand.counts):
                     counts[expert] += assignments
+            accounting_finished = time.perf_counter_ns()
+            metrics["client_post_completion_accounting_ms"] = (
+                accounting_finished - finished
+            ) / 1e6
+            metrics["client_call_total_host_ms"] = (
+                accounting_finished - validation_started
+            ) / 1e6
+            if self.metrics is not None:
+                self.metrics.record(layer_id, request.num_tokens, metrics)
             # The public return represents the parent; its representative
             # child plan is metadata only, never a buffer-release authority.
             return output, Message(
