@@ -9,6 +9,7 @@ its purpose is to prove two independent vLLM engines share resident Experts.
 """
 
 import argparse
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -27,6 +28,7 @@ def create_app(
 ):
     # Runtime imports follow CUDA_VISIBLE_DEVICES selection in main().
     from fastapi import FastAPI
+    from fastapi.responses import StreamingResponse
     from pydantic import BaseModel, Field
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
@@ -140,6 +142,36 @@ def create_app(
                 for token, step in zip(output.token_ids, output.logprobs, strict=True)
             ]
         return response
+
+    @app.post("/generate-stream")
+    async def generate_stream(request: GenerateRequest) -> StreamingResponse:
+        """Stream token deltas so a remote driver can measure delivered TTFT."""
+        params = SamplingParams(
+            temperature=0,
+            max_tokens=request.max_tokens,
+            ignore_eos=True,
+            detokenize=False,
+            output_kind=RequestOutputKind.DELTA,
+        )
+
+        async def chunks():
+            finished = False
+            async for result in app.state.engine.generate(
+                request.prompt, params, uuid.uuid4().hex
+            ):
+                token_ids = list(result.outputs[0].token_ids)
+                if token_ids or result.finished:
+                    yield (
+                        json.dumps(
+                            {"token_ids": token_ids, "finished": result.finished}
+                        )
+                        + "\n"
+                    ).encode()
+                finished = result.finished
+            if not finished:
+                raise RuntimeError("The A engine did not finish inference")
+
+        return StreamingResponse(chunks(), media_type="application/x-ndjson")
 
     return app
 
