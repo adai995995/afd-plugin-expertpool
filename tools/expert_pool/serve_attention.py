@@ -25,6 +25,7 @@ def create_app(
     max_model_len: int = 1024,
     kv_cache_bytes: int = 256 * 1024 * 1024,
     native_reference: bool = False,
+    enable_diagnostics: bool = False,
 ):
     # Runtime imports follow CUDA_VISIBLE_DEVICES selection in main().
     from fastapi import FastAPI, HTTPException
@@ -66,6 +67,12 @@ def create_app(
                 },
             }
         )
+        if enable_diagnostics:
+            pool_options["worker_cls"] = (
+                "tools.expert_pool.diagnostic_worker.DiagnosticNativeWorker"
+                if native_reference
+                else "tools.expert_pool.diagnostic_worker.DiagnosticPoolWorker"
+            )
         engine = AsyncLLM.from_engine_args(
             AsyncEngineArgs(
                 model=deployment.model,
@@ -98,11 +105,27 @@ def create_app(
     app = FastAPI(lifespan=lifespan)
     app.state.active_requests = 0
     app.state.metrics_transition = False
+    app.state.diagnostic_transition = False
 
     class GenerateRequest(BaseModel):
         prompt: str = Field(min_length=1)
         max_tokens: int = Field(default=16, ge=1, le=128)
         return_logprobs: bool = False
+
+    class PrefixRequest(BaseModel):
+        token_ids: list[int] = Field(min_length=1)
+        capture_moe: bool = False
+
+    def top_logprobs(output) -> list[list[dict]]:
+        return [
+            [
+                {"token_id": token, "logprob": item.logprob, "rank": item.rank}
+                for token, item in sorted(
+                    step.items(), key=lambda pair: -pair[1].logprob
+                )
+            ]
+            for step in output.logprobs
+        ]
 
     class MetricsRequest(BaseModel):
         enabled: bool
@@ -110,8 +133,10 @@ def create_app(
     def begin_request() -> None:
         # These async handlers share one event loop. No await occurs between
         # checking the transition and reserving this request.
-        if app.state.metrics_transition:
-            raise HTTPException(status_code=503, detail="Pool metrics are changing")
+        if app.state.metrics_transition or app.state.diagnostic_transition:
+            raise HTTPException(
+                status_code=503, detail="Service instrumentation is changing"
+            )
         app.state.active_requests += 1
 
     def end_request() -> None:
@@ -192,12 +217,17 @@ def create_app(
     @app.post("/generate-stream")
     async def generate_stream(request: GenerateRequest) -> StreamingResponse:
         """Stream token deltas so a remote driver can measure delivered TTFT."""
+        if request.return_logprobs and not enable_diagnostics:
+            raise HTTPException(
+                status_code=400, detail="Enable diagnostic mode for streamed logprobs"
+            )
         params = SamplingParams(
             temperature=0,
             max_tokens=request.max_tokens,
             ignore_eos=True,
             detokenize=False,
             output_kind=RequestOutputKind.DELTA,
+            logprobs=2 if request.return_logprobs else None,
         )
         begin_request()
         released = False
@@ -216,12 +246,10 @@ def create_app(
                 ):
                     token_ids = list(result.outputs[0].token_ids)
                     if token_ids or result.finished:
-                        yield (
-                            json.dumps(
-                                {"token_ids": token_ids, "finished": result.finished}
-                            )
-                            + "\n"
-                        ).encode()
+                        part = {"token_ids": token_ids, "finished": result.finished}
+                        if token_ids and request.return_logprobs:
+                            part["top_logprobs"] = top_logprobs(result.outputs[0])
+                        yield (json.dumps(part) + "\n").encode()
                     finished = result.finished
                 if not finished:
                     raise RuntimeError("The A engine did not finish inference")
@@ -234,6 +262,61 @@ def create_app(
             background=BackgroundTask(release_request),
         )
 
+    @app.post("/diagnostics/prefix")
+    async def diagnose_prefix(request: PrefixRequest) -> dict:
+        """Recompute one next-token distribution for an identical forced prefix.
+
+        This endpoint is unavailable in the normal service. It must run with
+        drained requests: its result is an isolated numerical comparison, not
+        the original pressure-time logits or a performance measurement.
+        """
+        if not enable_diagnostics:
+            raise HTTPException(status_code=404, detail="Diagnostics are disabled")
+        if app.state.active_requests:
+            raise HTTPException(
+                status_code=409, detail="Drain requests before a prefix probe"
+            )
+        if len(request.token_ids) >= max_model_len or any(
+            token < 0 for token in request.token_ids
+        ):
+            raise HTTPException(status_code=400, detail="Invalid forced prefix")
+        begin_request()
+        app.state.diagnostic_transition = True
+        probe_started = False
+        try:
+            if request.capture_moe:
+                await app.state.engine.collective_rpc("begin_moe_probe")
+                probe_started = True
+            params = SamplingParams(
+                temperature=0, max_tokens=1, ignore_eos=True, logprobs=2
+            )
+            final = None
+            async for result in app.state.engine.generate(
+                {"prompt_token_ids": request.token_ids}, params, uuid.uuid4().hex
+            ):
+                final = result
+            if final is None or not final.finished:
+                raise RuntimeError("Prefix probe did not finish")
+            response = {
+                "prompt_token_ids": final.prompt_token_ids,
+                "token_ids": list(final.outputs[0].token_ids),
+                "top_logprobs": top_logprobs(final.outputs[0]),
+                "scope": "isolated-identical-prefix",
+            }
+            if probe_started:
+                probe_started = False
+                response["moe_probe"] = await app.state.engine.collective_rpc(
+                    "end_moe_probe"
+                )
+            return response
+        finally:
+            try:
+                if probe_started:
+                    await app.state.engine.collective_rpc("end_moe_probe")
+            finally:
+                app.state.diagnostic_transition = False
+                end_request()
+
     return app
 
 
@@ -245,6 +328,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--native-reference", action="store_true")
+    parser.add_argument("--enable-diagnostics", action="store_true")
     args = parser.parse_args()
     if args.gpu < 0 or not 1 <= args.port <= 65535:
         parser.error("GPU index and HTTP port must be valid")
@@ -256,7 +340,10 @@ def main() -> None:
 
     uvicorn.run(
         create_app(
-            args.deployment, args.client_id, native_reference=args.native_reference
+            args.deployment,
+            args.client_id,
+            native_reference=args.native_reference,
+            enable_diagnostics=args.enable_diagnostics,
         ),
         host=args.host,
         port=args.port,

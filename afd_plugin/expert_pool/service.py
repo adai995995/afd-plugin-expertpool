@@ -28,6 +28,9 @@ def serve(
     profile_dir: Path | None = None,
     profile_skip_calls: int = 512,
     profile_calls: int = 208,
+    batch_capture_dir: Path | None = None,
+    batch_capture_skip_calls: int = 4096,
+    batch_capture_batches: int = 128,
 ) -> dict:
     # Keep module imports CPU-only so launchers can select the visible device
     # before importing Torch/vLLM in each spawned process.
@@ -43,6 +46,7 @@ def serve(
     from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
     from afd_plugin.connectors.gpu.pool import PoolTransport
+    from afd_plugin.expert_pool.batch_capture import BatchInputCapture
     from afd_plugin.expert_pool.checkpoint import DeepseekCheckpoint
     from afd_plugin.expert_pool.executor import ExpertExecutor
     from afd_plugin.expert_pool.profiling import WorkerProfiler
@@ -163,8 +167,19 @@ def serve(
                     batching=deployment.batching,
                     direct_dispatch=deployment.direct_dispatch,
                     packed_input=deployment.packed_input,
+                    batch_capture=(
+                        BatchInputCapture(
+                            batch_capture_dir,
+                            batch_capture_skip_calls,
+                            batch_capture_batches,
+                        )
+                        if batch_capture_dir is not None
+                        else None
+                    ),
                 )
                 worker.run()
+                if worker.batch_capture is not None:
+                    worker.batch_capture.close()
                 return {
                     "worker_id": directory.worker_id,
                     "placement_version": directory.version,
@@ -208,10 +223,23 @@ def main() -> None:
     parser.add_argument(
         "--worker-id", help="Required when the deployment has multiple E workers"
     )
+    parser.add_argument(
+        "--batch-capture-dir",
+        type=Path,
+        help="Diagnostic only: fresh private directory for real E input tensors",
+    )
+    parser.add_argument("--batch-capture-skip-calls", type=int, default=4096)
+    parser.add_argument("--batch-capture-batches", type=int, default=128)
     args = parser.parse_args()
     print(
         json.dumps(
-            serve(PoolDeployment.read(args.deployment), worker_id=args.worker_id)
+            serve(
+                PoolDeployment.read(args.deployment),
+                worker_id=args.worker_id,
+                batch_capture_dir=args.batch_capture_dir,
+                batch_capture_skip_calls=args.batch_capture_skip_calls,
+                batch_capture_batches=args.batch_capture_batches,
+            )
         ),
         flush=True,
     )

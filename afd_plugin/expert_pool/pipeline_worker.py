@@ -401,6 +401,10 @@ class WorkerPipeline:
                     ):
                         dest[offset:end].copy_(source[: end - offset])
                     offset = end
+            if self.worker.batch_capture is not None:
+                self.worker.batch_capture.capture(
+                    self.worker.completed_calls, plans, inputs
+                )
             self.compute_begin.record()
             layer = plans[0].request.layer_id
             assignment_mask = None

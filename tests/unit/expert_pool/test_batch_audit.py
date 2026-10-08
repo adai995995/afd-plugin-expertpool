@@ -61,3 +61,23 @@ class BatchAuditTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             audit.record_batch(group(first), (second,))
         self.assertEqual(audit.observed, 0)
+
+    def test_ready_timeline_and_physical_cost_follow_the_right_member(self):
+        first, second = ready_call(0).plan, ready_call(1).plan
+        audit = BatchAudit()
+        audit.record_batch(group(first, second), (first, second))
+        audit.record_ready_timing(first, 10, 20, 30)
+        audit.record_ready_timing(second, 11, 25, 30)
+        with self.assertRaises(ValueError):
+            audit.record_ready_timing(first, 10, 31, 30)
+        metrics = {"compute_phase_cost_gpu_ms": 2.0}
+        audit.record_done(second, {"compute_phase_cost_gpu_ms": 0.0})
+        audit.record_done(first, metrics)
+        metrics["compute_phase_cost_gpu_ms"] = 0.0
+        members = audit.records[0]["members"]
+        self.assertEqual(members[0]["input_ready_ns"], 20)
+        self.assertEqual(members[1]["input_ready_ns"], 25)
+        self.assertEqual(
+            sum(m["metrics"]["compute_phase_cost_gpu_ms"] for m in members), 2.0
+        )
+        self.assertFalse(audit.pending)

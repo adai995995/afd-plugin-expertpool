@@ -64,6 +64,13 @@ class LocalWorkerPipeline(WorkerPipeline):
                     tuple(BatchSlot.from_plan(plan) for plan in plans),
                 )
                 self.audit.record_batch(batch, plans)
+                for slot in self.computing:
+                    self.audit.record_ready_timing(
+                        slot.plan,
+                        slot.started_ns,
+                        slot.ready_ns,
+                        slot.compute_submitted_ns,
+                    )
             return
         if message.kind not in {"grant", "output_ready", "done"}:
             return
@@ -73,7 +80,7 @@ class LocalWorkerPipeline(WorkerPipeline):
             # this point would corrupt a different A's pending receive.
             self.book.complete(message.plan)
             if self.audit is not None:
-                self.audit.record_done(message.plan)
+                self.audit.record_done(message.plan, message.metrics)
         peer = self.worker.peers[message.plan.request.key.client_id]
         send_message(peer.control, message)
 

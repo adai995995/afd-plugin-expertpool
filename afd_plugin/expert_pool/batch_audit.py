@@ -11,7 +11,7 @@ from afd_plugin.expert_pool.protocol import BatchExecution, BatchSlot, Execution
 
 DEFAULT_AUDIT_RECORDS = 8192
 MAX_AUDIT_RECORDS = 65536
-AUDIT_VERSION = 2
+AUDIT_VERSION = 3
 
 
 class BatchAudit:
@@ -89,10 +89,36 @@ class BatchAudit:
             }
         )
 
-    def record_done(self, plan: ExecutionPlan) -> None:
+    def record_ready_timing(
+        self,
+        plan: ExecutionPlan,
+        admitted_ns: int,
+        ready_ns: int,
+        compute_submitted_ns: int,
+    ) -> None:
+        """All timestamps use this E's host clock, observed after CUDA readiness.
+
+        These are dependency-aware arrivals under the measured policy. An
+        offline regrouping is an opportunity estimate, not future online SLOs.
+        """
+        if not 0 <= admitted_ns <= ready_ns <= compute_submitted_ns:
+            raise ValueError("Execution cannot precede admission or input readiness")
+        member = self.pending.get(plan.plan_id)
+        if member is not None:
+            member.update(
+                admitted_ns=admitted_ns,
+                input_ready_ns=ready_ns,
+                compute_submitted_ns=compute_submitted_ns,
+            )
+
+    def record_done(
+        self, plan: ExecutionPlan, metrics: dict[str, float] | None = None
+    ) -> None:
         member = self.pending.pop(plan.plan_id, None)
         if member is not None:
             member["completed"] = True
+            if metrics is not None:
+                member["metrics"] = dict(metrics)
 
     def summary(self) -> dict:
         return {

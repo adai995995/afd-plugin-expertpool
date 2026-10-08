@@ -148,16 +148,22 @@ def fetch(
     replica: int,
     planned_ns: int,
     length_class: int,
+    capture_output_tokens: bool = False,
+    capture_logprobs: bool = False,
 ) -> dict:
     submitted_ns = time.perf_counter_ns()
     tokens: list[int] = []
+    probabilities: list[list[dict]] = []
     chunks: list[tuple[int, int]] = []
     finished = False
     status = "completed"
     error = None
     deadline_ns = planned_ns + round(timeout_s * 1e9)
     try:
-        payload = json.dumps({"prompt": prompt, "max_tokens": output_tokens}).encode()
+        body = {"prompt": prompt, "max_tokens": output_tokens}
+        if capture_logprobs:
+            body["return_logprobs"] = True
+        payload = json.dumps(body).encode()
         request = Request(
             endpoint + "/generate-stream",
             data=payload,
@@ -176,6 +182,11 @@ def fetch(
                 if delta:
                     chunks.append((received_ns, len(delta)))
                     tokens.extend(delta)
+                    if capture_logprobs:
+                        steps = part["top_logprobs"]
+                        if len(steps) != len(delta):
+                            raise RuntimeError("Missing diagnostic token probabilities")
+                        probabilities.extend(steps)
                 if part["finished"]:
                     finished = True
                     break
@@ -213,6 +224,12 @@ def fetch(
             tpot_ms=(chunks[-1][0] - chunks[0][0]) / 1e6 / (len(tokens) - 1),
             output_sha256=hashlib.sha256(json.dumps(tokens).encode()).hexdigest(),
         )
+    if capture_output_tokens or capture_logprobs:
+        # Retain partial sequences too. Hashes alone cannot locate a first
+        # divergence. These opt-in request artifacts must remain private.
+        record["token_ids"] = tokens
+    if capture_logprobs:
+        record["top_logprobs"] = probabilities
     return record
 
 
@@ -290,6 +307,8 @@ async def run(args: argparse.Namespace, services: dict[int, list[str]]) -> dict:
             replica=item["replica"],
             planned_ns=planned_ns,
             length_class=item["length_class"],
+            capture_output_tokens=getattr(args, "capture_output_tokens", False),
+            capture_logprobs=getattr(args, "capture_logprobs", False),
         )
 
     service_keys = [
@@ -388,6 +407,14 @@ async def run(args: argparse.Namespace, services: dict[int, list[str]]) -> dict:
             ]
         }
         result["configuration"]["collect_pool_metrics"] = True
+    if getattr(args, "capture_output_tokens", False) or getattr(
+        args, "capture_logprobs", False
+    ):
+        result["configuration"].update(
+            capture_output_tokens=True,
+            capture_logprobs=getattr(args, "capture_logprobs", False),
+            diagnostic_timing=bool(getattr(args, "capture_logprobs", False)),
+        )
     return result
 
 
@@ -404,6 +431,16 @@ def main() -> None:
     parser.add_argument("--short-repeats", type=int, default=6)
     parser.add_argument("--long-repeats", type=int, default=18)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument(
+        "--capture-output-tokens",
+        action="store_true",
+        help="Save full generated sequences in the private benchmark report",
+    )
+    parser.add_argument(
+        "--capture-logprobs",
+        action="store_true",
+        help="Diagnostic only: request top-two logprobs and retain output tokens",
+    )
     parser.add_argument(
         "--collect-pool-metrics",
         action="store_true",

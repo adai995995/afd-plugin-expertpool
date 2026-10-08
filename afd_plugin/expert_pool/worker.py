@@ -16,6 +16,7 @@ from multiprocessing.connection import Connection, wait
 import torch
 
 from afd_plugin.connectors.gpu.pool import PoolTransport
+from afd_plugin.expert_pool.batch_capture import BatchInputCapture
 from afd_plugin.expert_pool.batching import DISABLED_BATCHING, BatchingOptions
 from afd_plugin.expert_pool.compact_output import CompactOutputWorkspace
 from afd_plugin.expert_pool.controller import directory_digest
@@ -65,6 +66,7 @@ class ExpertWorker:
         expert_replicated: bool = False,
         direct_dispatch: bool = False,
         packed_input: bool = False,
+        batch_capture: BatchInputCapture | None = None,
     ) -> None:
         if not peers or len({peer.client_id for peer in peers}) != len(peers):
             raise ValueError("Worker requires unique client endpoints")
@@ -145,6 +147,9 @@ class ExpertWorker:
             and not compact_output
             and receive_slots > 1
         )
+        if batch_capture is not None and not self.local_full_pipeline:
+            raise ValueError("Real input capture currently requires local full E")
+        self.batch_capture = batch_capture
         if (
             type(receive_slots) is not int
             or not 1 <= receive_slots <= MAX_RECEIVE_SLOTS
