@@ -39,8 +39,12 @@ def create_app(
     from afd_plugin.expert_pool import register_expert_pool
 
     deployment = PoolDeployment.read(deployment_path)
-    if client_id not in deployment.client_ids or not deployment.pooled_admission:
-        raise ValueError("A service must belong to one pooled-admission deployment")
+    if client_id not in deployment.client_ids or not (
+        deployment.pooled_admission or deployment.local_full_pipeline
+    ):
+        raise ValueError(
+            "A service requires pooled admission or a local full E pipeline"
+        )
     if not native_reference:
         register_expert_pool()
 
@@ -177,7 +181,9 @@ def create_app(
             if request.return_logprobs:
                 response["token_logprobs"] = [
                     step[token].logprob
-                    for token, step in zip(output.token_ids, output.logprobs, strict=True)
+                    for token, step in zip(
+                        output.token_ids, output.logprobs, strict=True
+                    )
                 ]
             return response
         finally:

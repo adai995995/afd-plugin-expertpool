@@ -15,11 +15,12 @@ from afd_plugin.connectors.gpu.pool import PoolTransport
 from afd_plugin.expert_pool import register_expert_pool
 from afd_plugin.expert_pool.client import PoolClient
 from afd_plugin.expert_pool.controlled_client import ControlledPoolClient
+from afd_plugin.expert_pool.controller import directory_digest
 from afd_plugin.expert_pool.controller_service import connect_controller
 from afd_plugin.expert_pool.deployment import PoolDeployment
 from afd_plugin.expert_pool.direct_client import DirectFanoutPoolClient
 from afd_plugin.expert_pool.fanout_client import FanoutPoolClient
-from afd_plugin.expert_pool.protocol import enable_tcp_nodelay
+from afd_plugin.expert_pool.protocol import enable_tcp_nodelay, receive_message
 from afd_plugin.expert_pool.replica_client import ReplicaPoolClient
 from afd_plugin.model_executor.models.pool_deepseek_v2 import (
     PoolDeepseekV2ForCausalLM,
@@ -114,8 +115,21 @@ class PoolAttentionWorker(Worker):
                         transport,
                         deployment.timeout_s,
                         validate_values=deployment.execution.validate_client_values,
+                        receive_slots=deployment.receive_slots,
                     )
                 )
+            if deployment.local_full_pipeline:
+                for channel in channels:
+                    ready = receive_message(channel.control, deployment.timeout_s)
+                    if (
+                        ready.kind != "ready"
+                        or ready.detail != directory_digest(channel.directory)
+                        or ready.metrics.get("receive_slots")
+                        != deployment.receive_slots
+                    ):
+                        raise RuntimeError(
+                            "Full E startup directory or capacity mismatch"
+                        )
             if deployment.direct_dispatch:
                 client = DirectFanoutPoolClient(
                     tuple(channels),

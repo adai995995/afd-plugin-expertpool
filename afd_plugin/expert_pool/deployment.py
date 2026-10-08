@@ -39,6 +39,7 @@ class ExecutionOptions:
     defer_output_sync: bool = False
     warmup_before_ready: bool = False
     collect_cost_feedback: bool = False
+    audit_batch_members: bool = False
 
     def __post_init__(self) -> None:
         if any(type(value) is not bool for value in asdict(self).values()):
@@ -213,7 +214,7 @@ class PoolDeployment:
             or (
                 self.receive_slots > 1
                 and (
-                    not self.compact_output
+                    (not self.compact_output and not self.local_full_pipeline)
                     or self.execution.validate_worker_values
                     or not self.execution.defer_output_sync
                 )
@@ -229,6 +230,14 @@ class PoolDeployment:
         }:
             raise ValueError("Unknown expert dispatch mode")
         self.batching.validate_capacity(self.receive_slots, self.max_tokens)
+        if self.execution.audit_batch_members and not self.local_full_pipeline:
+            raise ValueError("Local batch audit requires a full E pipeline")
+        if self.local_full_pipeline and (
+            self.batching.max_wait_us or self.execution.collect_cost_feedback
+        ):
+            raise ValueError(
+                "Local full E requires zero wait and no demand cost feedback"
+            )
         if self.execution.collect_cost_feedback and self.receive_slots < 2:
             raise ValueError(
                 "Execution cost feedback requires compact multi-slot workers"
@@ -431,6 +440,16 @@ class PoolDeployment:
     @property
     def control_authkey(self) -> bytes | None:
         return bytes.fromhex(self.tcp_authkey) if self.tcp_authkey else None
+
+    @property
+    def local_full_pipeline(self) -> bool:
+        return (
+            self.dispatch_mode == "whole_layer"
+            and self.controller is None
+            and self.receive_slots > 1
+            and not self.demand_aware
+            and not self.compact_output
+        )
 
     @property
     def worker_ids(self) -> tuple[str, ...]:

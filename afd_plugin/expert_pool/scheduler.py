@@ -10,7 +10,12 @@ from collections import deque
 from dataclasses import dataclass
 
 from afd_plugin.expert_pool.placement import ExpertPlacement
-from afd_plugin.expert_pool.protocol import CallKey, CallRequest, ExecutionPlan
+from afd_plugin.expert_pool.protocol import (
+    MAX_RECEIVE_SLOTS,
+    CallKey,
+    CallRequest,
+    ExecutionPlan,
+)
 
 
 @dataclass(frozen=True)
@@ -140,22 +145,27 @@ class StaticScheduler:
     def grant(self) -> ExecutionPlan | None:
         if self.active is not None:
             return None
+        pending = self._take_pending()
+        if pending is None:
+            return None
+        self.generation += 1
+        self.active = ExecutionPlan(
+            pending.request,
+            self.directory.worker_id,
+            self.generation,
+            0,
+            self.generation,
+        )
+        self.active_enqueued_ns = pending.enqueued_ns
+        return self.active
+
+    def _take_pending(self) -> PendingCall | None:
         for _ in range(len(self.domains)):
             domain = self.domains[0]
             self.domains.rotate(-1)
             if not self.pending[domain]:
                 continue
-            pending = self.pending[domain].popleft()
-            self.generation += 1
-            self.active = ExecutionPlan(
-                pending.request,
-                self.directory.worker_id,
-                self.generation,
-                0,
-                self.generation,
-            )
-            self.active_enqueued_ns = pending.enqueued_ns
-            return self.active
+            return self.pending[domain].popleft()
         return None
 
     def complete(self, plan: ExecutionPlan) -> None:
@@ -175,3 +185,71 @@ class StaticScheduler:
             pending for pending in self.pending[domain] if pending.request.key != key
         )
         del self.outstanding[key.client_id]
+
+
+class LocalSlotScheduler(StaticScheduler):
+    """Full-E buffer admission, independent of the single GPU compute lane.
+
+    Slots have no permanent client owner. Only drained output sends may return
+    credit; generations are per slot and plan IDs are worker-wide.
+    """
+
+    def __init__(
+        self,
+        directory: StaticDirectory,
+        receive_slots: int,
+        max_pending_per_domain: int = 4,
+    ) -> None:
+        super().__init__(directory, max_pending_per_domain)
+        if (
+            type(receive_slots) is not int
+            or not 1 <= receive_slots <= MAX_RECEIVE_SLOTS
+        ):
+            raise ValueError("Invalid local receive capacity")
+        self.slot_generations = [0] * receive_slots
+        self.active_slots: dict[int, ExecutionPlan] = {}
+        self.enqueued_ns: dict[int, int] = {}
+
+    def submit(self, request: CallRequest, now_ns: int) -> None:
+        if request.demand is not None or request.compact_output:
+            raise ValueError("Local full E expects reduced whole-layer calls")
+        super().submit(request, now_ns)
+
+    def grant(self) -> ExecutionPlan | None:
+        slot_id = next(
+            (
+                index
+                for index in range(len(self.slot_generations))
+                if index not in self.active_slots
+            ),
+            None,
+        )
+        if slot_id is None:
+            return None
+        pending = self._take_pending()
+        if pending is None:
+            return None
+        self.generation += 1
+        self.slot_generations[slot_id] += 1
+        plan = ExecutionPlan(
+            pending.request,
+            self.directory.worker_id,
+            self.generation,
+            slot_id,
+            self.slot_generations[slot_id],
+        )
+        self.active_slots[slot_id] = plan
+        self.enqueued_ns[slot_id] = pending.enqueued_ns
+        return plan
+
+    def complete(self, plan: ExecutionPlan) -> None:
+        if self.active_slots.get(plan.slot_id) != plan:
+            raise ValueError("Stale, duplicate or mismatched completion")
+        del self.active_slots[plan.slot_id]
+        del self.enqueued_ns[plan.slot_id]
+        del self.outstanding[plan.request.key.client_id]
+
+    def cancel_queued(self, key: CallKey) -> None:
+        if any(plan.request.key == key for plan in self.active_slots.values()):
+            raise ValueError("In-flight GPU work must drain before cancellation")
+        super().cancel_queued(key)

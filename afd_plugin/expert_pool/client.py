@@ -11,6 +11,7 @@ import torch
 from afd_plugin.connectors.gpu.pool import PoolTransport
 from afd_plugin.expert_pool.metrics import CallMetrics
 from afd_plugin.expert_pool.protocol import (
+    MAX_RECEIVE_SLOTS,
     CallKey,
     CallRequest,
     ExecutionPlan,
@@ -36,10 +37,18 @@ class PoolClient:
         timeout_s: float = 60,
         *,
         validate_values: bool = True,
+        receive_slots: int = 1,
     ) -> None:
         CallKey(client_id, session_epoch, 0)
         if transport.peer != 0:
             raise ValueError("Client transport must target the worker rank")
+        if (
+            type(receive_slots) is not int
+            or not 1 <= receive_slots <= MAX_RECEIVE_SLOTS
+        ):
+            raise ValueError("Invalid client receive capacity")
+        self.receive_slots = receive_slots
+        self.slot_generations = [0] * receive_slots
         self.client_id = client_id
         self.session_epoch = session_epoch
         self.directory = directory
@@ -83,9 +92,14 @@ class PoolClient:
             raise RuntimeError("Stale plan or buffer generation")
         if (
             message.plan.worker_id != self.directory.worker_id
-            or message.plan.slot_id != 0
+            or message.plan.slot_id >= self.receive_slots
         ):
             raise RuntimeError("Unexpected worker or buffer slot")
+        if kind == "grant":
+            slot_id = message.plan.slot_id
+            if message.plan.generation <= self.slot_generations[slot_id]:
+                raise RuntimeError("Stale buffer generation")
+            self.slot_generations[slot_id] = message.plan.generation
         return message
 
     def prepare_request(

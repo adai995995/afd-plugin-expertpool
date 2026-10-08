@@ -39,9 +39,9 @@ class BatchAudit:
             return
         members = []
         totals: dict[str, int] = {}
+        row_begin = 0
         for plan in plans:
             counts = {str(e): plan.assignments_for(e) for e in plan.expert_ids}
-            assert plan.request.demand is not None
             ranges = (
                 {
                     str(item.expert_id): {"start": item.start, "count": item.count}
@@ -59,13 +59,19 @@ class BatchAudit:
                 "generation": plan.generation,
                 "num_tokens": plan.request.num_tokens,
                 "top_k": plan.request.top_k,
-                "expert_demand": {
-                    str(e): n for e, n in enumerate(plan.request.demand.counts) if n
-                },
+                "expert_demand": None
+                if plan.request.demand is None
+                else {str(e): n for e, n in enumerate(plan.request.demand.counts) if n},
                 "expert_assignments": counts,
                 "assignment_ranges": ranges,
                 "completed": False,
             }
+            if plan.request.demand is None:
+                member["input_row_range"] = [
+                    row_begin,
+                    row_begin + plan.request.num_tokens,
+                ]
+            row_begin += plan.request.num_tokens
             members.append(member)
             self.pending[plan.plan_id] = member
             for expert, count in counts.items():

@@ -138,13 +138,20 @@ class ExpertWorker:
                 self.scheduler.register(peer.client_id, peer.session_epoch, peer.domain)
         self.audit_inputs = audit_inputs
         self.execution = execution or ExecutionOptions()
+        self.local_full_pipeline = (
+            controller is None
+            and not directory.allow_partial_experts
+            and not demand_aware
+            and not compact_output
+            and receive_slots > 1
+        )
         if (
             type(receive_slots) is not int
             or not 1 <= receive_slots <= MAX_RECEIVE_SLOTS
             or (
                 receive_slots > 1
                 and (
-                    not compact_output
+                    (not compact_output and not self.local_full_pipeline)
                     or self.execution.validate_worker_values
                     or not self.execution.defer_output_sync
                 )
@@ -155,6 +162,12 @@ class ExpertWorker:
         if not isinstance(batching, BatchingOptions):
             raise ValueError("Worker requires typed batching options")
         batching.validate_capacity(receive_slots, directory.max_tokens)
+        if self.local_full_pipeline and (
+            batching.max_wait_us or self.execution.collect_cost_feedback
+        ):
+            raise ValueError(
+                "Local full E requires zero wait and no demand cost feedback"
+            )
         self.batching = batching
         if type(expert_replicated) is not bool or (
             expert_replicated and (receive_slots < 2 or not compact_output)
@@ -238,7 +251,11 @@ class ExpertWorker:
         self.pipeline = None
         if receive_slots > 1:
             # Lazy import avoids the Worker/typed pipeline ownership cycle.
-            if direct_dispatch:
+            if self.local_full_pipeline:
+                from afd_plugin.expert_pool.local_worker import LocalWorkerPipeline
+
+                self.pipeline = LocalWorkerPipeline(self, receive_slots)
+            elif direct_dispatch:
                 from afd_plugin.expert_pool.direct_worker import DirectWorkerPipeline
 
                 self.pipeline = DirectWorkerPipeline(self, receive_slots)
@@ -532,7 +549,7 @@ class ExpertWorker:
         self.prepare()
         connections = {peer.control: peer for peer in self.peers.values()}
         try:
-            if self.direct_dispatch:
+            if self.direct_dispatch or self.local_full_pipeline:
                 assert self.pipeline is not None
                 self.pipeline.run()
                 return

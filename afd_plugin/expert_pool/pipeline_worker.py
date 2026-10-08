@@ -44,10 +44,11 @@ class PipelineSlot:
     hidden: torch.Tensor
     weights: torch.Tensor
     ids: torch.Tensor
-    workspace: CompactOutputWorkspace
+    workspace: CompactOutputWorkspace | None
     begin: torch.cuda.Event
     packed_end: torch.cuda.Event
     input_ready: torch.cuda.Event
+    output: torch.Tensor | None = None
     generation: int = 0
     plan: ExecutionPlan | None = None
     phase: str = "idle"
@@ -73,9 +74,10 @@ class PipelineSlot:
 
 class WorkerPipeline:
     def __init__(self, worker: ExpertWorker, receive_slots: int) -> None:
-        if (
-            worker.controller is None and not worker.direct_dispatch
-        ) or worker.output_workspace is None:
+        if not worker.local_full_pipeline and (
+            (worker.controller is None and not worker.direct_dispatch)
+            or worker.output_workspace is None
+        ):
             raise ValueError(
                 "Pipeline requires controlled or direct compact partitions"
             )
@@ -103,15 +105,28 @@ class WorkerPipeline:
                     worker.hidden if index == 0 else torch.empty_like(worker.hidden),
                     worker.weights if index == 0 else torch.empty_like(worker.weights),
                     worker.ids if index == 0 else torch.empty_like(worker.ids),
-                    worker.output_workspace
-                    if index == 0
-                    else CompactOutputWorkspace(
-                        worker.directory.max_tokens * worker.directory.top_k,
-                        worker.directory.hidden_size,
-                        worker.device,
+                    None
+                    if worker.local_full_pipeline
+                    else (
+                        worker.output_workspace
+                        if index == 0
+                        else CompactOutputWorkspace(
+                            worker.directory.max_tokens * worker.directory.top_k,
+                            worker.directory.hidden_size,
+                            worker.device,
+                        )
                     ),
                     *(torch.cuda.Event(enable_timing=True) for _ in range(2)),
                     torch.cuda.Event(),
+                    output=(
+                        (
+                            worker.output
+                            if index == 0
+                            else torch.empty_like(worker.hidden)
+                        )
+                        if worker.local_full_pipeline
+                        else None
+                    ),
                 )
             )
         self.batch_inputs = (
@@ -162,9 +177,7 @@ class WorkerPipeline:
             for other in self.slots
         ):
             raise RuntimeError("Slot or client channel is still occupied")
-        self.worker.validate_controlled_plan(
-            plan, slot.generation + 1, receive_slots=len(self.slots)
-        )
+        self._validate_plan(plan, slot)
         slot.plan = plan
         slot.generation = plan.generation
         slot.phase = "receiving"
@@ -183,6 +196,11 @@ class WorkerPipeline:
         # stream. Receiving a new input must not wait for unrelated GEMMs.
         slot.transfer = peer.transport.post(
             (slot.hidden[:rows], slot.weights[:rows], slot.ids[:rows]), send=False
+        )
+
+    def _validate_plan(self, plan: ExecutionPlan, slot: PipelineSlot) -> None:
+        self.worker.validate_controlled_plan(
+            plan, slot.generation + 1, receive_slots=len(self.slots)
         )
 
     def _receive_completions(self) -> bool:
@@ -256,18 +274,19 @@ class WorkerPipeline:
             )
             worker.output_transfer["dense_equivalent_bytes"] += (
                 plan.request.num_tokens
-                * plan.request.top_k
+                * (1 if worker.local_full_pipeline else plan.request.top_k)
                 * plan.request.hidden_size
                 * slot.result.element_size()
             )
             worker.completed_calls += 1
             worker.client_calls[plan.request.key.client_id] += 1
             worker.layer_calls[plan.request.layer_id] += 1
-            assert plan.request.demand is not None
-            for expert in plan.expert_ids:
-                worker.expert_assignments[str(plan.request.layer_id)][str(expert)] += (
-                    plan.assignments_for(expert)
-                )
+            if not worker.local_full_pipeline:
+                assert plan.request.demand is not None
+                for expert in plan.expert_ids:
+                    worker.expert_assignments[str(plan.request.layer_id)][
+                        str(expert)
+                    ] += plan.assignments_for(expert)
             metrics = {
                 "admitted_queue_ms": slot.queue_ms,
                 "receive_gpu_ms": slot.receive_ms,
@@ -335,9 +354,7 @@ class WorkerPipeline:
         selected = tuple(self.slots[index] for index in decision.slot_ids)
         plans = tuple(slot.plan for slot in selected)
         assert all(plan is not None for plan in plans)
-        input_rows = tuple(
-            plan.input_rows or plan.request.num_tokens for plan in plans
-        )
+        input_rows = tuple(plan.input_rows or plan.request.num_tokens for plan in plans)
         execution_rows = sum(input_rows)
         self.batch_executions += 1
         self.batch_calls += len(selected)
@@ -408,8 +425,12 @@ class WorkerPipeline:
                 assignment_mask = (
                     masks[0] if len(masks) == 1 else torch.cat(masks, dim=0)
                 )
-            result = self.worker.executors[layer].forward_slots(
-                *inputs, assignment_mask=assignment_mask
+            result = (
+                self.worker.executors[layer].forward(*inputs)
+                if self.worker.local_full_pipeline
+                else self.worker.executors[layer].forward_slots(
+                    *inputs, assignment_mask=assignment_mask
+                )
             )
             self.compute_end.record()
             offset = 0
@@ -417,14 +438,20 @@ class WorkerPipeline:
                 slot.result = result[offset : offset + rows]
                 offset += rows
                 slot.begin.record()
-                slot.outgoing = slot.workspace.pack(
-                    slot.result,
-                    slot.ids[:rows],
-                    slot.task_ownership
-                    if self.worker.expert_replicated
-                    else self.worker.ownership[layer],
-                    num_assignments=plan.num_assignments,
-                )
+                if self.worker.local_full_pipeline:
+                    assert slot.output is not None
+                    slot.outgoing = slot.output[:rows]
+                    slot.outgoing.copy_(slot.result)
+                else:
+                    assert slot.workspace is not None
+                    slot.outgoing = slot.workspace.pack(
+                        slot.result,
+                        slot.ids[:rows],
+                        slot.task_ownership
+                        if self.worker.expert_replicated
+                        else self.worker.ownership[layer],
+                        num_assignments=plan.num_assignments,
+                    )
                 slot.packed_end.record()
         return True
 
@@ -519,5 +546,10 @@ class WorkerPipeline:
                 tensor.numel() * tensor.element_size()
                 for slot in self.slots
                 for tensor in (slot.hidden, slot.weights, slot.ids)
+            ),
+            "reduced_output_buffer_bytes": sum(
+                slot.output.numel() * slot.output.element_size()
+                for slot in self.slots
+                if slot.output is not None
             ),
         }
