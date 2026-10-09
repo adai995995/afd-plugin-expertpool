@@ -48,7 +48,12 @@ class TokenDispatchTests(unittest.TestCase):
     def test_direct_client_roundtrip_splits_the_same_expert_across_copies(self):
         self._direct_client_roundtrip(2)
 
-    def _direct_client_roundtrip(self, active_expert_replicas):
+    def test_shared_home_direct_roundtrip_restores_and_reuses_without_wire_grants(self):
+        self._direct_client_roundtrip(1, "shared_home")
+
+    def _direct_client_roundtrip(
+        self, active_expert_replicas, local_replica_policy="load_aware"
+    ):
         from afd_plugin.expert_pool.client import PoolClient
         from afd_plugin.expert_pool.controller import directory_digest
         from afd_plugin.expert_pool.direct_client import DirectFanoutPoolClient
@@ -164,6 +169,7 @@ class TokenDispatchTests(unittest.TestCase):
                 packed_input=True,
                 partial_reduction=True,
                 active_expert_replicas=active_expert_replicas,
+                local_replica_policy=local_replica_policy,
             )
             for rows in (4, 3):
                 x = torch.arange(
@@ -189,6 +195,7 @@ class TokenDispatchTests(unittest.TestCase):
             self.assertEqual(status["pending_feedback"], 0)
             self.assertEqual(status["output_contract"], "fp32-partial-token-hidden")
             self.assertEqual(status["active_expert_replicas"], active_expert_replicas)
+            self.assertEqual(status["local_replica_policy"], local_replica_policy)
             if active_expert_replicas > 1:
                 self.assertGreater(status["split_expert_calls"], 0)
             self.assertLess(
@@ -348,6 +355,79 @@ class TokenDispatchTests(unittest.TestCase):
         self.assertEqual(plan.tasks, ())
         self.assertEqual(payloads, {})
         self.assertEqual(metrics["token_summary_wait_ms"], 0)
+
+    def test_shared_home_ignores_client_turn_and_load_and_reuses_gpu_table(self):
+        from afd_plugin.expert_pool.directory import shared_expert_homes
+
+        device = torch.device("cuda", 0)
+        pool = directory(True)
+        homes = shared_expert_homes(pool)[1]
+        dispatchers = [
+            LocalTokenDispatcher(pool, device, local_replica_policy="shared_home")
+            for _ in range(2)
+        ]
+        rows_by_client = ([[0, 1], [0, 2], [3, 1], [2, 3]], [[0, 2], [1, 3], [3, 0]])
+        for turn in (0, 1, 19):
+            for client, original in enumerate(rows_by_client):
+                dispatcher = dispatchers[client]
+                table_pointer = dispatcher.home_tables[1].data_ptr()
+                loads = {
+                    w: WorkerLoad(
+                        1, 100 if i == client else 0, i == client, i == client
+                    )
+                    for i, w in enumerate(dispatcher.owners)
+                }
+                rows = len(original)
+                hidden = torch.arange(
+                    rows * 32, dtype=torch.bfloat16, device=device
+                ).reshape(rows, 32)
+                ids = torch.tensor(original, dtype=torch.int32, device=device)
+                weights = torch.full((rows, 2), 0.5, device=device)
+                request = CallRequest(
+                    CallKey(f"a{client}", 1, turn), "checkpoint", 1, 1, rows, 32, 2
+                )
+                plan, payloads, metrics = dispatcher.prepare(
+                    request, (hidden, weights, ids), loads, turn + client
+                )
+                cover = torch.zeros_like(ids)
+                for task in plan.tasks:
+                    self.assertTrue(
+                        all(homes[e] == task.worker_id for e in task.expert_ids)
+                    )
+                    payload = payloads[task.worker_id]
+                    row_ids = dispatcher.workspaces[task.worker_id].row_ids[
+                        : len(payload[0])
+                    ]
+                    owned = payload[2] >= 0
+                    expected = torch.tensor(
+                        [[homes[e] == task.worker_id for e in row] for row in original],
+                        device=device,
+                    )
+                    torch.testing.assert_close(owned, expected[row_ids], atol=0, rtol=0)
+                    torch.testing.assert_close(
+                        payload[0], hidden[row_ids], atol=0, rtol=0
+                    )
+                    cover.index_add_(0, row_ids, owned.int())
+                    self.assertEqual(task.num_assignments, int(owned.sum()))
+                torch.testing.assert_close(cover, torch.ones_like(ids), atol=0, rtol=0)
+                self.assertEqual(metrics["client_split_experts"], 0)
+                self.assertEqual(metrics["token_summary_bytes"], 7 * 8)
+                self.assertEqual(dispatcher.home_tables[1].data_ptr(), table_pointer)
+
+    def test_shared_home_configuration_rejects_unknown_policy_and_two_copies(self):
+        device = torch.device("cuda", 0)
+        for policy in ("unknown", True, []):
+            with self.assertRaises(ValueError):
+                LocalTokenDispatcher(
+                    directory(True), device, local_replica_policy=policy
+                )
+        with self.assertRaises(ValueError):
+            LocalTokenDispatcher(
+                directory(True),
+                device,
+                local_replica_policy="shared_home",
+                active_expert_replicas=2,
+            )
 
     def test_invalid_active_copy_configuration_fails_before_dispatch(self):
         device = torch.device("cuda", 0)

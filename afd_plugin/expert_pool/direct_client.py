@@ -16,6 +16,7 @@ from afd_plugin.expert_pool.compact_input import (
 from afd_plugin.expert_pool.compact_output import selection_ownership
 from afd_plugin.expert_pool.controller import directory_digest
 from afd_plugin.expert_pool.direct_dispatch import DirectReplies
+from afd_plugin.expert_pool.directory import LOCAL_REPLICA_POLICIES
 from afd_plugin.expert_pool.fanout_client import FanoutPoolClient
 from afd_plugin.expert_pool.fanout_protocol import FanoutReplies
 from afd_plugin.expert_pool.metrics import CallMetrics
@@ -44,6 +45,7 @@ class DirectFanoutPoolClient(FanoutPoolClient):
         packed_input: bool = False,
         partial_reduction: bool = False,
         active_expert_replicas: int = 1,
+        local_replica_policy: str = "load_aware",
     ) -> None:
         if (
             type(active_expert_replicas) is not int
@@ -51,6 +53,15 @@ class DirectFanoutPoolClient(FanoutPoolClient):
             or (active_expert_replicas > 1 and not partial_reduction)
         ):
             raise ValueError("Multiple active Expert copies require partial reduction")
+        if (
+            type(local_replica_policy) is not str
+            or local_replica_policy not in LOCAL_REPLICA_POLICIES
+            or (
+                local_replica_policy == "shared_home"
+                and (not partial_reduction or active_expert_replicas != 1)
+            )
+        ):
+            raise ValueError("Shared Expert homes require one-copy partial reduction")
         super().__init__(
             channels,
             None,
@@ -84,12 +95,14 @@ class DirectFanoutPoolClient(FanoutPoolClient):
                 self.directory,
                 channels[0].transport.device,
                 active_expert_replicas=active_expert_replicas,
+                local_replica_policy=local_replica_policy,
             )
             if partial_reduction
             else None
         )
         self.token_payloads = {}
         self.active_expert_replicas = active_expert_replicas
+        self.local_replica_policy = local_replica_policy
         self.split_expert_calls = 0
         for channel in self.channels.values():
             message = receive_message(channel.control, self.timeout_s)
@@ -294,6 +307,7 @@ class DirectFanoutPoolClient(FanoutPoolClient):
             packed_input=self.packed_input,
             partial_reduction=self.partial_reduction,
             active_expert_replicas=self.active_expert_replicas,
+            local_replica_policy=self.local_replica_policy,
             split_expert_calls=self.split_expert_calls,
             input_transfer=dict(self.input_transfer),
             packed_tasks=self.packed_tasks,

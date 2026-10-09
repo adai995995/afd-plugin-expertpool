@@ -15,7 +15,11 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from afd_plugin.expert_pool.compact_input import ROW_BLOCK_SIZE, _row_indices
-from afd_plugin.expert_pool.directory import PoolDirectory
+from afd_plugin.expert_pool.directory import (
+    LOCAL_REPLICA_POLICIES,
+    PoolDirectory,
+    shared_expert_homes,
+)
 from afd_plugin.expert_pool.protocol import (
     MAX_ACTIVE_EXPERT_REPLICAS,
     AssignmentSlice,
@@ -107,7 +111,7 @@ class TokenInputWorkspace:
 
 
 class LocalTokenDispatcher:
-    """Compiled per-layer candidate lists with a bounded, local load heuristic.
+    """Precompiled shared homes or a bounded local load heuristic.
 
     Load feedback may be stale. It affects copy selection, never slot ownership.
     No global optimization, new feedback wait or centralized reservation occurs.
@@ -119,6 +123,7 @@ class LocalTokenDispatcher:
         device: torch.device,
         *,
         active_expert_replicas: int = 1,
+        local_replica_policy: str = "load_aware",
     ):
         if not directory.expert_partitioned or device.type != "cuda":
             raise ValueError("Token dispatch requires a CUDA Expert directory")
@@ -128,9 +133,16 @@ class LocalTokenDispatcher:
             or (active_expert_replicas > 1 and not directory.expert_replicated)
         ):
             raise ValueError("Multiple active copies require resident Expert replicas")
+        if (
+            type(local_replica_policy) is not str
+            or local_replica_policy not in LOCAL_REPLICA_POLICIES
+            or (local_replica_policy == "shared_home" and active_expert_replicas != 1)
+        ):
+            raise ValueError("Shared Expert homes require exactly one active copy")
         self.directory = directory
         self.device = device
         self.active_expert_replicas = active_expert_replicas
+        self.local_replica_policy = local_replica_policy
         self.owners = tuple(sorted(w.worker_id for w in directory.workers))
         self.candidates = {
             p.layer_id: tuple(
@@ -139,6 +151,16 @@ class LocalTokenDispatcher:
             )
             for p in directory.placements
         }
+        self.home_choices = {}
+        self.home_tables = {}
+        if local_replica_policy == "shared_home":
+            for layer, homes in shared_expert_homes(directory).items():
+                self.home_choices[layer] = tuple((owner,) for owner in homes)
+                self.home_tables[layer] = torch.tensor(
+                    [[self.owners.index(owner)] for owner in homes],
+                    dtype=torch.int32,
+                    device=device,
+                )
         shape = directory.workers[0]
         self.workspaces = {
             owner: TokenInputWorkspace(
@@ -176,8 +198,14 @@ class LocalTokenDispatcher:
         started = time.perf_counter_ns()
         candidates = self.candidates[request.layer_id]
         num_experts = len(candidates)
-        choices = []
-        for expert, copies in enumerate(candidates):
+        choices = (
+            self.home_choices[request.layer_id]
+            if self.local_replica_policy == "shared_home"
+            else []
+        )
+        for expert, copies in (
+            enumerate(candidates) if self.local_replica_policy == "load_aware" else ()
+        ):
             rotated = (
                 copies[(expert + turn) % len(copies) :]
                 + copies[: (expert + turn) % len(copies)]
@@ -210,15 +238,21 @@ class LocalTokenDispatcher:
                 {"token_summary_wait_ms": 0.0, "client_split_experts": 0.0},
             )
         self.begin.record()
-        table = torch.tensor(
-            [
-                [self.owners.index(owner) for owner in copies]
-                + [-1] * (self.active_expert_replicas - len(copies))
-                for copies in choices
-            ],
-            dtype=torch.int32,
-            device=self.device,
+        table = (
+            self.home_tables[request.layer_id]
+            if self.local_replica_policy == "shared_home"
+            else None
         )
+        if table is None:
+            table = torch.tensor(
+                [
+                    [self.owners.index(owner) for owner in copies]
+                    + [-1] * (self.active_expert_replicas - len(copies))
+                    for copies in choices
+                ],
+                dtype=torch.int32,
+                device=self.device,
+            )
         valid = (ids >= 0) & (ids < num_experts)
         indices = ids.long().masked_fill(~valid, num_experts)
         histogram = self.summary[: num_experts + 1]

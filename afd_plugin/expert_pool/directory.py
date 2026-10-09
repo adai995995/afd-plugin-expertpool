@@ -7,11 +7,14 @@ coverage; explicit expert_replicated placement permits multiple resident copies.
 The Controller reserves selected workers before dispatch. No migration or retry.
 """
 
+import hashlib
 from collections.abc import Collection
 from dataclasses import dataclass
 
 from afd_plugin.expert_pool.placement import ExpertPlacement
 from afd_plugin.expert_pool.scheduler import StaticDirectory
+
+LOCAL_REPLICA_POLICIES = frozenset(("load_aware", "shared_home"))
 
 
 @dataclass(frozen=True)
@@ -120,6 +123,31 @@ class PoolDirectory:
         if not owners:
             raise ValueError("Layer is absent from the pool")
         return owners
+
+
+def shared_expert_homes(directory: PoolDirectory) -> dict[int, tuple[str, ...]]:
+    """Compile the same resident home for every A using this directory.
+
+    Sort candidates independently of registration order. A layer-specific stable
+    offset spreads fully replicated Experts evenly, without client identity,
+    call sequence, process-randomized hash or runtime load reads. This is an
+    affinity baseline, not a capacity optimizer or a failure fallback.
+    """
+    if not directory.expert_partitioned:
+        raise ValueError("Shared Expert homes require partitioned dispatch")
+    reference = directory.workers[0]
+    homes = {}
+    for placement in directory.placements:
+        identity = f"{reference.model_id}:{reference.version}:{placement.layer_id}"
+        offset = int.from_bytes(hashlib.sha256(identity.encode()).digest(), "big")
+        layer = []
+        for expert in range(placement.num_experts):
+            copies = sorted(
+                w for w, _ in directory.locations(placement.layer_id, expert)
+            )
+            layer.append(copies[(offset + expert) % len(copies)])
+        homes[placement.layer_id] = tuple(layer)
+    return homes
 
 
 class ReplicaSelector:

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from afd_plugin.expert_pool.batching import BatchingOptions
 from afd_plugin.expert_pool.controller import CONTROLLER_POLICIES
-from afd_plugin.expert_pool.directory import PoolDirectory
+from afd_plugin.expert_pool.directory import LOCAL_REPLICA_POLICIES, PoolDirectory
 from afd_plugin.expert_pool.placement import ExpertPlacement
 from afd_plugin.expert_pool.protocol import (
     MAX_ACTIVE_EXPERT_REPLICAS,
@@ -177,6 +177,7 @@ class PoolDeployment:
     full_e_direct: bool = False
     partial_reduction: bool = False
     active_expert_replicas: int = 1
+    local_replica_policy: str = "load_aware"
     tcp_authkey: str = ""
 
     def __post_init__(self) -> None:
@@ -318,6 +319,15 @@ class PoolDeployment:
                 "Multiple active Expert copies require direct partial reduction "
                 "and resident replicas"
             )
+        if (
+            type(self.local_replica_policy) is not str
+            or self.local_replica_policy not in LOCAL_REPLICA_POLICIES
+            or (
+                self.local_replica_policy == "shared_home"
+                and (not self.partial_reduction or self.active_expert_replicas != 1)
+            )
+        ):
+            raise ValueError("Shared Expert homes require one-copy partial reduction")
         if type(self.pooled_admission) is not bool or (
             self.pooled_admission
             and (

@@ -427,6 +427,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 full_e_direct=args.full_e_direct,
                 partial_reduction=args.partial_reduction,
                 active_expert_replicas=args.active_expert_replicas,
+                local_replica_policy=args.local_replica_policy,
                 packed_input=args.packed_input,
                 pooled_admission=args.pooled_admission,
                 compact_output=args.compact_output,
@@ -1272,6 +1273,11 @@ def main() -> int:
     parser.add_argument("--packed-input", action="store_true")
     parser.add_argument("--partial-reduction", action="store_true")
     parser.add_argument("--active-expert-replicas", type=int, choices=(1, 2), default=1)
+    parser.add_argument(
+        "--local-replica-policy",
+        choices=("load_aware", "shared_home"),
+        default="load_aware",
+    )
     parser.add_argument("--pooled-admission", action="store_true")
     parser.add_argument(
         "--expert-replicated",
@@ -1319,6 +1325,10 @@ def main() -> int:
         parser.error(
             "Two active copies require partial reduction and resident replicas"
         )
+    if args.local_replica_policy == "shared_home" and (
+        not args.partial_reduction or args.active_expert_replicas != 1
+    ):
+        parser.error("Shared Expert homes require one-copy partial reduction")
     if args.pooled_admission and (
         not args.controller
         or args.controller_policy != "ready_first"
@@ -1406,6 +1416,7 @@ def main() -> int:
         "packed_input": args.packed_input,
         "partial_reduction": args.partial_reduction,
         "active_expert_replicas": args.active_expert_replicas,
+        "local_replica_policy": args.local_replica_policy,
         "pooled_admission": args.pooled_admission,
         "controller_policy": args.controller_policy if args.controller else None,
     }

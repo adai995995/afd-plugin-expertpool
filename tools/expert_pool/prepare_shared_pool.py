@@ -59,6 +59,7 @@ def build_deployment(
     batching: BatchingOptions = DISABLED_BATCHING,
     partial_reduction: bool = False,
     active_expert_replicas: int = 1,
+    local_replica_policy: str = "load_aware",
 ) -> PoolDeployment:
     """Describe one shared E pool and distinct A clients without loading weights."""
 
@@ -139,6 +140,7 @@ def build_deployment(
         packed_input=partial_reduction,
         partial_reduction=partial_reduction,
         active_expert_replicas=active_expert_replicas,
+        local_replica_policy=local_replica_policy,
         expert_replicated=bool(replicated_experts),
         split_assignments=split_assignments,
         batch_aware_replicas=batch_aware_replicas,
@@ -250,6 +252,12 @@ def main() -> None:
         help="Maximum copies per Expert call; two requires partial reduction replicas",
     )
     parser.add_argument("--controller-host")
+    parser.add_argument(
+        "--local-replica-policy",
+        choices=("load_aware", "shared_home"),
+        default="load_aware",
+        help="Shared home uses one precompiled resident per Expert across A clients",
+    )
     parser.add_argument("--control-port-base", type=int)
     parser.add_argument("--nccl-port-base", type=int)
     args = parser.parse_args()
@@ -278,6 +286,7 @@ def main() -> None:
             batching=batching,
             partial_reduction=args.partial_reduction,
             active_expert_replicas=args.active_expert_replicas,
+            local_replica_policy=args.local_replica_policy,
         )
         if (
             args.worker_host
@@ -312,6 +321,7 @@ def main() -> None:
                 "shared_expert_overlap": deployment.shared_expert_overlap,
                 "partial_reduction": deployment.partial_reduction,
                 "active_expert_replicas": deployment.active_expert_replicas,
+                "local_replica_policy": deployment.local_replica_policy,
                 "socket_dir": str(socket_dir),
             }
         )

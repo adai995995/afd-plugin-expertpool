@@ -156,6 +156,7 @@ class PoolAttentionWorker(Worker):
                     packed_input=deployment.packed_input,
                     partial_reduction=deployment.partial_reduction,
                     active_expert_replicas=deployment.active_expert_replicas,
+                    local_replica_policy=deployment.local_replica_policy,
                 )
             elif deployment.controller is not None:
                 controller = connect_controller(
