@@ -424,6 +424,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 ),
                 demand_aware=args.expert_demand,
                 direct_dispatch=args.direct_dispatch,
+                full_e_direct=args.full_e_direct,
                 packed_input=args.packed_input,
                 pooled_admission=args.pooled_admission,
                 compact_output=args.compact_output,
@@ -1261,6 +1262,11 @@ def main() -> int:
     parser.add_argument("--execution-options", type=json.loads, default={})
     parser.add_argument("--receive-slots", type=int, default=1)
     parser.add_argument("--direct-dispatch", action="store_true")
+    parser.add_argument(
+        "--full-e-direct",
+        action="store_true",
+        help="Whole-layer E with preallocated transport slots and asynchronous done",
+    )
     parser.add_argument("--packed-input", action="store_true")
     parser.add_argument("--pooled-admission", action="store_true")
     parser.add_argument(
@@ -1287,6 +1293,15 @@ def main() -> int:
         parser.error(
             "Direct dispatch requires two dedicated slots, compact output "
             "and no controller"
+        )
+    if args.full_e_direct and (
+        args.controller
+        or args.direct_dispatch
+        or args.receive_slots != 2
+        or args.placement == "expert_partitioned"
+    ):
+        parser.error(
+            "Direct full E requires two slots, whole-layer placement and no controller"
         )
     if args.packed_input and not args.direct_dispatch:
         parser.error("--packed-input requires --direct-dispatch")

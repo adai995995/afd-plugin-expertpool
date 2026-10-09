@@ -115,6 +115,8 @@ class ReplicaPoolClient:
 
     def dispatch_status(self) -> dict:
         """Read bounded counters after draining; this is not live busy feedback."""
+        for channel in self.channels.values():
+            channel.drain_feedback()
         return {
             "policy": "resident-layer-round-robin",
             "placement_version": self.directory.workers[0].version,

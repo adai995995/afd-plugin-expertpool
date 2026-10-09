@@ -8,11 +8,18 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from afd_plugin.expert_pool.batch_audit import MAX_AUDIT_RECORDS, BatchAudit
 from afd_plugin.expert_pool.controller import ControllerClientIdentity, directory_digest
 from afd_plugin.expert_pool.direct_dispatch import DirectSlots
 from afd_plugin.expert_pool.pipeline_worker import WorkerPipeline
 from afd_plugin.expert_pool.progress_wait import ProgressWaiter
-from afd_plugin.expert_pool.protocol import Message, receive_message, send_message
+from afd_plugin.expert_pool.protocol import (
+    BatchExecution,
+    BatchSlot,
+    Message,
+    receive_message,
+    send_message,
+)
 
 if TYPE_CHECKING:
     from afd_plugin.expert_pool.worker import ExpertWorker
@@ -26,6 +33,11 @@ class DirectWorkerPipeline(WorkerPipeline):
             for p in worker.peers.values()
         )
         self.book = DirectSlots(worker.directory, identities)
+        self.audit = (
+            BatchAudit(MAX_AUDIT_RECORDS)
+            if worker.full_e_direct and worker.execution.audit_batch_members
+            else None
+        )
         self.progress_waiter = ProgressWaiter(
             tuple(p.control for p in worker.peers.values())
         )
@@ -33,18 +45,38 @@ class DirectWorkerPipeline(WorkerPipeline):
     def _notify(self, message: Message) -> None:
         # Input progress and batch execution remain local state. No central
         # grant, stage notification or completion acknowledgement is required.
+        if message.kind in {"batch_executing", "executing"} and self.audit is not None:
+            plans = tuple(slot.plan for slot in self.computing)
+            assert all(plan is not None for plan in plans)
+            batch = message.batch or BatchExecution(
+                self.worker.directory.worker_id,
+                self.batch_executions,
+                tuple(BatchSlot.from_plan(plan) for plan in plans),
+            )
+            self.audit.record_batch(batch, plans)
+            for slot in self.computing:
+                self.audit.record_ready_timing(
+                    slot.plan,
+                    slot.started_ns,
+                    slot.ready_ns,
+                    slot.compute_submitted_ns,
+                )
         if message.kind not in {"output_ready", "done"}:
             return
         assert message.plan is not None
         if message.kind == "done":
             # The inherited pipeline calls this only after send.finish().
             self.book.complete(message.plan)
+            if self.audit is not None:
+                self.audit.record_done(message.plan, message.metrics)
             message = replace(
                 message,
                 metrics={
                     **message.metrics,
                     "direct_pending_assignments": sum(
                         p.num_assignments
+                        if p.num_assignments is not None
+                        else p.request.num_tokens * p.request.top_k
                         for p in (
                             *self.book.active.values(),
                             *self.book.pending.values(),
@@ -71,6 +103,7 @@ class DirectWorkerPipeline(WorkerPipeline):
                         "receive_slots": len(self.slots),
                         "startup_complete": int(self.worker.startup["completed"]),
                         "packed_input": int(self.worker.packed_input),
+                        "full_e_direct": int(self.worker.full_e_direct),
                     },
                 ),
             )
@@ -102,6 +135,9 @@ class DirectWorkerPipeline(WorkerPipeline):
                     Message("grant", plan=plan, metrics={"controller_queue_ms": 0.0})
                 )
                 progressed = True
+            # Observe all newly posted receives before choosing the zero-wait
+            # batch. No cross-A layer barrier or collection delay is added.
+            progressed = self._receive_completions() or progressed
             progressed = self._start_compute() or progressed
             if connections and not progressed:
                 self.progress_waiter.wait(self.next_wait_s)
@@ -109,11 +145,20 @@ class DirectWorkerPipeline(WorkerPipeline):
     def snapshot(self) -> dict:
         return {
             **super().snapshot(),
-            "direct_dispatch": True,
+            "direct_dispatch": self.worker.direct_dispatch,
+            "full_e_direct": self.worker.full_e_direct,
+            "output_layout": (
+                "reduced-token-hidden"
+                if self.worker.full_e_direct
+                else "compact-assignments"
+            ),
             "packed_input": self.worker.packed_input,
             "direct_active": len(self.book.active),
             "direct_pending": len(self.book.pending),
             "direct_closed_clients": len(self.book.closed),
             "direct_completed_by_client": dict(self.book.completed),
             "direct_slot_clients": list(self.book.clients),
+            "batch_audit": self.audit.snapshot()
+            if self.audit is not None
+            else {"enabled": False},
         }

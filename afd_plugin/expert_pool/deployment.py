@@ -170,6 +170,7 @@ class PoolDeployment:
     split_assignments: bool = False
     batch_aware_replicas: bool = False
     shared_expert_overlap: bool = False
+    full_e_direct: bool = False
     tcp_authkey: str = ""
 
     def __post_init__(self) -> None:
@@ -265,6 +266,19 @@ class PoolDeployment:
             )
         if type(self.shared_expert_overlap) is not bool:
             raise ValueError("Shared expert overlap must be an explicit boolean")
+        if type(self.full_e_direct) is not bool or (
+            self.full_e_direct
+            and (
+                not self.local_full_pipeline
+                or self.direct_dispatch
+                or self.receive_slots != len(self.client_ids)
+                or self.execution.validate_client_values
+            )
+        ):
+            raise ValueError(
+                "Direct full E requires trusted whole-layer execution, "
+                "one transport slot per client and no controller"
+            )
         if type(self.direct_dispatch) is not bool:
             raise ValueError("Direct dispatch must be an explicit boolean")
         if type(self.packed_input) is not bool or (

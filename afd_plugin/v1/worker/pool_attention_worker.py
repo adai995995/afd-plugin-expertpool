@@ -20,6 +20,7 @@ from afd_plugin.expert_pool.controller_service import connect_controller
 from afd_plugin.expert_pool.deployment import PoolDeployment
 from afd_plugin.expert_pool.direct_client import DirectFanoutPoolClient
 from afd_plugin.expert_pool.fanout_client import FanoutPoolClient
+from afd_plugin.expert_pool.full_e_client import DirectFullPoolClient
 from afd_plugin.expert_pool.protocol import enable_tcp_nodelay, receive_message
 from afd_plugin.expert_pool.replica_client import ReplicaPoolClient
 from afd_plugin.model_executor.models.pool_deepseek_v2 import (
@@ -106,16 +107,25 @@ class PoolAttentionWorker(Worker):
                     ),
                 )
                 startup.callback(transport.close)
+                channel_options = {
+                    "validate_values": deployment.execution.validate_client_values,
+                    "receive_slots": deployment.receive_slots,
+                }
+                channel_type = PoolClient
+                if deployment.full_e_direct:
+                    channel_type = DirectFullPoolClient
+                    channel_options["client_slot"] = deployment.client_ids.index(
+                        settings["client_id"]
+                    )
                 channels.append(
-                    PoolClient(
+                    channel_type(
                         endpoint.client_id,
                         endpoint.session_epoch,
                         directories[endpoint.worker_id],
                         control,
                         transport,
                         deployment.timeout_s,
-                        validate_values=deployment.execution.validate_client_values,
-                        receive_slots=deployment.receive_slots,
+                        **channel_options,
                     )
                 )
             if deployment.local_full_pipeline:
@@ -126,6 +136,13 @@ class PoolAttentionWorker(Worker):
                         or ready.detail != directory_digest(channel.directory)
                         or ready.metrics.get("receive_slots")
                         != deployment.receive_slots
+                        or bool(ready.metrics.get("full_e_direct", 0))
+                        != deployment.full_e_direct
+                        or (
+                            deployment.full_e_direct
+                            and ready.metrics.get("slot_id")
+                            != deployment.client_ids.index(settings["client_id"])
+                        )
                     ):
                         raise RuntimeError(
                             "Full E startup directory or capacity mismatch"

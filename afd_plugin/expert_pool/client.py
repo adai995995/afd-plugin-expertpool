@@ -71,6 +71,9 @@ class PoolClient:
         finally:
             self.lock.release()
 
+    def drain_feedback(self) -> None:
+        """The blocking protocol has already consumed its completion reply."""
+
     def _reply(
         self,
         kind: str,

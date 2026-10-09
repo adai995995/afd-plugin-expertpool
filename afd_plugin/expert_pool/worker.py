@@ -65,6 +65,7 @@ class ExpertWorker:
         batching: BatchingOptions = DISABLED_BATCHING,
         expert_replicated: bool = False,
         direct_dispatch: bool = False,
+        full_e_direct: bool = False,
         packed_input: bool = False,
         batch_capture: BatchInputCapture | None = None,
     ) -> None:
@@ -147,6 +148,16 @@ class ExpertWorker:
             and not compact_output
             and receive_slots > 1
         )
+        if type(full_e_direct) is not bool or (
+            full_e_direct
+            and (
+                not self.local_full_pipeline
+                or direct_dispatch
+                or receive_slots != len(peers)
+            )
+        ):
+            raise ValueError("Direct full E requires one complete transport slot per A")
+        self.full_e_direct = full_e_direct
         if batch_capture is not None and not self.local_full_pipeline:
             raise ValueError("Real input capture currently requires local full E")
         self.batch_capture = batch_capture
@@ -256,14 +267,14 @@ class ExpertWorker:
         self.pipeline = None
         if receive_slots > 1:
             # Lazy import avoids the Worker/typed pipeline ownership cycle.
-            if self.local_full_pipeline:
-                from afd_plugin.expert_pool.local_worker import LocalWorkerPipeline
-
-                self.pipeline = LocalWorkerPipeline(self, receive_slots)
-            elif direct_dispatch:
+            if full_e_direct or direct_dispatch:
                 from afd_plugin.expert_pool.direct_worker import DirectWorkerPipeline
 
                 self.pipeline = DirectWorkerPipeline(self, receive_slots)
+            elif self.local_full_pipeline:
+                from afd_plugin.expert_pool.local_worker import LocalWorkerPipeline
+
+                self.pipeline = LocalWorkerPipeline(self, receive_slots)
             else:
                 from afd_plugin.expert_pool.pipeline_worker import WorkerPipeline
 

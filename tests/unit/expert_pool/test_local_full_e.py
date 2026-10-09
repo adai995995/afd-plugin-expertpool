@@ -25,6 +25,7 @@ from afd_plugin.expert_pool.protocol import (
     BatchSlot,
     CallKey,
     CallRequest,
+    ExecutionPlan,
     Message,
     send_message,
 )
@@ -186,6 +187,12 @@ class LocalFullETests(unittest.TestCase):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA pipeline lifecycle check")
 class FullEPipelineTests(unittest.TestCase):
     def test_merged_execution_does_not_reuse_a_returning_output_slot(self):
+        self.check_pipeline(direct=False)
+
+    def test_direct_merge_preserves_returning_slots_and_generations(self):
+        self.check_pipeline(direct=True)
+
+    def check_pipeline(self, *, direct):
         from afd_plugin.expert_pool.worker import ExpertWorker, WorkerPeer
 
         class Transfer:
@@ -249,6 +256,7 @@ class FullEPipelineTests(unittest.TestCase):
                     )
                 ),
                 receive_slots=2,
+                full_e_direct=direct,
                 batching=BatchingOptions(2, 128, 0),
                 execution=ExecutionOptions(
                     validate_worker_values=False,
@@ -257,9 +265,21 @@ class FullEPipelineTests(unittest.TestCase):
                 ),
             )
             pipeline = worker.pipeline
+
+            def admit(current):
+                if direct:
+                    slot = pipeline.book.slot_ids[current.key.client_id]
+                    generation = pipeline.book.generations[current.key.client_id] + 1
+                    candidate = ExecutionPlan(
+                        current, "e0", current.key.call_seq * 2 + slot, slot, generation
+                    )
+                    pipeline.book.submit(current.key.client_id, candidate)
+                    return pipeline.book.startable()[0]
+                pipeline.book.submit(current, 0)
+                return pipeline.book.grant()
+
             for client, rows in (("a", 3), ("b", 5)):
-                pipeline.book.submit(request(client, rows=rows), 0)
-                plan = pipeline.book.grant()
+                plan = admit(request(client, rows=rows))
                 pipeline._accept(
                     Message("grant", plan=plan, metrics={"controller_queue_ms": 0.0})
                 )
@@ -270,7 +290,11 @@ class FullEPipelineTests(unittest.TestCase):
             pipeline._compute_completion()
             self.assertEqual(executors[1].rows, [8])
             self.assertFalse(pipeline._send_completions())
-            self.assertIsNone(pipeline.book.grant())
+            if direct:
+                self.assertEqual(pipeline.book.startable(), ())
+                self.assertEqual(len(pipeline.book.active), 2)
+            else:
+                self.assertIsNone(pipeline.book.grant())
             torch.testing.assert_close(
                 transports[1].outgoing,
                 torch.full((5, 32), 4.0, device="cuda"),
@@ -279,8 +303,7 @@ class FullEPipelineTests(unittest.TestCase):
             transports[0].allow_send = True
             torch.cuda.synchronize()
             pipeline._send_completions()
-            pipeline.book.submit(request("a", 1, rows=7), 0)
-            plan = pipeline.book.grant()
+            plan = admit(request("a", 1, rows=7))
             self.assertEqual((plan.slot_id, plan.generation), (0, 2))
             pipeline._accept(
                 Message("grant", plan=plan, metrics={"controller_queue_ms": 0.0})
@@ -299,9 +322,14 @@ class FullEPipelineTests(unittest.TestCase):
             )
             transports[1].allow_send = True
             deadline = time.monotonic() + 5
-            while pipeline.book.outstanding and time.monotonic() < deadline:
+            while worker.completed_calls < 3 and time.monotonic() < deadline:
                 pipeline._send_completions()
-            self.assertFalse(pipeline.book.outstanding)
+            self.assertEqual(worker.completed_calls, 3)
+            if direct:
+                self.assertFalse(pipeline.book.active)
+                self.assertFalse(pipeline.book.pending)
+            else:
+                self.assertFalse(pipeline.book.outstanding)
             self.assertEqual(executors[1].rows, [8, 7])
             self.assertEqual(pipeline.audit.summary()["pending_recorded_members"], 0)
             self.assertEqual(worker.output_transfer["sent_bytes"], (3 + 5 + 7) * 32 * 2)
