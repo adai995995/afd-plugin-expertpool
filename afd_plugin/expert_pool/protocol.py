@@ -86,6 +86,7 @@ class CallRequest:
     top_k: int
     demand: ExpertDemand | None = None
     compact_output: bool = False
+    partial_reduction: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, CallKey):
@@ -102,6 +103,12 @@ class CallRequest:
             self.compact_output and self.demand is None
         ):
             raise ValueError("Compact output requires explicit expert demand")
+        if type(self.partial_reduction) is not bool or (
+            self.partial_reduction and not self.compact_output
+        ):
+            raise ValueError(
+                "Partial reduction requires explicit compact demand output"
+            )
         if self.demand is not None:
             if not isinstance(self.demand, ExpertDemand):
                 raise ValueError("Request requires typed expert demand")
@@ -244,8 +251,8 @@ class DispatchPlan:
 class ExecutionPlan:
     """Bind output layout to the request and compact row count to assignments.
 
-    When request.compact_output is true, num_assignments is the exact number
-    of returned weighted rows. There is no separate unchecked transfer length.
+    Compact slot output returns num_assignments weighted rows. Partial
+    reduction instead returns input_rows FP32 token rows with the same map.
     """
 
     request: CallRequest
@@ -287,6 +294,12 @@ class ExecutionPlan:
             )
         ):
             raise ValueError("Invalid packed-input row count")
+        if self.request.partial_reduction and (
+            self.input_rows is None
+            or self.num_assignments is None
+            or self.input_rows > self.num_assignments
+        ):
+            raise ValueError("Partial reduction requires a packed token row count")
         if self.num_assignments is None:
             if self.expert_ids or self.request.demand is not None:
                 raise ValueError("Legacy plans cannot carry expert demand")
@@ -312,8 +325,7 @@ class ExecutionPlan:
                 != set(self.expert_ids)
                 or len(self.assignment_slices) != len(self.expert_ids)
                 or any(
-                    item.start + item.count
-                    > self.request.demand.counts[item.expert_id]
+                    item.start + item.count > self.request.demand.counts[item.expert_id]
                     for item in self.assignment_slices
                 )
                 or self.num_assignments

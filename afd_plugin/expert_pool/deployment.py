@@ -171,6 +171,7 @@ class PoolDeployment:
     batch_aware_replicas: bool = False
     shared_expert_overlap: bool = False
     full_e_direct: bool = False
+    partial_reduction: bool = False
     tcp_authkey: str = ""
 
     def __post_init__(self) -> None:
@@ -231,7 +232,9 @@ class PoolDeployment:
         }:
             raise ValueError("Unknown expert dispatch mode")
         self.batching.validate_capacity(self.receive_slots, self.max_tokens)
-        if self.execution.audit_batch_members and not self.local_full_pipeline:
+        if self.execution.audit_batch_members and not (
+            self.local_full_pipeline or self.partial_reduction
+        ):
             raise ValueError("Local batch audit requires a full E pipeline")
         if self.local_full_pipeline and (
             self.batching.max_wait_us or self.execution.collect_cost_feedback
@@ -281,6 +284,19 @@ class PoolDeployment:
             )
         if type(self.direct_dispatch) is not bool:
             raise ValueError("Direct dispatch must be an explicit boolean")
+        if type(self.partial_reduction) is not bool or (
+            self.partial_reduction
+            and (
+                not self.direct_dispatch
+                or not self.packed_input
+                or self.batching.max_wait_us
+                or self.execution.validate_client_values
+                or self.execution.collect_cost_feedback
+            )
+        ):
+            raise ValueError(
+                "Partial reduction requires trusted direct packed input and zero wait"
+            )
         if type(self.packed_input) is not bool or (
             self.packed_input and not self.direct_dispatch
         ):

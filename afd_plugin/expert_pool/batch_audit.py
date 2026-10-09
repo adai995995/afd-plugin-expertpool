@@ -66,12 +66,16 @@ class BatchAudit:
                 "assignment_ranges": ranges,
                 "completed": False,
             }
-            if plan.request.demand is None:
+            actual_rows = plan.input_rows or plan.request.num_tokens
+            if plan.request.partial_reduction:
+                member["packed_token_rows"] = actual_rows
+                member["output_layout"] = "fp32-partial-token-hidden"
+            if plan.request.demand is None or plan.request.partial_reduction:
                 member["input_row_range"] = [
                     row_begin,
-                    row_begin + plan.request.num_tokens,
+                    row_begin + actual_rows,
                 ]
-            row_begin += plan.request.num_tokens
+            row_begin += actual_rows
             members.append(member)
             self.pending[plan.plan_id] = member
             for expert, count in counts.items():
@@ -83,7 +87,9 @@ class BatchAudit:
                 "model_id": plans[0].request.model_id,
                 "placement_version": plans[0].request.placement_version,
                 "layer_id": plans[0].request.layer_id,
-                "token_rows": sum(plan.request.num_tokens for plan in plans),
+                "token_rows": sum(
+                    plan.input_rows or plan.request.num_tokens for plan in plans
+                ),
                 "expert_assignments": totals,
                 "members": members,
             }

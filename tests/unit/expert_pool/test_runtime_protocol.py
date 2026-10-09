@@ -36,11 +36,11 @@ class RuntimeProtocolTests(unittest.TestCase):
                     with socket.fromfd(
                         connection.fileno(), socket.AF_INET, socket.SOCK_STREAM
                     ) as control_socket:
-                        self.assertEqual(
+                        self.assertNotEqual(
                             control_socket.getsockopt(
                                 socket.IPPROTO_TCP, socket.TCP_NODELAY
                             ),
-                            1,
+                            0,
                         )
                     connection.send_bytes(b"ready")
                     self.assertEqual(

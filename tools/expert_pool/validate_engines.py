@@ -425,6 +425,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 demand_aware=args.expert_demand,
                 direct_dispatch=args.direct_dispatch,
                 full_e_direct=args.full_e_direct,
+                partial_reduction=args.partial_reduction,
                 packed_input=args.packed_input,
                 pooled_admission=args.pooled_admission,
                 compact_output=args.compact_output,
@@ -1268,6 +1269,7 @@ def main() -> int:
         help="Whole-layer E with preallocated transport slots and asynchronous done",
     )
     parser.add_argument("--packed-input", action="store_true")
+    parser.add_argument("--partial-reduction", action="store_true")
     parser.add_argument("--pooled-admission", action="store_true")
     parser.add_argument(
         "--expert-replicated",
@@ -1305,6 +1307,10 @@ def main() -> int:
         )
     if args.packed_input and not args.direct_dispatch:
         parser.error("--packed-input requires --direct-dispatch")
+    if args.partial_reduction and (not args.direct_dispatch or not args.packed_input):
+        parser.error(
+            "--partial-reduction requires --direct-dispatch and --packed-input"
+        )
     if args.pooled_admission and (
         not args.controller
         or args.controller_policy != "ready_first"

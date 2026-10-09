@@ -48,6 +48,7 @@ class FanoutPoolClient(ControlledPoolClient):
         compact_output: bool = False,
         receive_slots: int = 1,
         expert_replicated: bool = False,
+        partial_reduction: bool = False,
     ) -> None:
         if scheduling_policy != "ready_first":
             raise ValueError("Expert partitions require ready-first gang admission")
@@ -63,6 +64,11 @@ class FanoutPoolClient(ControlledPoolClient):
         if type(compact_output) is not bool or (compact_output and not demand_aware):
             raise ValueError("Compact output requires expert-demand dispatch")
         self.compact_output = compact_output
+        if type(partial_reduction) is not bool or (
+            partial_reduction and (not compact_output or control is not None)
+        ):
+            raise ValueError("Partial reduction requires direct compact execution")
+        self.partial_reduction = partial_reduction
         if (
             type(receive_slots) is not int
             or not 1 <= receive_slots <= MAX_RECEIVE_SLOTS
@@ -90,7 +96,7 @@ class FanoutPoolClient(ControlledPoolClient):
                 directory.hidden_size,
                 channels[0].transport.device,
             )
-            if compact_output
+            if compact_output and not partial_reduction
             else None
         )
         self.output_transfer = {"received_bytes": 0, "dense_equivalent_bytes": 0}
@@ -98,6 +104,10 @@ class FanoutPoolClient(ControlledPoolClient):
             worker_id: {"received_bytes": 0, "dense_equivalent_bytes": 0}
             for worker_id in self.channels
         }
+        if partial_reduction:
+            self.output_transfer["slot_equivalent_bytes"] = 0
+            for counters in self.worker_output_transfer.values():
+                counters["slot_equivalent_bytes"] = 0
         self.layer_expert_counts = {
             placement.layer_id: placement.num_experts
             for placement in self.directory.placements
@@ -111,7 +121,7 @@ class FanoutPoolClient(ControlledPoolClient):
                 )
                 for count in set(self.layer_expert_counts.values())
             }
-            if demand_aware
+            if demand_aware and not partial_reduction
             else {}
         )
         self.parent_layer_calls = dict.fromkeys(self.layer_expert_counts, 0)
@@ -168,6 +178,20 @@ class FanoutPoolClient(ControlledPoolClient):
 
     def _output_received(self, plan: ExecutionPlan) -> None:
         pass
+
+    def _prepare_demand(
+        self,
+        request: CallRequest,
+        inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[CallRequest, DispatchPlan, dict[str, float]]:
+        demand, metrics = self.collectors[
+            self.layer_expert_counts[request.layer_id]
+        ].collect(inputs[2])
+        request = replace(request, demand=demand, compact_output=self.compact_output)
+        started = time.perf_counter_ns()
+        dispatch = plan_expert_demand(self.directory, request)
+        metrics["client_demand_plan_ms"] = (time.perf_counter_ns() - started) / 1e6
+        return request, dispatch, metrics
 
     def _finish_replies(
         self, replies: FanoutReplies, owners: tuple[str, ...]
@@ -259,9 +283,9 @@ class FanoutPoolClient(ControlledPoolClient):
             dispatch_plan = None
             if self.demand_aware:
                 try:
-                    demand, demand_metrics = self.collectors[
-                        self.layer_expert_counts[layer_id]
-                    ].collect(topk_ids)
+                    request, dispatch_plan, demand_metrics = self._prepare_demand(
+                        request, (hidden_states, topk_weights, topk_ids)
+                    )
                 except ValueError:
                     # Metadata rejection or invalid-ID rejection after the
                     # completed summary copy posts no controller/NCCL work.
@@ -271,15 +295,7 @@ class FanoutPoolClient(ControlledPoolClient):
                     # in flight even though no request has been submitted yet.
                     self.failed = True
                     raise
-                request = replace(
-                    request, demand=demand, compact_output=self.compact_output
-                )
-                planning_started = time.perf_counter_ns()
-                dispatch_plan = plan_expert_demand(self.directory, request)
                 owners = dispatch_plan.owners
-                demand_metrics["client_demand_plan_ms"] = (
-                    time.perf_counter_ns() - planning_started
-                ) / 1e6
             submitted = time.perf_counter_ns()
             self.sequence += 1
             issued = True
@@ -323,17 +339,21 @@ class FanoutPoolClient(ControlledPoolClient):
             )
             granted = time.perf_counter_ns()
             for owner in owners:
-                self.channels[owner].transport.transfer(
-                    owner_inputs[owner], send=True
-                )
+                self.channels[owner].transport.transfer(owner_inputs[owner], send=True)
             inputs_sent = time.perf_counter_ns()
             if self.receive_slots == 1:
                 for owner in owners:
                     self._fanout_reply(replies, "output_ready", owner)
             output_ready = time.perf_counter_ns()
             ready_wait_ns = output_ready - inputs_sent
-            slots = hidden_states.new_zeros(
-                (request.num_tokens, request.top_k, request.hidden_size)
+            slots = (
+                hidden_states.new_zeros(
+                    (request.num_tokens, request.hidden_size), dtype=torch.float32
+                )
+                if self.partial_reduction
+                else hidden_states.new_zeros(
+                    (request.num_tokens, request.top_k, request.hidden_size)
+                )
             )
             partial = None if self.compact_output else torch.empty_like(slots)
             route_indices = None if self.compact_output else topk_ids.long()
@@ -348,7 +368,12 @@ class FanoutPoolClient(ControlledPoolClient):
                 else:
                     owner = remaining[0]
                 remaining.remove(owner)
-                if self.compact_output:
+                if self.partial_reduction:
+                    plan = grants[owner].plan
+                    received = self.token_dispatcher.workspaces[owner].output[
+                        : plan.input_rows
+                    ]
+                elif self.compact_output:
                     assert self.output_workspace is not None
                     plan = grants[owner].plan
                     assert plan is not None and plan.num_assignments is not None
@@ -360,7 +385,11 @@ class FanoutPoolClient(ControlledPoolClient):
                     received = partial
                 self.channels[owner].transport.transfer((received,), send=False)
                 restore_started = time.perf_counter_ns()
-                if self.compact_output:
+                if self.partial_reduction:
+                    # Retain independent per-E replies and accumulate below in
+                    # stable owner order, not network completion order.
+                    pass
+                elif self.compact_output:
                     self.output_workspace.scatter(
                         received,
                         self.output_routes.get(owner, topk_ids),
@@ -387,14 +416,23 @@ class FanoutPoolClient(ControlledPoolClient):
                 output_bytes[owner] = received.numel() * received.element_size()
                 self._output_received(grants[owner].plan)
             output_received = time.perf_counter_ns()
-            output = torch.empty_like(hidden_states)
-            if request.num_tokens:
+            if self.partial_reduction:
+                restore_started = time.perf_counter_ns()
+                for owner in sorted(owners):
+                    rows = grants[owner].plan.input_rows
+                    workspace = self.token_dispatcher.workspaces[owner]
+                    slots.index_add_(
+                        0, workspace.row_ids[:rows], workspace.output[:rows]
+                    )
+                output = slots.to(hidden_states.dtype)
+                output_restore_submit_ns += time.perf_counter_ns() - restore_started
+            else:
+                output = torch.empty_like(hidden_states)
+            if request.num_tokens and not self.partial_reduction:
                 ops.moe_sum(slots, output)
             completions = self._finish_replies(replies, owners)
             finished = time.perf_counter_ns()
-            dispatch_wait_ns, grant_wait_ns, route_mapping_ns = (
-                self._admission_phase_ns
-            )
+            dispatch_wait_ns, grant_wait_ns, route_mapping_ns = self._admission_phase_ns
             admission_ns = granted - submitted
             metrics = {
                 **demand_metrics,
@@ -432,7 +470,12 @@ class FanoutPoolClient(ControlledPoolClient):
                         self.worker_expert_assignments[owner][str(layer_id)][
                             str(expert)
                         ] += plan.assignments_for(expert)
-                dense_bytes = slots.numel() * slots.element_size()
+                dense_bytes = (
+                    request.num_tokens
+                    * request.top_k
+                    * request.hidden_size
+                    * hidden_states.element_size()
+                )
                 self.worker_output_transfer[owner]["received_bytes"] += output_bytes[
                     owner
                 ]
@@ -441,6 +484,16 @@ class FanoutPoolClient(ControlledPoolClient):
                 )
                 self.output_transfer["received_bytes"] += output_bytes[owner]
                 self.output_transfer["dense_equivalent_bytes"] += dense_bytes
+                if self.partial_reduction:
+                    slot_bytes = (
+                        plan.num_assignments
+                        * request.hidden_size
+                        * hidden_states.element_size()
+                    )
+                    self.output_transfer["slot_equivalent_bytes"] += slot_bytes
+                    self.worker_output_transfer[owner]["slot_equivalent_bytes"] += (
+                        slot_bytes
+                    )
                 self.worker_calls[owner] += 1
                 self.worker_layer_calls[owner][layer_id] += 1
                 self.selected_worker_layer_calls[owner][layer_id] += 1
@@ -492,7 +545,9 @@ class FanoutPoolClient(ControlledPoolClient):
             else "controller-expert-partitioned-gang"
         )
         result["output_contract"] = (
-            "compact-weighted-top-k-slots"
+            "fp32-partial-token-hidden"
+            if self.partial_reduction
+            else "compact-weighted-top-k-slots"
             if self.compact_output
             else "weighted-top-k-slots"
         )

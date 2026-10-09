@@ -74,9 +74,13 @@ class PipelineSlot:
 
 class WorkerPipeline:
     def __init__(self, worker: ExpertWorker, receive_slots: int) -> None:
-        if not worker.local_full_pipeline and (
-            (worker.controller is None and not worker.direct_dispatch)
-            or worker.output_workspace is None
+        if (
+            not worker.local_full_pipeline
+            and not worker.partial_reduction
+            and (
+                (worker.controller is None and not worker.direct_dispatch)
+                or worker.output_workspace is None
+            )
         ):
             raise ValueError(
                 "Pipeline requires controlled or direct compact partitions"
@@ -106,7 +110,7 @@ class WorkerPipeline:
                     worker.weights if index == 0 else torch.empty_like(worker.weights),
                     worker.ids if index == 0 else torch.empty_like(worker.ids),
                     None
-                    if worker.local_full_pipeline
+                    if worker.local_full_pipeline or worker.partial_reduction
                     else (
                         worker.output_workspace
                         if index == 0
@@ -122,9 +126,9 @@ class WorkerPipeline:
                         (
                             worker.output
                             if index == 0
-                            else torch.empty_like(worker.hidden)
+                            else torch.empty_like(worker.output)
                         )
-                        if worker.local_full_pipeline
+                        if worker.local_full_pipeline or worker.partial_reduction
                         else None
                     ),
                 )
@@ -276,9 +280,19 @@ class WorkerPipeline:
                 plan.request.num_tokens
                 * (1 if worker.local_full_pipeline else plan.request.top_k)
                 * plan.request.hidden_size
-                * slot.result.element_size()
+                * (
+                    slot.hidden.element_size()
+                    if worker.partial_reduction
+                    else slot.result.element_size()
+                )
             )
             worker.completed_calls += 1
+            if worker.partial_reduction:
+                worker.output_transfer["slot_equivalent_bytes"] += (
+                    plan.num_assignments
+                    * plan.request.hidden_size
+                    * slot.hidden.element_size()
+                )
             worker.client_calls[plan.request.key.client_id] += 1
             worker.layer_calls[plan.request.layer_id] += 1
             if not worker.local_full_pipeline:
@@ -417,9 +431,7 @@ class WorkerPipeline:
                         self.worker.device,
                     )
                     routes = slot.ids[:rows]
-                    if plan.assignment_slices or (
-                        plan.input_rows is not None and rows < plan.request.num_tokens
-                    ):
+                    if plan.assignment_slices or plan.input_rows is not None:
                         masks.append(
                             (routes >= 0)
                             & slot.task_ownership[routes.clamp_min(0).long()]
@@ -430,7 +442,11 @@ class WorkerPipeline:
                     masks[0] if len(masks) == 1 else torch.cat(masks, dim=0)
                 )
             result = (
-                self.worker.executors[layer].forward(*inputs)
+                self.worker.executors[layer].forward_partial(
+                    *inputs, assignment_mask=assignment_mask
+                )
+                if self.worker.partial_reduction
+                else self.worker.executors[layer].forward(*inputs)
                 if self.worker.local_full_pipeline
                 else self.worker.executors[layer].forward_slots(
                     *inputs, assignment_mask=assignment_mask
@@ -442,7 +458,7 @@ class WorkerPipeline:
                 slot.result = result[offset : offset + rows]
                 offset += rows
                 slot.begin.record()
-                if self.worker.local_full_pipeline:
+                if self.worker.local_full_pipeline or self.worker.partial_reduction:
                     assert slot.output is not None
                     slot.outgoing = slot.output[:rows]
                     slot.outgoing.copy_(slot.result)

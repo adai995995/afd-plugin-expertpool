@@ -174,6 +174,24 @@ class ExpertExecutor(nn.Module):
         )
 
     @torch.inference_mode()
+    def forward_partial(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        assignment_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """FP32 sum of weighted BF16 slots, without rounding each E's sum.
+
+        Router weights are already applied by forward_slots. The A adds these
+        partials in stable destination order and converts to BF16 only once.
+        FP32 grouping may differ from native summation order; validate error.
+        """
+        return self.forward_slots(
+            hidden_states, topk_weights, topk_ids, assignment_mask
+        ).sum(dim=1, dtype=torch.float32)
+
+    @torch.inference_mode()
     def forward_slots(
         self,
         hidden_states: torch.Tensor,

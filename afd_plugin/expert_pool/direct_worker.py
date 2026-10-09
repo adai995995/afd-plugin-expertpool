@@ -35,7 +35,8 @@ class DirectWorkerPipeline(WorkerPipeline):
         self.book = DirectSlots(worker.directory, identities)
         self.audit = (
             BatchAudit(MAX_AUDIT_RECORDS)
-            if worker.full_e_direct and worker.execution.audit_batch_members
+            if (worker.full_e_direct or worker.partial_reduction)
+            and worker.execution.audit_batch_members
             else None
         )
         self.progress_waiter = ProgressWaiter(
@@ -104,6 +105,7 @@ class DirectWorkerPipeline(WorkerPipeline):
                         "startup_complete": int(self.worker.startup["completed"]),
                         "packed_input": int(self.worker.packed_input),
                         "full_e_direct": int(self.worker.full_e_direct),
+                        "partial_reduction": int(self.worker.partial_reduction),
                     },
                 ),
             )
@@ -147,8 +149,11 @@ class DirectWorkerPipeline(WorkerPipeline):
             **super().snapshot(),
             "direct_dispatch": self.worker.direct_dispatch,
             "full_e_direct": self.worker.full_e_direct,
+            "partial_reduction": self.worker.partial_reduction,
             "output_layout": (
-                "reduced-token-hidden"
+                "fp32-partial-token-hidden"
+                if self.worker.partial_reduction
+                else "reduced-token-hidden"
                 if self.worker.full_e_direct
                 else "compact-assignments"
             ),

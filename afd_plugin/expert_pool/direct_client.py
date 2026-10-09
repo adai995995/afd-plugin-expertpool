@@ -29,6 +29,7 @@ from afd_plugin.expert_pool.protocol import (
 )
 from afd_plugin.expert_pool.replica_client import ReplicaPoolClient
 from afd_plugin.expert_pool.replica_dispatch import WorkerLoad, select_replicas
+from afd_plugin.expert_pool.token_dispatch import LocalTokenDispatcher
 
 
 class DirectFanoutPoolClient(FanoutPoolClient):
@@ -40,6 +41,7 @@ class DirectFanoutPoolClient(FanoutPoolClient):
         receive_slots: int,
         expert_replicated: bool = False,
         packed_input: bool = False,
+        partial_reduction: bool = False,
     ) -> None:
         super().__init__(
             channels,
@@ -48,11 +50,16 @@ class DirectFanoutPoolClient(FanoutPoolClient):
             compact_output=True,
             receive_slots=receive_slots,
             expert_replicated=expert_replicated,
+            partial_reduction=partial_reduction,
         )
         if not 0 <= client_slot < receive_slots:
             raise ValueError("Direct client requires its own fixed slot")
         if type(packed_input) is not bool:
             raise ValueError("Packed input must be an explicit boolean")
+        if type(partial_reduction) is not bool or (
+            partial_reduction and not packed_input
+        ):
+            raise ValueError("Partial reduction requires exact packed input")
         self.client_slot = client_slot
         self.packed_input = packed_input
         self.input_workspaces: dict[str, CompactInputWorkspace] = {}
@@ -64,6 +71,12 @@ class DirectFanoutPoolClient(FanoutPoolClient):
         self.generations = dict.fromkeys(self.channels, 0)
         self.feedback_messages = 0
         self.connections = {c.control: w for w, c in self.channels.items()}
+        self.token_dispatcher = (
+            LocalTokenDispatcher(self.directory, channels[0].transport.device)
+            if partial_reduction
+            else None
+        )
+        self.token_payloads = {}
         for channel in self.channels.values():
             message = receive_message(channel.control, self.timeout_s)
             if (
@@ -72,6 +85,8 @@ class DirectFanoutPoolClient(FanoutPoolClient):
                 or message.metrics.get("slot_id") != client_slot
                 or message.metrics.get("receive_slots") != receive_slots
                 or bool(message.metrics.get("packed_input")) != packed_input
+                or bool(message.metrics.get("partial_reduction", 0))
+                != partial_reduction
             ):
                 raise RuntimeError(
                     "Direct worker did not bind the expected slot/directory"
@@ -113,6 +128,19 @@ class DirectFanoutPoolClient(FanoutPoolClient):
     def _empty_reply(self, request: CallRequest) -> Message:
         return Message("empty_done", request=request)
 
+    def _prepare_demand(
+        self,
+        request: CallRequest,
+        inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[CallRequest, DispatchPlan, dict[str, float]]:
+        if not self.partial_reduction:
+            return super()._prepare_demand(request, inputs)
+        assert self.token_dispatcher is not None
+        dispatch, self.token_payloads, metrics = self.token_dispatcher.prepare(
+            request, inputs, self.loads, self.sequence + self.client_slot
+        )
+        return dispatch.request, dispatch, metrics
+
     def _admit(
         self,
         request: CallRequest,
@@ -125,7 +153,7 @@ class DirectFanoutPoolClient(FanoutPoolClient):
         dict[str, Message],
         dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     ]:
-        if self.directory.expert_replicated:
+        if self.directory.expert_replicated and not self.partial_reduction:
             dispatch_plan = select_replicas(
                 self.directory, request, self.loads, self.sequence + self.client_slot
             )
@@ -143,11 +171,13 @@ class DirectFanoutPoolClient(FanoutPoolClient):
             # Unique selected rows cannot exceed selected assignments. Avoid
             # a per-owner GPU→CPU shape wait unless this bound alone proves
             # at least a twofold input-row reduction.
-            should_pack = (
-                self.packed_input
-                and should_pack_task(task.num_assignments, request.num_tokens)
+            should_pack = self.packed_input and should_pack_task(
+                task.num_assignments, request.num_tokens
             )
-            if should_pack:
+            if self.partial_reduction:
+                payloads[owner] = self.token_payloads[owner]
+                self.packed_tasks += 1
+            elif should_pack:
                 if owner not in self.input_workspaces:
                     channel = self.channels[owner]
                     self.input_workspaces[owner] = CompactInputWorkspace(
@@ -179,9 +209,7 @@ class DirectFanoutPoolClient(FanoutPoolClient):
                 tensor.numel() * tensor.element_size() for tensor in inputs
             )
         self.input_pack_ms = (
-            (time.perf_counter_ns() - pack_started) / 1e6
-            if self.packed_input
-            else 0.0
+            (time.perf_counter_ns() - pack_started) / 1e6 if self.packed_input else 0.0
         )
         replies = FanoutReplies(
             request,
@@ -204,7 +232,11 @@ class DirectFanoutPoolClient(FanoutPoolClient):
                 expert_ids=task.expert_ids,
                 num_assignments=task.num_assignments,
                 input_rows=payloads[owner][0].shape[0] if self.packed_input else None,
+                assignment_slices=task.assignment_slices,
             )
+            if self.partial_reduction:
+                while sum(w == owner for w, _ in self.events.pending) >= 2:
+                    self._drain(block=True)
             self.events.register(plan)
             # Local plan metadata reuses the existing result assembly contract.
             # This is not an E acknowledgement and no grant is sent on the wire.
@@ -245,6 +277,7 @@ class DirectFanoutPoolClient(FanoutPoolClient):
             policy="direct-local-expert-dispatch",
             direct_dispatch=True,
             packed_input=self.packed_input,
+            partial_reduction=self.partial_reduction,
             input_transfer=dict(self.input_transfer),
             packed_tasks=self.packed_tasks,
             dense_tasks=self.dense_tasks,

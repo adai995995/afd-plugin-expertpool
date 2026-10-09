@@ -41,10 +41,13 @@ def create_app(
 
     deployment = PoolDeployment.read(deployment_path)
     if client_id not in deployment.client_ids or not (
-        deployment.pooled_admission or deployment.local_full_pipeline
+        deployment.pooled_admission
+        or deployment.local_full_pipeline
+        or deployment.partial_reduction
     ):
         raise ValueError(
-            "A service requires pooled admission or a local full E pipeline"
+            "A service requires pooled admission, a local full E pipeline, "
+            "or direct partial reduction"
         )
     if not native_reference:
         register_expert_pool()

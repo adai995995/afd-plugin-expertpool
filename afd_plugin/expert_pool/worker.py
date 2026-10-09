@@ -66,6 +66,7 @@ class ExpertWorker:
         expert_replicated: bool = False,
         direct_dispatch: bool = False,
         full_e_direct: bool = False,
+        partial_reduction: bool = False,
         packed_input: bool = False,
         batch_capture: BatchInputCapture | None = None,
     ) -> None:
@@ -158,6 +159,14 @@ class ExpertWorker:
         ):
             raise ValueError("Direct full E requires one complete transport slot per A")
         self.full_e_direct = full_e_direct
+        if type(partial_reduction) is not bool or (
+            partial_reduction
+            and (not direct_dispatch or not packed_input or not compact_output)
+        ):
+            raise ValueError(
+                "Partial reduction requires direct compact packed execution"
+            )
+        self.partial_reduction = partial_reduction
         if batch_capture is not None and not self.local_full_pipeline:
             raise ValueError("Real input capture currently requires local full E")
         self.batch_capture = batch_capture
@@ -178,11 +187,12 @@ class ExpertWorker:
         if not isinstance(batching, BatchingOptions):
             raise ValueError("Worker requires typed batching options")
         batching.validate_capacity(receive_slots, directory.max_tokens)
-        if self.local_full_pipeline and (
+        if (self.local_full_pipeline or self.partial_reduction) and (
             batching.max_wait_us or self.execution.collect_cost_feedback
         ):
             raise ValueError(
-                "Local full E requires zero wait and no demand cost feedback"
+                "Local full E and partial reduction require zero wait "
+                "and no demand cost feedback"
             )
         self.batching = batching
         if type(expert_replicated) is not bool or (
@@ -223,7 +233,7 @@ class ExpertWorker:
                 directory.hidden_size,
                 self.device,
             )
-            if compact_output
+            if compact_output and not partial_reduction
             else None
         )
         self.ownership = (
@@ -239,7 +249,9 @@ class ExpertWorker:
             else {}
         )
         self.output = (
-            None
+            torch.empty_like(self.hidden, dtype=torch.float32)
+            if partial_reduction
+            else None
             if compact_output
             else (
                 torch.empty(
@@ -257,6 +269,8 @@ class ExpertWorker:
             else None
         )
         self.output_transfer = {"sent_bytes": 0, "dense_equivalent_bytes": 0}
+        if partial_reduction:
+            self.output_transfer["slot_equivalent_bytes"] = 0
         self.completed_calls = 0
         self.client_calls = dict.fromkeys(self.peers, 0)
         self.layer_calls = dict.fromkeys(self.executors, 0)
@@ -460,6 +474,8 @@ class ExpertWorker:
             raise RuntimeError("Worker and plan demand modes disagree")
         if self.compact_output != plan.request.compact_output:
             raise RuntimeError("Worker and plan output layouts disagree")
+        if self.partial_reduction != plan.request.partial_reduction:
+            raise RuntimeError("Worker and plan reduction layouts disagree")
         if (plan.input_rows is not None) != self.packed_input:
             raise RuntimeError("Worker and plan input layouts disagree")
         if self.demand_aware:

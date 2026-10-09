@@ -57,6 +57,7 @@ def build_deployment(
     batch_aware_replicas: bool = False,
     shared_expert_overlap: bool = False,
     batching: BatchingOptions = DISABLED_BATCHING,
+    partial_reduction: bool = False,
 ) -> PoolDeployment:
     """Describe one shared E pool and distinct A clients without loading weights."""
 
@@ -122,14 +123,20 @@ def build_deployment(
             reuse_cuda_events=True,
             defer_output_sync=True,
             warmup_before_ready=True,
+            audit_batch_members=partial_reduction,
         ),
         workers=workers,
-        controller=ControllerConfig(str(socket_dir), "ready_first"),
+        controller=None
+        if partial_reduction
+        else ControllerConfig(str(socket_dir), "ready_first"),
         dispatch_mode="expert_partitioned",
         demand_aware=True,
         compact_output=True,
         receive_slots=client_count,
-        pooled_admission=True,
+        pooled_admission=not partial_reduction,
+        direct_dispatch=partial_reduction,
+        packed_input=partial_reduction,
+        partial_reduction=partial_reduction,
         expert_replicated=bool(replicated_experts),
         split_assignments=split_assignments,
         batch_aware_replicas=batch_aware_replicas,
@@ -143,16 +150,22 @@ def build_deployment(
 def with_tcp_endpoints(
     deployment: PoolDeployment,
     worker_hosts: tuple[str, ...],
-    controller_host: str,
+    controller_host: str | None,
     control_port_base: int,
     nccl_port_base: int,
 ) -> PoolDeployment:
     """Bind each existing A–E pair and Controller identity to a TCP endpoint."""
 
-    if len(worker_hosts) != len(deployment.worker_ids) or not controller_host:
+    if len(worker_hosts) != len(deployment.worker_ids) or (
+        deployment.controller is not None and not controller_host
+    ):
         raise ValueError("TCP deployment needs one host per E and a Controller host")
     pair_count = len(deployment.clients)
-    controller_count = len(deployment.client_ids) + len(deployment.worker_ids)
+    controller_count = (
+        len(deployment.client_ids) + len(deployment.worker_ids)
+        if deployment.controller is not None
+        else 0
+    )
     control_ports = range(control_port_base, control_port_base + pair_count)
     nccl_ports = range(nccl_port_base, nccl_port_base + pair_count)
     controller_ports = range(
@@ -173,7 +186,6 @@ def with_tcp_endpoints(
         )
         for index, endpoint in enumerate(deployment.clients)
     )
-    assert deployment.controller is not None
     return replace(
         deployment,
         clients=clients,
@@ -181,7 +193,9 @@ def with_tcp_endpoints(
             deployment.controller,
             tcp_host=controller_host,
             tcp_port_base=control_port_base + pair_count,
-        ),
+        )
+        if deployment.controller is not None
+        else None,
         tcp_authkey=secrets.token_hex(32),
     )
 
@@ -220,6 +234,11 @@ def main() -> None:
     parser.add_argument("--batch-max-calls", type=int, default=1)
     parser.add_argument("--batch-max-tokens", type=int, default=0)
     parser.add_argument("--batch-max-wait-us", type=int, default=0)
+    parser.add_argument(
+        "--partial-reduction",
+        action="store_true",
+        help="Local Expert selection, exact packed rows and FP32 partial replies",
+    )
     parser.add_argument("--worker-host", action="append", default=[])
     parser.add_argument("--controller-host")
     parser.add_argument("--control-port-base", type=int)
@@ -248,6 +267,7 @@ def main() -> None:
             batch_aware_replicas=args.batch_aware_replicas,
             shared_expert_overlap=args.shared_expert_overlap,
             batching=batching,
+            partial_reduction=args.partial_reduction,
         )
         if (
             args.worker_host
@@ -256,7 +276,7 @@ def main() -> None:
             or args.nccl_port_base is not None
         ):
             if (
-                not args.controller_host
+                (not args.partial_reduction and not args.controller_host)
                 or args.control_port_base is None
                 or args.nccl_port_base is None
             ):
@@ -280,6 +300,7 @@ def main() -> None:
                 "workers": deployment.worker_ids,
                 "batching": asdict(deployment.batching),
                 "shared_expert_overlap": deployment.shared_expert_overlap,
+                "partial_reduction": deployment.partial_reduction,
                 "socket_dir": str(socket_dir),
             }
         )
