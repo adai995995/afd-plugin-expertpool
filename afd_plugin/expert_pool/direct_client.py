@@ -20,6 +20,7 @@ from afd_plugin.expert_pool.fanout_client import FanoutPoolClient
 from afd_plugin.expert_pool.fanout_protocol import FanoutReplies
 from afd_plugin.expert_pool.metrics import CallMetrics
 from afd_plugin.expert_pool.protocol import (
+    MAX_ACTIVE_EXPERT_REPLICAS,
     CallRequest,
     DispatchPlan,
     ExecutionPlan,
@@ -42,7 +43,14 @@ class DirectFanoutPoolClient(FanoutPoolClient):
         expert_replicated: bool = False,
         packed_input: bool = False,
         partial_reduction: bool = False,
+        active_expert_replicas: int = 1,
     ) -> None:
+        if (
+            type(active_expert_replicas) is not int
+            or not 1 <= active_expert_replicas <= MAX_ACTIVE_EXPERT_REPLICAS
+            or (active_expert_replicas > 1 and not partial_reduction)
+        ):
+            raise ValueError("Multiple active Expert copies require partial reduction")
         super().__init__(
             channels,
             None,
@@ -72,11 +80,17 @@ class DirectFanoutPoolClient(FanoutPoolClient):
         self.feedback_messages = 0
         self.connections = {c.control: w for w, c in self.channels.items()}
         self.token_dispatcher = (
-            LocalTokenDispatcher(self.directory, channels[0].transport.device)
+            LocalTokenDispatcher(
+                self.directory,
+                channels[0].transport.device,
+                active_expert_replicas=active_expert_replicas,
+            )
             if partial_reduction
             else None
         )
         self.token_payloads = {}
+        self.active_expert_replicas = active_expert_replicas
+        self.split_expert_calls = 0
         for channel in self.channels.values():
             message = receive_message(channel.control, self.timeout_s)
             if (
@@ -139,6 +153,7 @@ class DirectFanoutPoolClient(FanoutPoolClient):
         dispatch, self.token_payloads, metrics = self.token_dispatcher.prepare(
             request, inputs, self.loads, self.sequence + self.client_slot
         )
+        self.split_expert_calls += int(metrics["client_split_experts"])
         return dispatch.request, dispatch, metrics
 
     def _admit(
@@ -278,6 +293,8 @@ class DirectFanoutPoolClient(FanoutPoolClient):
             direct_dispatch=True,
             packed_input=self.packed_input,
             partial_reduction=self.partial_reduction,
+            active_expert_replicas=self.active_expert_replicas,
+            split_expert_calls=self.split_expert_calls,
             input_transfer=dict(self.input_transfer),
             packed_tasks=self.packed_tasks,
             dense_tasks=self.dense_tasks,

@@ -114,6 +114,9 @@ class PartialContractTests(unittest.TestCase):
             self.assertTrue(deployment.direct_dispatch)
             self.assertTrue(deployment.packed_input)
             self.assertTrue(deployment.execution.audit_batch_members)
+            self.assertEqual(deployment.active_expert_replicas, 1)
+            split = replace(deployment, active_expert_replicas=2)
+            self.assertEqual(split.active_expert_replicas, 2)
             remote = with_tcp_endpoints(
                 deployment,
                 ("127.0.0.1", "127.0.0.2"),
@@ -125,10 +128,19 @@ class PartialContractTests(unittest.TestCase):
             path = root / "deployment.json"
             write_private_deployment(path, remote)
             self.assertEqual(PoolDeployment.read(path), remote)
+            old = json.loads(path.read_text())
+            del old["active_expert_replicas"]
+            path.write_text(json.dumps(old))
+            self.assertEqual(PoolDeployment.read(path).active_expert_replicas, 1)
             for changes in (
                 {"packed_input": False},
                 {"direct_dispatch": False},
                 {"partial_reduction": 1},
+                {"active_expert_replicas": 0},
+                {"active_expert_replicas": 3},
+                {"active_expert_replicas": True},
+                {"active_expert_replicas": 2, "partial_reduction": False},
+                {"active_expert_replicas": 2, "expert_replicated": False},
                 {"batching": BatchingOptions(2, 32, 100)},
                 {
                     "execution": replace(

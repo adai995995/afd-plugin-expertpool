@@ -15,6 +15,7 @@ from multiprocessing.connection import Connection
 MAX_CONTROL_BYTES = 65536
 MAX_DEMAND_EXPERTS = 4096
 MAX_RECEIVE_SLOTS = 8
+MAX_ACTIVE_EXPERT_REPLICAS = 2
 MESSAGE_KINDS = frozenset(
     {
         "submit",

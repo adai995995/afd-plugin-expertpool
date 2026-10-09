@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Local resident selection, exact token packing and a single shape summary.
 
-Each logical Expert selects one resident copy per call. The GPU assigns every
-Top-k slot to that copy and deduplicates rows per destination. Only bounded
+Each logical Expert selects up to two resident copies per call. The GPU assigns
+stable, disjoint Top-k ranges and deduplicates rows per destination. Only bounded
 counts reach the host; IDs, activations and the return row map stay on GPU.
 The summary wait is required by this NCCL backend, not claimed asynchronous.
 """
@@ -12,17 +12,62 @@ import time
 from dataclasses import replace
 
 import torch
-from vllm.triton_utils import triton
+from vllm.triton_utils import tl, triton
 
 from afd_plugin.expert_pool.compact_input import ROW_BLOCK_SIZE, _row_indices
 from afd_plugin.expert_pool.directory import PoolDirectory
 from afd_plugin.expert_pool.protocol import (
+    MAX_ACTIVE_EXPERT_REPLICAS,
+    AssignmentSlice,
     CallRequest,
     DispatchPlan,
     ExpertDemand,
     ExpertTask,
 )
 from afd_plugin.expert_pool.replica_dispatch import WorkerLoad
+
+ASSIGNMENT_BLOCK_SIZE = 256
+
+
+@triton.jit
+def _expert_block_counts(ids, counts, slots, stride, block: tl.constexpr):
+    expert = tl.program_id(0)
+    chunk = tl.program_id(1)
+    offsets = chunk * block + tl.arange(0, block)
+    routes = tl.load(ids + offsets, offsets < slots, other=-1)
+    matched = (offsets < slots) & (routes == expert)
+    tl.store(counts + expert * stride + chunk, tl.sum(matched.to(tl.int32), 0))
+
+
+@triton.jit
+def _split_destinations(
+    ids,
+    histogram,
+    choices,
+    prefix,
+    destinations,
+    slots,
+    stride,
+    multi_block: tl.constexpr,
+    replica_slots: tl.constexpr,
+    block: tl.constexpr,
+):
+    expert = tl.program_id(0)
+    chunk = tl.program_id(1)
+    offsets = chunk * block + tl.arange(0, block)
+    routes = tl.load(ids + offsets, offsets < slots, other=-1)
+    matched = (offsets < slots) & (routes == expert)
+    ordinal = tl.cumsum(matched.to(tl.int32), 0) - 1
+    if multi_block:
+        ordinal += tl.load(prefix + expert * stride + chunk - 1, chunk > 0, other=0)
+    first = tl.load(choices + expert * replica_slots)
+    second = tl.load(choices + expert * replica_slots + 1)
+    count = tl.load(histogram + expert)
+    first_count = tl.where(second >= 0, (count + 1) // 2, count)
+    destination = tl.where(ordinal < first_count, first, second)
+    # Only this Expert's program writes these slots. Invalid IDs stay -1 until
+    # the existing single shape-summary copy rejects the call on the host.
+    tl.store(destinations + offsets, destination, matched)
 
 
 class TokenInputWorkspace:
@@ -68,11 +113,24 @@ class LocalTokenDispatcher:
     No global optimization, new feedback wait or centralized reservation occurs.
     """
 
-    def __init__(self, directory: PoolDirectory, device: torch.device):
+    def __init__(
+        self,
+        directory: PoolDirectory,
+        device: torch.device,
+        *,
+        active_expert_replicas: int = 1,
+    ):
         if not directory.expert_partitioned or device.type != "cuda":
             raise ValueError("Token dispatch requires a CUDA Expert directory")
+        if (
+            type(active_expert_replicas) is not int
+            or not 1 <= active_expert_replicas <= MAX_ACTIVE_EXPERT_REPLICAS
+            or (active_expert_replicas > 1 and not directory.expert_replicated)
+        ):
+            raise ValueError("Multiple active copies require resident Expert replicas")
         self.directory = directory
         self.device = device
+        self.active_expert_replicas = active_expert_replicas
         self.owners = tuple(sorted(w.worker_id for w in directory.workers))
         self.candidates = {
             p.layer_id: tuple(
@@ -89,6 +147,16 @@ class LocalTokenDispatcher:
             for owner in self.owners
         }
         count = max(p.num_experts for p in directory.placements)
+        self.split_destinations = self.block_counts = self.block_prefix = None
+        if active_expert_replicas > 1:
+            self.split_destinations = torch.empty(
+                (shape.max_tokens, shape.top_k), dtype=torch.int32, device=device
+            )
+            blocks = triton.cdiv(shape.max_tokens * shape.top_k, ASSIGNMENT_BLOCK_SIZE)
+            self.block_counts = torch.empty(
+                (count, blocks), dtype=torch.int32, device=device
+            )
+            self.block_prefix = torch.empty_like(self.block_counts)
         # Expert histogram, invalid-ID bin, then unique-row counts per E.
         self.summary = torch.empty(
             count + 1 + len(self.owners), dtype=torch.int64, device=device
@@ -114,15 +182,18 @@ class LocalTokenDispatcher:
                 copies[(expert + turn) % len(copies) :]
                 + copies[: (expert + turn) % len(copies)]
             )
-            choices.append(
-                min(
-                    rotated,
-                    key=lambda w: (
-                        loads[w].pending_assignments,
-                        loads[w].computing,
-                        loads[w].occupied_slots,
-                    ),
+
+            def load_key(worker):
+                return (
+                    loads[worker].pending_assignments,
+                    loads[worker].computing,
+                    loads[worker].occupied_slots,
                 )
+
+            choices.append(
+                (min(rotated, key=load_key),)
+                if self.active_expert_replicas == 1
+                else tuple(sorted(rotated, key=load_key)[: self.active_expert_replicas])
             )
         selected_ns = time.perf_counter_ns()
         ids = inputs[2]
@@ -133,10 +204,18 @@ class LocalTokenDispatcher:
                 compact_output=True,
                 partial_reduction=True,
             )
-            return DispatchPlan(empty, ()), {}, {"token_summary_wait_ms": 0.0}
+            return (
+                DispatchPlan(empty, ()),
+                {},
+                {"token_summary_wait_ms": 0.0, "client_split_experts": 0.0},
+            )
         self.begin.record()
         table = torch.tensor(
-            [self.owners.index(owner) for owner in choices],
+            [
+                [self.owners.index(owner) for owner in copies]
+                + [-1] * (self.active_expert_replicas - len(copies))
+                for copies in choices
+            ],
             dtype=torch.int32,
             device=self.device,
         )
@@ -145,7 +224,39 @@ class LocalTokenDispatcher:
         histogram = self.summary[: num_experts + 1]
         histogram.zero_()
         histogram.scatter_add_(0, indices.flatten(), torch.ones_like(indices.flatten()))
-        destinations = table[indices.clamp_max(num_experts - 1)].masked_fill(~valid, -1)
+        if self.active_expert_replicas == 1:
+            destinations = table[:, 0][indices.clamp_max(num_experts - 1)].masked_fill(
+                ~valid, -1
+            )
+        else:
+            assert self.split_destinations is not None
+            assert self.block_counts is not None and self.block_prefix is not None
+            slots = ids.numel()
+            blocks = triton.cdiv(slots, ASSIGNMENT_BLOCK_SIZE)
+            stride = self.block_counts.shape[1]
+            if blocks > 1:
+                _expert_block_counts[(num_experts, blocks)](
+                    ids, self.block_counts, slots, stride, ASSIGNMENT_BLOCK_SIZE
+                )
+                torch.cumsum(
+                    self.block_counts[:num_experts, :blocks],
+                    1,
+                    out=self.block_prefix[:num_experts, :blocks],
+                )
+            destinations = self.split_destinations[: request.num_tokens]
+            destinations.fill_(-1)
+            _split_destinations[(num_experts, blocks)](
+                ids,
+                histogram,
+                table,
+                self.block_prefix,
+                destinations,
+                slots,
+                stride,
+                blocks > 1,
+                self.active_expert_replicas,
+                ASSIGNMENT_BLOCK_SIZE,
+            )
         for index, owner in enumerate(self.owners):
             workspace = self.workspaces[owner]
             workspace.mark(destinations, index)
@@ -168,18 +279,47 @@ class LocalTokenDispatcher:
             compact_output=True,
             partial_reduction=True,
         )
+        assignments: dict[str, list[AssignmentSlice]] = {w: [] for w in self.owners}
+        split_experts = 0
+        for expert, copies in (
+            enumerate(choices) if self.active_expert_replicas > 1 else ()
+        ):
+            count = counts[expert]
+            if not count:
+                continue
+            active = min(count, len(copies))
+            split_experts += active > 1
+            start = 0
+            for index, owner in enumerate(copies[:active]):
+                share = (count - start + active - index - 1) // (active - index)
+                assignments[owner].append(AssignmentSlice(expert, start, share))
+                start += share
         tasks = []
         payloads = {}
         for index, owner in enumerate(self.owners):
-            experts = tuple(
-                e for e, w in enumerate(choices) if w == owner and counts[e]
+            slices = tuple(assignments[owner])
+            experts = (
+                tuple(item.expert_id for item in slices)
+                if self.active_expert_replicas > 1
+                else tuple(
+                    e
+                    for e, copies in enumerate(choices)
+                    if copies[0] == owner and counts[e]
+                )
             )
             rows = counts[num_experts + 1 + index]
             if not experts:
                 if rows:
                     raise RuntimeError("Empty destination has routed rows")
                 continue
-            task = ExpertTask(owner, experts, sum(counts[e] for e in experts))
+            task = ExpertTask(
+                owner,
+                experts,
+                sum(item.count for item in slices)
+                if self.active_expert_replicas > 1
+                else sum(counts[e] for e in experts),
+                slices if self.active_expert_replicas > 1 else (),
+            )
             if not 0 < rows <= min(request.num_tokens, task.num_assignments):
                 raise RuntimeError("Packed row accounting does not match assignments")
             tasks.append(task)
@@ -190,6 +330,7 @@ class LocalTokenDispatcher:
             payloads,
             {
                 "client_local_replica_select_ms": (selected_ns - started) / 1e6,
+                "client_split_experts": float(split_experts),
                 "token_summary_wait_ms": (waited - waiting) / 1e6,
                 "token_summary_host_ms": (waited - selected_ns) / 1e6,
                 "token_summary_gpu_ms": self.begin.elapsed_time(self.counted),

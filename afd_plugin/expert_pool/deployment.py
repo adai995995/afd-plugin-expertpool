@@ -17,7 +17,11 @@ from afd_plugin.expert_pool.batching import BatchingOptions
 from afd_plugin.expert_pool.controller import CONTROLLER_POLICIES
 from afd_plugin.expert_pool.directory import PoolDirectory
 from afd_plugin.expert_pool.placement import ExpertPlacement
-from afd_plugin.expert_pool.protocol import MAX_RECEIVE_SLOTS, CallKey
+from afd_plugin.expert_pool.protocol import (
+    MAX_ACTIVE_EXPERT_REPLICAS,
+    MAX_RECEIVE_SLOTS,
+    CallKey,
+)
 from afd_plugin.expert_pool.scheduler import StaticDirectory
 
 MAX_DEPLOYMENT_BYTES = 65536
@@ -172,6 +176,7 @@ class PoolDeployment:
     shared_expert_overlap: bool = False
     full_e_direct: bool = False
     partial_reduction: bool = False
+    active_expert_replicas: int = 1
     tcp_authkey: str = ""
 
     def __post_init__(self) -> None:
@@ -301,6 +306,18 @@ class PoolDeployment:
             self.packed_input and not self.direct_dispatch
         ):
             raise ValueError("Packed input requires direct dispatch")
+        if (
+            type(self.active_expert_replicas) is not int
+            or not 1 <= self.active_expert_replicas <= MAX_ACTIVE_EXPERT_REPLICAS
+            or (
+                self.active_expert_replicas > 1
+                and (not self.partial_reduction or not self.expert_replicated)
+            )
+        ):
+            raise ValueError(
+                "Multiple active Expert copies require direct partial reduction "
+                "and resident replicas"
+            )
         if type(self.pooled_admission) is not bool or (
             self.pooled_admission
             and (

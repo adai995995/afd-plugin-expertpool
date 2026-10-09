@@ -426,6 +426,7 @@ def run(args: argparse.Namespace, report: dict) -> None:
                 direct_dispatch=args.direct_dispatch,
                 full_e_direct=args.full_e_direct,
                 partial_reduction=args.partial_reduction,
+                active_expert_replicas=args.active_expert_replicas,
                 packed_input=args.packed_input,
                 pooled_admission=args.pooled_admission,
                 compact_output=args.compact_output,
@@ -1270,6 +1271,7 @@ def main() -> int:
     )
     parser.add_argument("--packed-input", action="store_true")
     parser.add_argument("--partial-reduction", action="store_true")
+    parser.add_argument("--active-expert-replicas", type=int, choices=(1, 2), default=1)
     parser.add_argument("--pooled-admission", action="store_true")
     parser.add_argument(
         "--expert-replicated",
@@ -1310,6 +1312,12 @@ def main() -> int:
     if args.partial_reduction and (not args.direct_dispatch or not args.packed_input):
         parser.error(
             "--partial-reduction requires --direct-dispatch and --packed-input"
+        )
+    if args.active_expert_replicas > 1 and (
+        not args.partial_reduction or not args.expert_replicated
+    ):
+        parser.error(
+            "Two active copies require partial reduction and resident replicas"
         )
     if args.pooled_admission and (
         not args.controller
@@ -1396,6 +1404,8 @@ def main() -> int:
         "controller_enabled": args.controller,
         "direct_dispatch": args.direct_dispatch,
         "packed_input": args.packed_input,
+        "partial_reduction": args.partial_reduction,
+        "active_expert_replicas": args.active_expert_replicas,
         "pooled_admission": args.pooled_admission,
         "controller_policy": args.controller_policy if args.controller else None,
     }

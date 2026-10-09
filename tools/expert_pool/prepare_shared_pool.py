@@ -58,6 +58,7 @@ def build_deployment(
     shared_expert_overlap: bool = False,
     batching: BatchingOptions = DISABLED_BATCHING,
     partial_reduction: bool = False,
+    active_expert_replicas: int = 1,
 ) -> PoolDeployment:
     """Describe one shared E pool and distinct A clients without loading weights."""
 
@@ -137,6 +138,7 @@ def build_deployment(
         direct_dispatch=partial_reduction,
         packed_input=partial_reduction,
         partial_reduction=partial_reduction,
+        active_expert_replicas=active_expert_replicas,
         expert_replicated=bool(replicated_experts),
         split_assignments=split_assignments,
         batch_aware_replicas=batch_aware_replicas,
@@ -240,6 +242,13 @@ def main() -> None:
         help="Local Expert selection, exact packed rows and FP32 partial replies",
     )
     parser.add_argument("--worker-host", action="append", default=[])
+    parser.add_argument(
+        "--active-expert-replicas",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Maximum copies per Expert call; two requires partial reduction replicas",
+    )
     parser.add_argument("--controller-host")
     parser.add_argument("--control-port-base", type=int)
     parser.add_argument("--nccl-port-base", type=int)
@@ -268,6 +277,7 @@ def main() -> None:
             shared_expert_overlap=args.shared_expert_overlap,
             batching=batching,
             partial_reduction=args.partial_reduction,
+            active_expert_replicas=args.active_expert_replicas,
         )
         if (
             args.worker_host
@@ -301,6 +311,7 @@ def main() -> None:
                 "batching": asdict(deployment.batching),
                 "shared_expert_overlap": deployment.shared_expert_overlap,
                 "partial_reduction": deployment.partial_reduction,
+                "active_expert_replicas": deployment.active_expert_replicas,
                 "socket_dir": str(socket_dir),
             }
         )
